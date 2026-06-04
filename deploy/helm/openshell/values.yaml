@@ -282,6 +282,22 @@ server:
       enabled: false
       # -- Path to the SPIFFE Workload API socket mounted into sandbox pods.
       workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
+  # -- Kubernetes-driver-specific settings.
+  kubernetes:
+    # -- How the Kubernetes compute driver provisions sandboxes.
+    # "direct" creates core Agent Sandbox `Sandbox` objects directly.
+    # "claim" creates Agent Sandbox extension `SandboxClaim` objects that
+    # allocate from an operator-managed warm pool.
+    provisioningMode: "direct"
+    # -- Name of the Agent Sandbox `SandboxTemplate` to reference when
+    # provisioningMode="claim".
+    claimTemplateName: ""
+    # -- Name of the Agent Sandbox `SandboxWarmPool` to allocate from when
+    # provisioningMode="claim".
+    claimWarmPoolName: "default"
+    # -- Lifecycle shutdown policy written into `SandboxClaim.spec.lifecycle`
+    # when provisioningMode="claim".
+    claimShutdownPolicy: "DeleteForeground"
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
