@@ -44,6 +44,7 @@ const SANDBOX_API_VERSION: &str = "v1alpha1";
 const SANDBOX_API_VERSION_FULL: &str = "agents.x-k8s.io/v1alpha1";
 const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
+const CLAIM_UID_LABEL: &str = "agents.x-k8s.io/claim-uid";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
@@ -416,25 +417,77 @@ fn validate_sandbox_owner_reference(
         return Err(Status::permission_denied("sandbox owner UID mismatch"));
     }
 
-    let actual_sandbox_id = sandbox_cr
-        .metadata
-        .labels
-        .as_ref()
+    let labels = sandbox_cr.metadata.labels.as_ref();
+    let actual_sandbox_id = labels
         .and_then(|labels| labels.get(SANDBOX_ID_LABEL))
         .map(String::as_str)
         .unwrap_or_default();
-    if actual_sandbox_id != sandbox_id {
-        warn!(
-            sandbox_owner = %owner.name,
-            owner_uid = %owner.uid,
-            pod_sandbox_id = %sandbox_id,
-            cr_sandbox_id = %actual_sandbox_id,
-            "pod sandbox annotation does not match owning Sandbox CR label"
-        );
-        return Err(Status::permission_denied("sandbox owner ID mismatch"));
+    if !actual_sandbox_id.is_empty() {
+        if actual_sandbox_id != sandbox_id {
+            warn!(
+                sandbox_owner = %owner.name,
+                owner_uid = %owner.uid,
+                pod_sandbox_id = %sandbox_id,
+                cr_sandbox_id = %actual_sandbox_id,
+                "pod sandbox annotation does not match owning Sandbox CR label"
+            );
+            return Err(Status::permission_denied("sandbox owner ID mismatch"));
+        }
+        return Ok(());
     }
 
-    Ok(())
+    let actual_claim_uid = labels
+        .and_then(|labels| labels.get(CLAIM_UID_LABEL))
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !actual_claim_uid.is_empty() {
+        let expected_claim_uid = sandbox_cr
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|owner_ref| {
+                owner_ref.kind == "SandboxClaim"
+                    && owner_ref.api_version == "extensions.agents.x-k8s.io/v1alpha1"
+                    && owner_ref.controller == Some(true)
+            })
+            .map(|owner_ref| owner_ref.uid.as_str())
+            .unwrap_or_default();
+        if expected_claim_uid.is_empty() {
+            warn!(
+                sandbox_owner = %owner.name,
+                owner_uid = %owner.uid,
+                claim_uid = %actual_claim_uid,
+                "owning Sandbox CR has claim-uid label but no controlling SandboxClaim ownerReference"
+            );
+            return Err(Status::permission_denied(
+                "sandbox owner missing claim owner reference",
+            ));
+        }
+        if actual_claim_uid != expected_claim_uid {
+            warn!(
+                sandbox_owner = %owner.name,
+                owner_uid = %owner.uid,
+                claim_uid = %actual_claim_uid,
+                expected_claim_uid = %expected_claim_uid,
+                "pod Sandbox claim-uid label does not match owning SandboxClaim UID"
+            );
+            return Err(Status::permission_denied(
+                "sandbox owner claim UID mismatch",
+            ));
+        }
+        return Ok(());
+    }
+
+    warn!(
+        sandbox_owner = %owner.name,
+        owner_uid = %owner.uid,
+        "owning Sandbox CR is missing both sandbox-id and claim-uid labels"
+    );
+    Err(Status::permission_denied(
+        "sandbox owner missing identity labels",
+    ))
 }
 
 #[cfg(test)]

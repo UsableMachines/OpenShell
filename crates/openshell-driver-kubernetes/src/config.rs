@@ -88,6 +88,28 @@ impl std::fmt::Display for AppArmorProfile {
     }
 }
 
+/// How OpenShell provisions Kubernetes sandboxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvisioningMode {
+    /// Create Agent Sandbox core `Sandbox` objects directly.
+    #[default]
+    Direct,
+    /// Create Agent Sandbox extension `SandboxClaim` objects that allocate from
+    /// an operator-managed warm pool.
+    Claim,
+}
+
+impl std::fmt::Display for ProvisioningMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct => f.write_str("direct"),
+            Self::Claim => f.write_str("claim"),
+        }
+    }
+}
+
+
 impl FromStr for AppArmorProfile {
     type Err = String;
 
@@ -108,6 +130,21 @@ impl FromStr for AppArmorProfile {
         }
     }
 }
+
+impl std::str::FromStr for ProvisioningMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "direct" => Ok(Self::Direct),
+            "claim" => Ok(Self::Claim),
+            other => Err(format!(
+                "unknown provisioning mode '{other}'; expected 'direct' or 'claim'"
+            )),
+        }
+    }
+}
+
 
 impl Serialize for AppArmorProfile {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -163,6 +200,17 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: String,
     /// How the supervisor binary is delivered into sandbox pods.
     pub supervisor_sideload_method: SupervisorSideloadMethod,
+    /// How the driver provisions sandbox resources on Kubernetes.
+    pub provisioning_mode: ProvisioningMode,
+    /// Name of the Agent Sandbox `SandboxTemplate` to reference when
+    /// `provisioning_mode=claim`.
+    pub claim_template_name: String,
+    /// Name of the Agent Sandbox `SandboxWarmPool` to claim from when
+    /// `provisioning_mode=claim`.
+    pub claim_warm_pool_name: String,
+    /// Lifecycle shutdown policy written into `SandboxClaim.spec.lifecycle`
+    /// when `provisioning_mode=claim`.
+    pub claim_shutdown_policy: String,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -215,6 +263,10 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            provisioning_mode: ProvisioningMode::default(),
+            claim_template_name: String::new(),
+            claim_warm_pool_name: "default".to_string(),
+            claim_shutdown_policy: "DeleteForeground".to_string(),
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -263,6 +315,24 @@ mod tests {
             cfg.service_account_name,
             DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME
         );
+    }
+
+    #[test]
+    fn default_provisioning_mode_is_direct() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.provisioning_mode, ProvisioningMode::Direct);
+    }
+
+    #[test]
+    fn default_claim_warm_pool_name_is_default() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.claim_warm_pool_name, "default");
+    }
+
+    #[test]
+    fn default_claim_shutdown_policy_is_delete_foreground() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.claim_shutdown_policy, "DeleteForeground");
     }
 
     #[test]
@@ -361,5 +431,14 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.image_pull_secrets, ["regcred", "backup-regcred"]);
+    }
+
+    #[test]
+    fn serde_override_provisioning_mode() {
+        let json = serde_json::json!({
+            "provisioning_mode": "claim"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.provisioning_mode, ProvisioningMode::Claim);
     }
 }

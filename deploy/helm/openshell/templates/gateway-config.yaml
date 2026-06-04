@@ -103,6 +103,16 @@ data:
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
+    provisioning_mode            = {{ .Values.server.kubernetes.provisioningMode | quote }}
+    {{- if .Values.server.kubernetes.claimTemplateName }}
+    claim_template_name          = {{ .Values.server.kubernetes.claimTemplateName | quote }}
+    {{- end }}
+    {{- if .Values.server.kubernetes.claimWarmPoolName }}
+    claim_warm_pool_name         = {{ .Values.server.kubernetes.claimWarmPoolName | quote }}
+    {{- end }}
+    {{- if .Values.server.kubernetes.claimShutdownPolicy }}
+    claim_shutdown_policy        = {{ .Values.server.kubernetes.claimShutdownPolicy | quote }}
+    {{- end }}
     {{- if .Values.server.sandboxImagePullPolicy }}
     image_pull_policy            = {{ .Values.server.sandboxImagePullPolicy | quote }}
     {{- end }}

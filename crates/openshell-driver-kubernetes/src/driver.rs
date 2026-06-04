@@ -5,7 +5,7 @@
 
 use crate::config::{
     AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, SupervisorSideloadMethod,
+    KubernetesComputeConfig, ProvisioningMode, SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
@@ -75,6 +75,10 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION: &str = "v1alpha1";
 pub const SANDBOX_KIND: &str = "Sandbox";
+
+const CLAIM_GROUP: &str = "extensions.agents.x-k8s.io";
+const CLAIM_VERSION: &str = "v1alpha1";
+const CLAIM_KIND: &str = "SandboxClaim";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
@@ -191,6 +195,87 @@ impl KubernetesComputeDriver {
         Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
     }
 
+    fn claim_watch_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.watch_client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn claim_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn is_claim_mode(&self) -> bool {
+        self.config.provisioning_mode == ProvisioningMode::Claim
+    }
+
+    fn validate_claim_mode_config(&self) -> Result<(), String> {
+        if self.config.claim_template_name.trim().is_empty() {
+            return Err(
+                "claim provisioning mode requires config.claim_template_name to be set".to_string(),
+            );
+        }
+        if self.config.claim_warm_pool_name.trim().is_empty() {
+            return Err(
+                "claim provisioning mode requires config.claim_warm_pool_name to be set"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_claim_mode_sandbox(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.validate_claim_mode_config()?;
+
+        let Some(spec) = sandbox.spec.as_ref() else {
+            return Ok(());
+        };
+
+        if spec.gpu {
+            return Err(
+                "claim provisioning mode does not support gpu sandboxes; operator-managed warm pools must own GPU pool shape"
+                    .to_string(),
+            );
+        }
+
+        let Some(template) = spec.template.as_ref() else {
+            return Ok(());
+        };
+
+        if !template.image.is_empty() && template.image != self.config.default_image {
+            return Err(
+                "claim provisioning mode does not support per-sandbox template.image overrides beyond the configured default_image; operator-managed SandboxTemplate must own the image"
+                    .to_string(),
+            );
+        }
+        if !template.agent_socket_path.is_empty() {
+            return Err(
+                "claim provisioning mode does not support per-sandbox agent_socket_path"
+                    .to_string(),
+            );
+        }
+        if template.resources.is_some() {
+            return Err(
+                "claim provisioning mode does not support per-sandbox template.resources; operator-managed SandboxTemplate must own resource sizing"
+                    .to_string(),
+            );
+        }
+        if template
+            .platform_config
+            .as_ref()
+            .is_some_and(|cfg| !cfg.fields.is_empty())
+        {
+            return Err(
+                "claim provisioning mode does not support per-sandbox template.platform_config; operator-managed SandboxTemplate must own pod/runtime configuration"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
         let nodes: Api<Node> = Api::all(self.client.clone());
         let node_list = nodes.list(&ListParams::default()).await?;
@@ -203,6 +288,12 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        if self.is_claim_mode() {
+            self.validate_claim_mode_sandbox(sandbox)
+                .map_err(tonic::Status::failed_precondition)?;
+            return Ok(());
+        }
+
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {
@@ -217,6 +308,42 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn get_sandbox(&self, name: &str) -> Result<Option<Sandbox>, String> {
+        if self.is_claim_mode() {
+            info!(
+                sandbox_name = %name,
+                namespace = %self.config.namespace,
+                "Fetching sandbox claim from Kubernetes"
+            );
+
+            let api = self.claim_api();
+            return match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+                Ok(Ok(obj)) => claim_from_object(&self.config.namespace, obj).map(Some),
+                Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                    debug!(sandbox_name = %name, "Sandbox claim not found in Kubernetes");
+                    Ok(None)
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_name = %name,
+                        error = %err,
+                        "Failed to fetch sandbox claim from Kubernetes"
+                    );
+                    Err(err.to_string())
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_name = %name,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out fetching sandbox claim from Kubernetes"
+                    );
+                    Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+        }
+
         info!(
             sandbox_name = %name,
             namespace = %self.config.namespace,
@@ -253,6 +380,51 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, String> {
+        if self.is_claim_mode() {
+            info!(
+                namespace = %self.config.namespace,
+                "Listing sandbox claims from Kubernetes"
+            );
+
+            let api = self.claim_api();
+            return match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default()))
+                .await
+            {
+                Ok(Ok(list)) => {
+                    let mut sandboxes = list
+                        .items
+                        .into_iter()
+                        .map(|obj| claim_from_object(&self.config.namespace, obj))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    sandboxes.sort_by(|left, right| {
+                        left.name
+                            .cmp(&right.name)
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    Ok(sandboxes)
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        namespace = %self.config.namespace,
+                        error = %err,
+                        "Failed to list sandbox claims from Kubernetes"
+                    );
+                    Err(err.to_string())
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        namespace = %self.config.namespace,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out listing sandbox claims from Kubernetes"
+                    );
+                    Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+        }
+
         info!(
             namespace = %self.config.namespace,
             "Listing sandboxes from Kubernetes"
@@ -297,6 +469,68 @@ impl KubernetesComputeDriver {
 
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let name = sandbox.name.as_str();
+
+        if self.is_claim_mode() {
+            info!(
+                sandbox_id = %sandbox.id,
+                sandbox_name = %name,
+                namespace = %self.config.namespace,
+                "Creating sandbox claim in Kubernetes"
+            );
+
+            self.validate_claim_mode_sandbox(sandbox)
+                .map_err(KubernetesDriverError::Precondition)?;
+
+            let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+            let resource = ApiResource::from_gvk(&gvk);
+            let mut obj = DynamicObject::new(name, &resource);
+            obj.metadata = ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(self.config.namespace.clone()),
+                labels: Some(sandbox_labels(sandbox)),
+                ..Default::default()
+            };
+            obj.data = claim_to_k8s_spec(sandbox, &self.config)?;
+            let api = self.claim_api();
+
+            return match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.create(&PostParams::default(), &obj),
+            )
+            .await
+            {
+                Ok(Ok(_result)) => {
+                    info!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %name,
+                        "Sandbox claim created in Kubernetes successfully"
+                    );
+                    Ok(())
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %name,
+                        error = %err,
+                        "Failed to create sandbox claim in Kubernetes"
+                    );
+                    Err(KubernetesDriverError::from_kube(err))
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %name,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out creating sandbox claim in Kubernetes"
+                    );
+                    Err(KubernetesDriverError::Message(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    )))
+                }
+            };
+        }
+
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
@@ -371,6 +605,50 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, String> {
+        if self.is_claim_mode() {
+            info!(
+                sandbox_name = %name,
+                namespace = %self.config.namespace,
+                "Deleting sandbox claim from Kubernetes"
+            );
+
+            let api = self.claim_api();
+            return match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.delete(name, &DeleteParams::default()),
+            )
+            .await
+            {
+                Ok(Ok(_response)) => {
+                    info!(sandbox_name = %name, "Sandbox claim deleted from Kubernetes");
+                    Ok(true)
+                }
+                Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                    debug!(sandbox_name = %name, "Sandbox claim not found in Kubernetes (already deleted)");
+                    Ok(false)
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_name = %name,
+                        error = %err,
+                        "Failed to delete sandbox claim from Kubernetes"
+                    );
+                    Err(err.to_string())
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_name = %name,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out deleting sandbox claim from Kubernetes"
+                    );
+                    Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+        }
+
         info!(
             sandbox_name = %name,
             namespace = %self.config.namespace,
@@ -412,7 +690,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
-        let api = self.api();
+        let api = if self.is_claim_mode() {
+            self.claim_api()
+        } else {
+            self.api()
+        };
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
             Ok(Ok(_)) => Ok(true),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
@@ -427,6 +709,107 @@ impl KubernetesComputeDriver {
     // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
+        if self.is_claim_mode() {
+            let namespace = self.config.namespace.clone();
+            let claim_api = self.claim_watch_api();
+            let mut claim_stream = watcher::watcher(claim_api, watcher::Config::default()).boxed();
+            let (tx, rx) = mpsc::channel(256);
+
+            tokio::spawn(async move {
+                loop {
+                    match claim_stream.try_next().await {
+                        Ok(Some(Event::Applied(obj))) => match claim_from_object(&namespace, obj) {
+                            Ok(sandbox) => {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                        WatchSandboxesSandboxEvent {
+                                            sandbox: Some(sandbox),
+                                        },
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if tx
+                                    .send(Err(KubernetesDriverError::Message(err)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        },
+                        Ok(Some(Event::Deleted(obj))) => match sandbox_id_from_object(&obj) {
+                            Ok(sandbox_id) => {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                        WatchSandboxesDeletedEvent { sandbox_id },
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if tx
+                                    .send(Err(KubernetesDriverError::Message(err)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        },
+                        Ok(Some(Event::Restarted(objs))) => {
+                            for obj in objs {
+                                match claim_from_object(&namespace, obj) {
+                                    Ok(sandbox) => {
+                                        let event = WatchSandboxesEvent {
+                                            payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                                WatchSandboxesSandboxEvent {
+                                                    sandbox: Some(sandbox),
+                                                },
+                                            )),
+                                        };
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if tx
+                                            .send(Err(KubernetesDriverError::Message(err)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx
+                                .send(Err(KubernetesDriverError::Message(
+                                    "sandbox claim watcher stream ended unexpectedly".to_string(),
+                                )))
+                                .await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx
+                                .send(Err(KubernetesDriverError::Message(err.to_string())))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            return Ok(Box::pin(ReceiverStream::new(rx)));
+        }
+
         let namespace = self.config.namespace.clone();
         let sandbox_api = self.watch_api();
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
@@ -588,6 +971,50 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, S
         .clone()
         .unwrap_or_else(|| namespace.to_string());
     let status = status_from_object(&obj);
+
+    Ok(Sandbox {
+        id,
+        name,
+        namespace,
+        spec: None,
+        status,
+    })
+}
+
+fn claim_status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
+    let claim_name = obj.metadata.name.clone().unwrap_or_default();
+    let status_obj = obj.data.get("status").and_then(|status| status.as_object());
+
+    let conditions = status_obj
+        .and_then(|status| status.get("conditions"))
+        .and_then(|val| val.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(condition_from_value)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(SandboxStatus {
+        sandbox_name: claim_name,
+        instance_id: String::new(),
+        agent_fd: String::new(),
+        sandbox_fd: String::new(),
+        conditions,
+        deleting: obj.metadata.deletion_timestamp.is_some(),
+    })
+}
+
+fn claim_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
+    let id = sandbox_id_from_object(&obj)?;
+    let name = obj.metadata.name.clone().unwrap_or_default();
+    let namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| namespace.to_string());
+    let status = claim_status_from_object(&obj);
 
     Ok(Sandbox {
         id,
@@ -1084,6 +1511,77 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
         );
     }
     env
+}
+
+fn claim_to_k8s_spec(
+    sandbox: &Sandbox,
+    config: &KubernetesComputeConfig,
+) -> Result<serde_json::Value, KubernetesDriverError> {
+    let spec = sandbox.spec.as_ref();
+    let spec_environment = spec_pod_env(spec);
+    let empty_template_env = std::collections::HashMap::new();
+    let template = spec.and_then(|s| s.template.as_ref());
+    let template_environment = template
+        .map(|t| &t.environment)
+        .unwrap_or(&empty_template_env);
+
+    let env = build_env_list(
+        None,
+        template_environment,
+        &spec_environment,
+        &sandbox.id,
+        &sandbox.name,
+        &config.grpc_endpoint,
+        &config.ssh_socket_path,
+        !config.client_tls_secret_name.is_empty(),
+    );
+
+    let mut labels = sandbox_labels(sandbox);
+    if let Some(template) = template {
+        for (key, value) in &template.labels {
+            labels.insert(key.clone(), value.clone());
+        }
+    }
+
+    let mut annotations = BTreeMap::new();
+    annotations.insert("openshell.io/sandbox-id".to_string(), sandbox.id.clone());
+
+    let mut additional_pod_metadata = serde_json::Map::new();
+    if !labels.is_empty() {
+        additional_pod_metadata.insert("labels".to_string(), serde_json::json!(labels));
+    }
+    if !annotations.is_empty() {
+        additional_pod_metadata.insert("annotations".to_string(), serde_json::json!(annotations));
+    }
+
+    let mut claim_spec = serde_json::Map::new();
+    claim_spec.insert(
+        "sandboxTemplateRef".to_string(),
+        serde_json::json!({"name": config.claim_template_name}),
+    );
+    claim_spec.insert(
+        "warmpool".to_string(),
+        serde_json::json!(config.claim_warm_pool_name),
+    );
+    if !env.is_empty() {
+        claim_spec.insert("env".to_string(), serde_json::Value::Array(env));
+    }
+    if !additional_pod_metadata.is_empty() {
+        claim_spec.insert(
+            "additionalPodMetadata".to_string(),
+            serde_json::Value::Object(additional_pod_metadata),
+        );
+    }
+    if !config.claim_shutdown_policy.trim().is_empty() {
+        claim_spec.insert(
+            "lifecycle".to_string(),
+            serde_json::json!({"shutdownPolicy": config.claim_shutdown_policy}),
+        );
+    }
+
+    Ok(serde_json::Value::Object(
+        std::iter::once(("spec".to_string(), serde_json::Value::Object(claim_spec))).collect(),
+    ))
 }
 
 fn sandbox_to_k8s_spec(
