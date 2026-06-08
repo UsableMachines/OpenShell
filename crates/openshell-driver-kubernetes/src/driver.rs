@@ -395,6 +395,9 @@ fn kubernetes_driver_volume_mount_to_k8s(
     serde_json::to_value(VolumeMount::from(mount)).expect("VolumeMount serializes to JSON")
 }
 
+const POD_SANDBOX_ID_ANNOTATION: &str = "openshell.io/sandbox-id";
+const POD_SANDBOX_NAME_ANNOTATION: &str = "openshell.io/sandbox-name";
+
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
 // ---------------------------------------------------------------------------
@@ -2807,7 +2810,11 @@ fn claim_to_k8s_spec(
     }
 
     let mut annotations = BTreeMap::new();
-    annotations.insert("openshell.io/sandbox-id".to_string(), sandbox.id.clone());
+    annotations.insert(POD_SANDBOX_ID_ANNOTATION.to_string(), sandbox.id.clone());
+    annotations.insert(
+        POD_SANDBOX_NAME_ANNOTATION.to_string(),
+        sandbox.name.clone(),
+    );
 
     let mut additional_pod_metadata = serde_json::Map::new();
     if !labels.is_empty() {
@@ -2984,12 +2991,9 @@ fn sandbox_template_to_k8s_with_validated_config(
     if !pod_labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::Value::Object(pod_labels));
     }
-    // Carry the sandbox UUID as a pod annotation so the gateway can resolve
-    // a projected SA token claim (pod name + uid) back to a sandbox identity
-    // when the supervisor calls `IssueSandboxToken` at startup. The gateway
-    // also verifies the pod's controlling Sandbox ownerReference against the
-    // live CR before accepting this annotation. Its K8s Role does NOT grant
-    // `patch pods`, so this annotation is effectively immutable post-create.
+    // Carry the sandbox identity on pod annotations so both the gateway bootstrap
+    // path and any warm-pool bind-discovery projection can recover the adopted
+    // sandbox without requiring Pod-side K8s watch permissions.
     let mut pod_annotations = platform_config_struct(template, "annotations")
         .and_then(|v| match v {
             serde_json::Value::Object(map) => Some(map),
@@ -2998,8 +3002,14 @@ fn sandbox_template_to_k8s_with_validated_config(
         .unwrap_or_default();
     if !params.sandbox_id.is_empty() {
         pod_annotations.insert(
-            "openshell.io/sandbox-id".to_string(),
+            POD_SANDBOX_ID_ANNOTATION.to_string(),
             serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if !params.sandbox_name.is_empty() {
+        pod_annotations.insert(
+            POD_SANDBOX_NAME_ANNOTATION.to_string(),
+            serde_json::Value::String(params.sandbox_name.to_string()),
         );
     }
     if !pod_annotations.is_empty() {
@@ -3151,6 +3161,11 @@ fn sandbox_template_to_k8s_with_validated_config(
             .iter()
             .map(kubernetes_driver_volume_mount_to_k8s),
     );
+    volume_mounts.push(serde_json::json!({
+        "name": "openshell-bind",
+        "mountPath": "/var/run/openshell-bind",
+        "readOnly": true,
+    }));
     container.insert(
         "volumeMounts".to_string(),
         serde_json::Value::Array(volume_mounts),
@@ -3220,6 +3235,25 @@ fn sandbox_template_to_k8s_with_validated_config(
             .iter()
             .map(kubernetes_driver_volume_to_k8s),
     );
+    volumes.push(serde_json::json!({
+        "name": "openshell-bind",
+        "downwardAPI": {
+            "items": [
+                {
+                    "path": "sandbox-id",
+                    "fieldRef": {
+                        "fieldPath": "metadata.annotations['openshell.io/sandbox-id']"
+                    }
+                },
+                {
+                    "path": "sandbox-name",
+                    "fieldRef": {
+                        "fieldPath": "metadata.annotations['openshell.io/sandbox-name']"
+                    }
+                }
+            ]
+        }
+    }));
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
@@ -3549,6 +3583,20 @@ fn apply_required_env(
             socket_path,
         );
     }
+
+    // Bind-discovery files projected from Pod annotations. Warm-pool templates
+    // can expose these files even before sandbox identity is present in the
+    // startup env, letting the supervisor wait for adoption without K8s watch RBAC.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::BIND_SANDBOX_ID_FILE,
+        "/var/run/openshell-bind/sandbox-id",
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::BIND_SANDBOX_NAME_FILE,
+        "/var/run/openshell-bind/sandbox-name",
+    );
 }
 
 fn provider_spiffe_socket_path<'a>(params: &'a SandboxPodParams<'a>) -> Option<&'a str> {
@@ -5039,6 +5087,84 @@ mod tests {
     /// The volume is mounted at a specific path and the env vars must point to
     /// files within that same path, otherwise the sandbox will fail to start
     /// with "No such file or directory" errors.
+    #[test]
+    fn bind_discovery_env_vars_match_projection_mount_path() {
+        const BIND_MOUNT_PATH: &str = "/var/run/openshell-bind";
+
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "0.0.0.0:2222",
+            false,
+            None,
+        );
+
+        let get_env = |name: &str| -> Option<String> {
+            env.iter()
+                .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+                .and_then(|e| e.get("value").and_then(|v| v.as_str()).map(String::from))
+        };
+
+        let bind_id = get_env("OPENSHELL_BIND_SANDBOX_ID_FILE")
+            .expect("OPENSHELL_BIND_SANDBOX_ID_FILE must be set");
+        let bind_name = get_env("OPENSHELL_BIND_SANDBOX_NAME_FILE")
+            .expect("OPENSHELL_BIND_SANDBOX_NAME_FILE must be set");
+
+        assert_eq!(bind_id, format!("{BIND_MOUNT_PATH}/sandbox-id"));
+        assert_eq!(bind_name, format!("{BIND_MOUNT_PATH}/sandbox-name"));
+    }
+
+    #[test]
+    fn sandbox_template_projects_bind_metadata_via_downward_api() {
+        let pod_template = {
+            let params = SandboxPodParams {
+                sandbox_id: "sandbox-1",
+                sandbox_name: "my-sandbox",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert!(mounts.iter().any(|mount| {
+            mount["name"] == "openshell-bind"
+                && mount["mountPath"] == "/var/run/openshell-bind"
+                && mount["readOnly"] == true
+        }));
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        let bind_volume = volumes
+            .iter()
+            .find(|volume| volume["name"] == "openshell-bind")
+            .expect("openshell-bind volume should exist");
+        let items = bind_volume["downwardAPI"]["items"]
+            .as_array()
+            .expect("downwardAPI items should exist");
+        assert!(items.iter().any(|item| {
+            item["path"] == "sandbox-id"
+                && item["fieldRef"]["fieldPath"]
+                    == "metadata.annotations['openshell.io/sandbox-id']"
+        }));
+        assert!(items.iter().any(|item| {
+            item["path"] == "sandbox-name"
+                && item["fieldRef"]["fieldPath"]
+                    == "metadata.annotations['openshell.io/sandbox-name']"
+        }));
+    }
+
     #[test]
     fn tls_env_vars_match_volume_mount_path() {
         // The mount path used in pod template construction

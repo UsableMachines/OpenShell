@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -100,6 +101,10 @@ impl std::str::FromStr for Mode {
     }
 }
 
+const DEFAULT_BIND_SANDBOX_ID_PATH: &str = "/var/run/openshell-bind/sandbox-id";
+const DEFAULT_BIND_SANDBOX_NAME_PATH: &str = "/var/run/openshell-bind/sandbox-name";
+const BIND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// `OpenShell` Sandbox - process isolation and monitoring.
 // CLI flags are naturally boolean switches; grouping them into structs would
 // only obscure the clap definition.
@@ -141,6 +146,18 @@ struct Args {
     /// Required when using --sandbox-id.
     #[arg(long, env = openshell_core::sandbox_env::ENDPOINT)]
     openshell_endpoint: Option<String>,
+
+    /// Optional path to a bind-discovery file carrying the sandbox UUID.
+    #[arg(long, env = openshell_core::sandbox_env::BIND_SANDBOX_ID_FILE)]
+    bind_sandbox_id_file: Option<String>,
+
+    /// Optional path to a bind-discovery file carrying the sandbox name.
+    #[arg(long, env = openshell_core::sandbox_env::BIND_SANDBOX_NAME_FILE)]
+    bind_sandbox_name_file: Option<String>,
+
+    /// Timeout in seconds for waiting on bind-discovery files.
+    #[arg(long, default_value = "0", env = openshell_core::sandbox_env::BIND_WAIT_TIMEOUT_SECS)]
+    bind_wait_timeout_secs: u64,
 
     /// Path to Rego policy file for OPA-based network access control.
     /// Requires --policy-data to also be set.
@@ -454,6 +471,80 @@ fn run_network_init(
     ))
 }
 
+fn read_bind_file(path: &str) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let trimmed = contents.trim().to_string();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).into_diagnostic(),
+    }
+}
+
+async fn await_bind_metadata(args: &mut Args) -> Result<()> {
+    if args.sandbox_id.is_some() && args.sandbox.is_some() {
+        return Ok(());
+    }
+
+    let bind_id_path = args
+        .bind_sandbox_id_file
+        .as_deref()
+        .unwrap_or(DEFAULT_BIND_SANDBOX_ID_PATH);
+    let bind_name_path = args
+        .bind_sandbox_name_file
+        .as_deref()
+        .unwrap_or(DEFAULT_BIND_SANDBOX_NAME_PATH);
+
+    let needs_id = args.sandbox_id.is_none();
+    let needs_name = args.sandbox.is_none();
+    if !needs_id && !needs_name {
+        return Ok(());
+    }
+
+    let id_path_exists = Path::new(bind_id_path).exists();
+    let name_path_exists = Path::new(bind_name_path).exists();
+    let should_wait = args.bind_wait_timeout_secs > 0 || id_path_exists || name_path_exists;
+    if !should_wait {
+        return Ok(());
+    }
+
+    let deadline = (args.bind_wait_timeout_secs > 0)
+        .then(|| std::time::Instant::now() + Duration::from_secs(args.bind_wait_timeout_secs));
+
+    loop {
+        if needs_id
+            && args.sandbox_id.is_none()
+            && let Some(value) = read_bind_file(bind_id_path)?
+        {
+            args.sandbox_id = Some(value);
+        }
+        if needs_name
+            && args.sandbox.is_none()
+            && let Some(value) = read_bind_file(bind_name_path)?
+        {
+            args.sandbox = Some(value);
+        }
+        if (!needs_id || args.sandbox_id.is_some()) && (!needs_name || args.sandbox.is_some()) {
+            return Ok(());
+        }
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            return Err(miette::miette!(
+                "Timed out waiting for warm-pool bind metadata. Missing sandbox_id={} sandbox_name={}.",
+                args.sandbox_id.is_none(),
+                args.sandbox.is_none(),
+            ));
+        }
+        tokio::time::sleep(BIND_POLL_INTERVAL).await;
+    }
+}
+
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
@@ -480,7 +571,7 @@ fn main() -> Result<()> {
         });
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if args.mode.network_init {
         let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
@@ -518,6 +609,8 @@ fn main() -> Result<()> {
     let exit_code = runtime.block_on(async move {
         // Install rustls crypto provider before any TLS connections (including log push).
         let _ = rustls::crypto::ring::default_provider().install_default();
+
+        await_bind_metadata(&mut args).await?;
 
         // Set up optional log push layer (gRPC mode only).
         let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
@@ -668,6 +761,28 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&final_path, perms).into_diagnostic()?;
         Ok(())
+    }
+
+    #[test]
+    fn read_bind_file_returns_none_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-bind-file");
+        let value = read_bind_file(missing.to_str().unwrap()).unwrap();
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn read_bind_file_trims_and_returns_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bind_file = tmp.path().join("sandbox-id");
+        std::fs::write(
+            &bind_file,
+            b"  sandbox-123
+",
+        )
+        .unwrap();
+        let value = read_bind_file(bind_file.to_str().unwrap()).unwrap();
+        assert_eq!(value.as_deref(), Some("sandbox-123"));
     }
 
     #[test]

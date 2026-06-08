@@ -115,6 +115,26 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
+/// Optional path to a bind-discovery file carrying the sandbox UUID.
+///
+/// Used by Kubernetes warm-pool templates that start the supervisor before the
+/// sandbox is fully bound. When `OPENSHELL_SANDBOX_ID` is absent, the
+/// supervisor can wait for this file to become non-empty and then continue with
+/// the normal bootstrap flow.
+pub const BIND_SANDBOX_ID_FILE: &str = "OPENSHELL_BIND_SANDBOX_ID_FILE";
+
+/// Optional path to a bind-discovery file carrying the sandbox name.
+///
+/// Used alongside [`BIND_SANDBOX_ID_FILE`] so a warm supervisor can recover the
+/// logical sandbox handle before entering the ordinary bootstrap/session path.
+pub const BIND_SANDBOX_NAME_FILE: &str = "OPENSHELL_BIND_SANDBOX_NAME_FILE";
+
+/// Optional timeout (seconds) for waiting on bind-discovery files.
+///
+/// When unset or zero, the supervisor waits only if the bind-discovery files
+/// are already present in the pod filesystem.
+pub const BIND_WAIT_TIMEOUT_SECS: &str = "OPENSHELL_BIND_WAIT_TIMEOUT_SECS";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
