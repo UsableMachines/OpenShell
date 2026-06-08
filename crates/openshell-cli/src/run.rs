@@ -2942,31 +2942,28 @@ async fn sandbox_exec_interactive_grpc(
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
-    #[cfg(unix)]
-    {
-        let stdin_tx = input_tx.clone();
-        std::thread::spawn(move || {
-            let mut stdin = std::io::stdin().lock();
-            let mut buf = [0u8; 4096];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdin_tx
-                            .blocking_send(ExecSandboxInput {
-                                payload: Some(exec_sandbox_input::Payload::Stdin(
-                                    buf[..n].to_vec(),
-                                )),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+    let stdin_tx = input_tx.clone();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx
+                        .blocking_send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(
+                                buf[..n].to_vec(),
+                            )),
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
-        });
-    }
+        }
+    });
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
@@ -8013,6 +8010,8 @@ mod tests {
         sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
         service_url_for_gateway,
     };
+    #[cfg(unix)]
+    use super::{local_upload_path_exists, local_upload_path_is_symlink};
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
     use hyper::StatusCode;
