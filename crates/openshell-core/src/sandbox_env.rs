@@ -56,3 +56,23 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 /// writes and rotates this file; the supervisor exchanges its contents
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
+
+/// Optional path to a bind-discovery file carrying the sandbox UUID.
+///
+/// Used by Kubernetes warm-pool templates that start the supervisor before the
+/// sandbox is fully bound. When `OPENSHELL_SANDBOX_ID` is absent, the
+/// supervisor can wait for this file to become non-empty and then continue with
+/// the normal bootstrap flow.
+pub const BIND_SANDBOX_ID_FILE: &str = "OPENSHELL_BIND_SANDBOX_ID_FILE";
+
+/// Optional path to a bind-discovery file carrying the sandbox name.
+///
+/// Used alongside [`BIND_SANDBOX_ID_FILE`] so a warm supervisor can recover the
+/// logical sandbox handle before entering the ordinary bootstrap/session path.
+pub const BIND_SANDBOX_NAME_FILE: &str = "OPENSHELL_BIND_SANDBOX_NAME_FILE";
+
+/// Optional timeout (seconds) for waiting on bind-discovery files.
+///
+/// When unset or zero, the supervisor waits only if the bind-discovery files
+/// are already present in the pod filesystem.
+pub const BIND_WAIT_TIMEOUT_SECS: &str = "OPENSHELL_BIND_WAIT_TIMEOUT_SECS";

@@ -11,8 +11,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, ProvisioningMode,
-    SupervisorSideloadMethod,
+    KubernetesComputeConfig, KubernetesComputeDriver, ProvisioningMode, SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]

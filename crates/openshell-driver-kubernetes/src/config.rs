@@ -109,7 +109,6 @@ impl std::fmt::Display for ProvisioningMode {
     }
 }
 
-
 impl FromStr for AppArmorProfile {
     type Err = String;
 
@@ -144,7 +143,6 @@ impl std::str::FromStr for ProvisioningMode {
         }
     }
 }
-
 
 impl Serialize for AppArmorProfile {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
