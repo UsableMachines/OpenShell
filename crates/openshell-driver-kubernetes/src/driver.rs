@@ -276,6 +276,12 @@ impl KubernetesComputeDriver {
                     .to_string(),
             );
         }
+        if warm_pool_claim_env_is_unsafe(Some(spec)) {
+            return Err(
+                "claim provisioning mode with a warm pool does not support per-request environment injection; move startup env to the SandboxTemplate and use Pod metadata / Downward API for bind-specific identity"
+                    .to_string(),
+            );
+        }
 
         Ok(())
     }
@@ -1518,28 +1524,17 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
     env
 }
 
+fn warm_pool_claim_env_is_unsafe(spec: Option<&SandboxSpec>) -> bool {
+    let env = spec_pod_env(spec);
+    !env.is_empty()
+}
+
 fn claim_to_k8s_spec(
     sandbox: &Sandbox,
     config: &KubernetesComputeConfig,
 ) -> Result<serde_json::Value, KubernetesDriverError> {
     let spec = sandbox.spec.as_ref();
-    let spec_environment = spec_pod_env(spec);
-    let empty_template_env = std::collections::HashMap::new();
     let template = spec.and_then(|s| s.template.as_ref());
-    let template_environment = template
-        .map(|t| &t.environment)
-        .unwrap_or(&empty_template_env);
-
-    let env = build_env_list(
-        None,
-        template_environment,
-        &spec_environment,
-        &sandbox.id,
-        &sandbox.name,
-        &config.grpc_endpoint,
-        &config.ssh_socket_path,
-        !config.client_tls_secret_name.is_empty(),
-    );
 
     let mut labels = sandbox_labels(sandbox);
     if let Some(template) = template {
@@ -1572,9 +1567,6 @@ fn claim_to_k8s_spec(
         "warmpool".to_string(),
         serde_json::json!(config.claim_warm_pool_name),
     );
-    if !env.is_empty() {
-        claim_spec.insert("env".to_string(), serde_json::Value::Array(env));
-    }
     if !additional_pod_metadata.is_empty() {
         claim_spec.insert(
             "additionalPodMetadata".to_string(),
