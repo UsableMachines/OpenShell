@@ -1003,6 +1003,15 @@ fn claim_status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             items
                 .iter()
                 .filter_map(condition_from_value)
+                .map(|mut condition| {
+                    if condition.r#type == "Ready"
+                        && condition.status.eq_ignore_ascii_case("false")
+                        && condition.reason.eq_ignore_ascii_case("SandboxNotReady")
+                    {
+                        condition.reason = "DependenciesNotReady".to_string();
+                    }
+                    condition
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -3588,4 +3597,64 @@ mod tests {
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
     }
+    #[test]
+    fn claim_status_from_object_rewrites_sandbox_not_ready_to_dependencies_not_ready() {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("claim-a", &resource);
+        obj.metadata = ObjectMeta {
+            name: Some("claim-a".to_string()),
+            ..Default::default()
+        };
+        obj.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "SandboxNotReady",
+                    "message": "Sandbox is not ready",
+                    "lastTransitionTime": "2026-06-11T00:00:00Z"
+                }]
+            }
+        });
+
+        let status = claim_status_from_object(&obj).expect("claim status should parse");
+        assert_eq!(status.sandbox_name, "claim-a");
+        assert_eq!(status.instance_id, "");
+        assert_eq!(status.conditions.len(), 1);
+
+        let ready = &status.conditions[0];
+        assert_eq!(ready.r#type, "Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "DependenciesNotReady");
+        assert_eq!(ready.message, "Sandbox is not ready");
+    }
+
+    #[test]
+    fn claim_status_from_object_preserves_other_ready_false_reasons() {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("claim-b", &resource);
+        obj.metadata = ObjectMeta {
+            name: Some("claim-b".to_string()),
+            ..Default::default()
+        };
+        obj.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "ImagePullBackOff",
+                    "message": "Failed to pull image",
+                    "lastTransitionTime": "2026-06-11T00:00:00Z"
+                }]
+            }
+        });
+
+        let status = claim_status_from_object(&obj).expect("claim status should parse");
+        let ready = &status.conditions[0];
+        assert_eq!(ready.reason, "ImagePullBackOff");
+        assert_eq!(ready.message, "Failed to pull image");
+    }
+
 }
