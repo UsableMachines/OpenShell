@@ -11,6 +11,7 @@ use openshell_core::proto::{
     Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
     StoredProviderCredentialRefreshState,
 };
+use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -272,8 +273,6 @@ pub fn new_refresh_state(
     })
 }
 
-use openshell_core::{ObjectId, ObjectName};
-
 #[derive(Debug)]
 struct MintedCredential {
     access_token: String,
@@ -343,6 +342,7 @@ pub use openshell_providers::is_gateway_mintable_strategy;
 pub async fn refresh_provider_credential(
     store: &Store,
     workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
     credential_key: &str,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
@@ -398,12 +398,10 @@ pub async fn refresh_provider_credential(
     match mint_credential(&state).await {
         Ok(minted) => {
             let now_ms = current_time_ms();
-            // Fold the minted result into the refresh state before claiming the
-            // generation.
-            if let Some(refresh_token) = minted.refresh_token.clone() {
+            if let Some(ref refresh_token) = minted.refresh_token {
                 state
                     .material
-                    .insert("refresh_token".to_string(), refresh_token);
+                    .insert("refresh_token".to_string(), refresh_token.clone());
                 if !state
                     .secret_material_keys
                     .iter()
@@ -446,8 +444,15 @@ pub async fn refresh_provider_credential(
             };
 
             // Generation is ours; write the minted credentials into the provider.
-            if let Err(err) =
-                apply_minted_credential(store, workspace, &provider, credential_key, &minted).await
+            if let Err(err) = apply_minted_credential(
+                store,
+                workspace,
+                credentials,
+                &provider,
+                credential_key,
+                &minted,
+            )
+            .await
             {
                 state.status = "error".to_string();
                 state.last_error = err.message().to_string();
@@ -505,17 +510,39 @@ pub async fn refresh_provider_credential(
 async fn apply_minted_credential(
     store: &Store,
     workspace: &str,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
     provider: &Provider,
     credential_key: &str,
     minted: &MintedCredential,
 ) -> Result<(), Status> {
     let mut updated = provider.clone();
-    updated
-        .credentials
-        .insert(credential_key.to_string(), minted.access_token.clone());
-    for (key, value) in &minted.additional_credentials {
-        updated.credentials.insert(key.clone(), value.clone());
-    }
+    let stored_handle = if let Some(credentials) = credentials
+        && credentials.stores_provider_credentials()
+    {
+        let stored = credentials
+            .store_provider_credentials(
+                provider.object_name(),
+                &HashMap::from([(credential_key.to_string(), minted.access_token.clone())]),
+                &provider.credential_handles,
+            )
+            .await?;
+        let handle = stored.get(credential_key).cloned().ok_or_else(|| {
+            Status::internal("credential driver did not return refreshed credential handle")
+        })?;
+        updated.credentials.remove(credential_key);
+        updated
+            .credential_handles
+            .insert(credential_key.to_string(), handle.clone());
+        Some(handle)
+    } else {
+        updated
+            .credentials
+            .insert(credential_key.to_string(), minted.access_token.clone());
+        for (key, value) in &minted.additional_credentials {
+            updated.credentials.insert(key.clone(), value.clone());
+        }
+        None
+    };
     if minted.expires_at_ms > 0 {
         updated
             .credential_expires_at_ms
@@ -537,11 +564,18 @@ async fn apply_minted_credential(
     .await?;
     store
         .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
-            current
-                .credentials
-                .insert(credential_key.to_string(), minted.access_token.clone());
-            for (key, value) in &minted.additional_credentials {
-                current.credentials.insert(key.clone(), value.clone());
+            if let Some(handle) = stored_handle.clone() {
+                current.credentials.remove(credential_key);
+                current
+                    .credential_handles
+                    .insert(credential_key.to_string(), handle);
+            } else {
+                current
+                    .credentials
+                    .insert(credential_key.to_string(), minted.access_token.clone());
+                for (key, value) in &minted.additional_credentials {
+                    current.credentials.insert(key.clone(), value.clone());
+                }
             }
             if minted.expires_at_ms > 0 {
                 current
@@ -995,14 +1029,19 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(state.store.as_ref()).await {
+            if let Err(err) =
+                run_refresh_worker_tick(state.store.as_ref(), Some(&state.credentials)).await
+            {
                 warn!(error = %err, "provider credential refresh worker tick failed");
             }
         }
     });
 }
 
-async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
+async fn run_refresh_worker_tick(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+) -> Result<(), Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
@@ -1060,6 +1099,7 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
         if let Err(err) = refresh_provider_credential(
             store,
             state.object_workspace(),
+            credentials,
             &state.provider_name,
             &state.credential_key,
         )
@@ -1086,7 +1126,9 @@ mod tests {
         put_refresh_state, refresh_provider_credential, refresh_state_name, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms,
     };
-    use crate::persistence::test_store;
+    use crate::credentials::CredentialRuntime;
+    use crate::persistence::{current_time_ms, test_store};
+    use openshell_core::Config;
     use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
@@ -1159,7 +1201,7 @@ mod tests {
         let store = test_store().await;
         let provider = provider("my-graph", "outlook");
         store.put_message(&provider).await.unwrap();
-        let before_refresh_ms = crate::persistence::current_time_ms();
+        let before_refresh_ms = current_time_ms();
         let state = new_refresh_state(
             &provider,
             "default",
@@ -1182,10 +1224,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, "default", "my-graph", "MS_GRAPH_ACCESS_TOKEN")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "my-graph",
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
         assert!(refreshed.next_refresh_at_ms > 0);
@@ -1204,6 +1251,82 @@ mod tests {
         assert_eq!(
             stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
             Some(&refreshed.expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth2_client_credentials_refresh_stores_access_token_with_credential_runtime() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "stored-graph-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let provider = provider("my-stored-graph", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+        let config = Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = CredentialRuntime::from_config(&config).unwrap();
+
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            Some(&credentials),
+            "my-stored-graph",
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap();
+
+        let stored = store
+            .get_message_by_name::<Provider>("default", "my-stored-graph")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.credentials.contains_key("MS_GRAPH_ACCESS_TOKEN"));
+        let handle = stored
+            .credential_handles
+            .get("MS_GRAPH_ACCESS_TOKEN")
+            .unwrap();
+        assert_eq!(handle.driver, "test-static");
+        assert_eq!(
+            stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&refreshed.expires_at_ms)
+        );
+
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&"stored-graph-token".to_string())
         );
     }
 
@@ -1274,6 +1397,7 @@ mod tests {
         let err = refresh_provider_credential(
             &store,
             "default",
+            None,
             "refreshing-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
@@ -1353,6 +1477,7 @@ mod tests {
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            None,
             "my-delegated-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
@@ -1443,10 +1568,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, "default", "my-drive", "GOOGLE_DRIVE_ACCESS_TOKEN")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "my-drive",
+            "GOOGLE_DRIVE_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
 
@@ -1485,7 +1615,7 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store).await.unwrap();
+        run_refresh_worker_tick(&store, None).await.unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -1595,10 +1725,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, "default", "aws-sts-test", "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "aws-sts-test",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
 
@@ -1687,9 +1822,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        refresh_provider_credential(&store, "default", "aws-sts-custom", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
+        refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "aws-sts-custom",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
 
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-sts-custom")
@@ -1757,10 +1898,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let err =
-            refresh_provider_credential(&store, "default", "aws-sts-partial", "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap_err();
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "aws-sts-partial",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("both be set or both omitted"));
 
@@ -1798,7 +1944,7 @@ mod tests {
             ]),
         };
 
-        apply_minted_credential(&store, "default", &prov, "AWS_ACCESS_KEY_ID", &minted)
+        apply_minted_credential(&store, "default", None, &prov, "AWS_ACCESS_KEY_ID", &minted)
             .await
             .unwrap();
 
@@ -1884,6 +2030,7 @@ mod tests {
         let err = apply_minted_credential(
             &store,
             "default",
+            None,
             &refreshing_provider,
             "AWS_ACCESS_KEY_ID",
             &minted,
@@ -1989,10 +2136,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, "default", "aws-sts-session", "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "aws-sts-session",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-sts-session")
@@ -2055,6 +2207,7 @@ mod tests {
         let err = refresh_provider_credential(
             &store,
             "default",
+            None,
             "aws-sts-lonesession",
             "AWS_ACCESS_KEY_ID",
         )
@@ -2138,7 +2291,7 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
 
         let rotate =
-            refresh_provider_credential(&store, "default", "aws-race", "AWS_ACCESS_KEY_ID");
+            refresh_provider_credential(&store, "default", None, "aws-race", "AWS_ACCESS_KEY_ID");
         let interfere = async {
             // Wait until the rotation is inside the STS call (its state read has
             // already happened), then delete the refresh and release STS.
@@ -2252,8 +2405,13 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let rotate =
-            refresh_provider_credential(&store, "default", "aws-superseded", "AWS_ACCESS_KEY_ID");
+        let rotate = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            "aws-superseded",
+            "AWS_ACCESS_KEY_ID",
+        );
         let interfere = async {
             if tokio::time::timeout(std::time::Duration::from_secs(15), hit_rx)
                 .await
@@ -2315,6 +2473,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 
