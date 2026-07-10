@@ -29,16 +29,21 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
-    let chain = openshell_supervisor_middleware::ChainRunner::default()
-        .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
-            name: "test".into(),
-            implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error: openshell_supervisor_middleware::OnError::FailClosed,
-        }])
-        .await
-        .expect("describe built-in middleware");
+    let chain = openshell_supervisor_middleware::ChainRunner::new(
+        openshell_supervisor_middleware_builtins::services()
+            .into_iter()
+            .next()
+            .expect("built-in middleware service"),
+    )
+    .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
+        name: "test".into(),
+        implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+        order: 0,
+        config: prost_types::Struct::default(),
+        on_error: openshell_supervisor_middleware::OnError::FailClosed,
+    }])
+    .await
+    .expect("describe built-in middleware");
     chain[0].max_body_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
@@ -1170,6 +1175,7 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
     generation_guard: Option<&PolicyGenerationGuard>,
     max_wire_bytes: Option<usize>,
 ) -> Result<Vec<u8>> {
+    let max_decoded_bytes = max_wire_bytes.unwrap_or(MAX_REWRITE_BODY_BYTES);
     let mut read_state = ChunkedReadState {
         buffered_pos: 0,
         wire_bytes: 0,
@@ -1207,9 +1213,9 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
             }
         }
 
-        if body.len().saturating_add(chunk_size) > MAX_REWRITE_BODY_BYTES {
+        if body.len().saturating_add(chunk_size) > max_decoded_bytes {
             return Err(miette!(
-                "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                "decoded chunked body exceeds {max_decoded_bytes} byte buffer limit"
             ));
         }
         read_buffered_exact(
@@ -3369,6 +3375,22 @@ mod tests {
                 .expect_err("wire framing over the cap must be rejected");
 
         assert!(error.to_string().contains("wire representation"));
+    }
+
+    #[tokio::test]
+    async fn middleware_chunked_body_can_exceed_credential_rewrite_limit() {
+        let max_body_bytes = 1024 * 1024;
+        let payload_len = 300 * 1024;
+        assert!(payload_len > MAX_REWRITE_BODY_BYTES);
+        let mut wire = format!("{payload_len:x}\r\n").into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', payload_len));
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let body = collect_chunked_body(&mut tokio::io::empty(), &wire, None, Some(max_body_bytes))
+            .await
+            .expect("middleware cap should control chunked body collection");
+
+        assert_eq!(body.len(), payload_len);
     }
 
     /// SEC-009: Bare LF in headers enables header injection.

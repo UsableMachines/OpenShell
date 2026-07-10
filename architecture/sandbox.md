@@ -73,13 +73,38 @@ values with stable name tie-breaking, and the gRPC contract represents operation
 and phases as enums. Built-ins run in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
-service capabilities and policy-owned config before delivery. Supervisors keep
-the last-known-good service registry when a live config reload fails. Built-in
-middleware identifiers, host-selector matching, and pure config validation live
-in `openshell-core` so policy admission does not depend on the supervisor
-runtime implementation. The policy and runtime also share the core
-JSON/protobuf adapter for middleware configuration, keeping serialization
-consistent across that boundary.
+service capabilities and implementation-owned config before delivery.
+For a gateway policy snapshot, the supervisor prepares replacements off to the
+side and installs them as one runtime generation. A policy-only change swaps
+the policy engine alone and reuses the connected registry, so middleware
+reachability cannot block it. The registry is rebuilt, reconnecting every
+delivered service, only when the delivered service set changes or the installed
+registry is degraded; that rebuild commits together with the policy engine.
+A failure preserves the complete last-known-good runtime and leaves its applied
+hash and registrations unchanged so the snapshot is retried. The generic
+registry and chain runner live in
+`openshell-supervisor-middleware`;
+first-party implementations and their config schemas live in
+`openshell-supervisor-middleware-builtins`. The gateway and supervisor inject
+those services explicitly and discover their binding IDs through the same
+`Describe` contract used by external services. Reusable compiled DNS host
+patterns and selectors remain in `openshell-core::host_pattern`.
+
+`openshell-policy` validates policy-owned middleware structure without knowing
+which implementations are installed. The active middleware registry validates
+implementation-owned config before gateway admission. The supervisor's
+local-file path supplies its built-in catalog to the same JSON projection so it
+retains early config validation. Rego exposes the middleware list as policy
+data, but Rust performs selector validation, overlap detection, matching, chain
+ordering, implementation discovery, and config validation.
+
+The Rust HTTP pipeline makes transformed-body handling explicit for every
+middleware invocation: body-independent protocols select a no-recheck mode,
+while GraphQL, JSON-RPC, and MCP carry a policy evaluator bound to the captured
+policy generation. Each replacement is reclassified and evaluated before the
+next stage runs. Hard-deny classification is shared by CONNECT relays,
+route-selected relays, and forward proxying; evaluator failures become
+structured fail-closed outcomes instead of escaping the middleware pipeline.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
@@ -186,11 +211,43 @@ the structured 403 and authors the narrowest rule. Mechanistically mapping L7
 would either over-broaden rules or require path-templating logic that rots
 quickly.
 
+## Policy Revision Acknowledgement
+
+When the supervisor loads a sandbox-scoped policy from the gateway, it retains
+the version, hash, source, and configuration revision returned with that exact
+policy snapshot. After the OPA engine is built successfully, the supervisor
+reports that revision as `LOADED`, which advances
+`SandboxStatus.current_policy_version` and moves the revision out of `Pending`.
+If policy construction fails, it reports the captured revision as `FAILED` with
+the original construction error. It never infers revision identity by comparing
+policy structure.
+
+This holds even when the initial policy is enriched with baseline paths during
+startup: the enriched revision the supervisor synced back to the gateway is the
+revision it acknowledges, so a successfully constructed initial policy never
+remains `Pending`. If the first poll returns a different revision, the supervisor
+processes it through the normal reload path instead of treating it as already
+loaded.
+
+Policy status delivery uses a FIFO background worker. Retryable delivery
+failures retain the ordered update and retry with capped exponential backoff;
+terminal errors are logged and discarded. The outbox is nonblocking and does
+not discard updates because of a fixed queue capacity, so status endpoint
+outages cannot block policy polling, enforcement, settings, or provider
+refreshes and cannot permanently lose the initial acknowledgement.
+
+Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
+zero) are acknowledged. Global policies and local-file development policies do
+not use the sandbox revision API and produce no acknowledgement. When explicit
+local Rego and data files are configured, the supervisor continues polling the
+gateway for settings and provider refreshes but never replaces the local OPA
+engine with a gateway policy revision.
+
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
-- If a live policy update is invalid, the supervisor rejects it and keeps the
-  current policy.
+- If a live policy or middleware-registry update is invalid, the supervisor
+  rejects the combined update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`
   behavior decides whether to deny the request or continue without that stage.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply

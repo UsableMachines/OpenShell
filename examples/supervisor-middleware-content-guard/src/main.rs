@@ -18,7 +18,6 @@ use prost_types::value::Kind;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-const API_VERSION: &str = "openshell.middleware.v1";
 const BINDING_ID: &str = "example/content-guard";
 const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
 const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
@@ -120,7 +119,6 @@ impl SupervisorMiddleware for ContentGuard {
         _request: Request<()>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
-            api_version: API_VERSION.into(),
             name: "example/content-guard-service".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![MiddlewareBinding {
@@ -137,7 +135,7 @@ impl SupervisorMiddleware for ContentGuard {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
-        let validation = validate_envelope(&request.api_version, &request.binding_id, None)
+        let validation = validate_envelope(&request.binding_id, None)
             .and_then(|()| GuardConfig::parse(request.config.as_ref()));
         Ok(Response::new(match validation {
             Ok(_) => ValidateConfigResponse {
@@ -156,12 +154,8 @@ impl SupervisorMiddleware for ContentGuard {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
         let request = request.into_inner();
-        validate_envelope(
-            &request.api_version,
-            &request.binding_id,
-            Some(&request.phase),
-        )
-        .map_err(Status::invalid_argument)?;
+        validate_envelope(&request.binding_id, Some(&request.phase))
+            .map_err(Status::invalid_argument)?;
         let config =
             GuardConfig::parse(request.config.as_ref()).map_err(Status::invalid_argument)?;
         let body = String::from_utf8(request.body)
@@ -170,14 +164,7 @@ impl SupervisorMiddleware for ContentGuard {
     }
 }
 
-fn validate_envelope(
-    api_version: &str,
-    binding_id: &str,
-    phase: Option<&i32>,
-) -> Result<(), String> {
-    if api_version != API_VERSION {
-        return Err(format!("unsupported api_version '{api_version}'"));
-    }
+fn validate_envelope(binding_id: &str, phase: Option<&i32>) -> Result<(), String> {
     if binding_id != BINDING_ID {
         return Err(format!("unsupported binding_id '{binding_id}'"));
     }

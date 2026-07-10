@@ -17,11 +17,16 @@ For each inspected HTTP request, the supervisor:
 
 1. Evaluates network and L7 policy.
 2. Selects middleware whose host selectors match the admitted destination.
-3. Buffers the request body using the smallest body limit in the selected chain.
+3. Buffers the request body using the largest body limit in the selected chain.
 4. Runs matching middleware by ascending `order`, using the policy-local name to break ties.
-5. Applies allowed transformations, injects provider credentials, and forwards the request.
+5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
+6. Applies allowed transformations, injects provider credentials, and forwards the request.
 
-Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials.
+Because each transformed body is re-checked before the next stage runs, a middleware hook always receives a request that satisfies the sandbox policy. A stage whose output the policy rejects stops the chain; under `enforcement: audit` the rejection is logged and the request proceeds.
+
+If post-transformation policy evaluation itself fails, OpenShell denies the request and emits a high-severity detection finding. This failure is separate from middleware `on_error` because the middleware completed successfully; the sandbox policy could not validate its output.
+
+Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Request headers are delivered in wire order and repeated header names are preserved as separate entries, so a service inspects every value the upstream will receive.
 
 ## Choose a Middleware Type
 
@@ -30,7 +35,7 @@ Middleware receives the request before credential injection. Operator-run servic
 | Built-in | None | Defined by OpenShell | Runs inside the supervisor |
 | Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
 
-`openshell/secrets` is the built-in middleware currently available. It identifies common secret patterns in UTF-8 request bodies and replaces matched values before the request leaves the sandbox.
+`openshell/secrets` is the built-in middleware currently available. It identifies common secret patterns in UTF-8 request bodies and replaces matched values before the request leaves the sandbox. Its `config` accepts one field, `secrets: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation.
 
 Operator-run services expose one or more binding IDs. Policies reference a binding ID, such as `example/content-guard`, rather than the gateway registration name.
 
@@ -74,7 +79,7 @@ network_middlewares:
 
 Each config has a policy-local `name`, a built-in or operator-provided binding ID in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors.
 
-`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints.
+`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
 
 Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may reference the same binding and run as separate stages. Config names must be unique.
 
@@ -93,16 +98,24 @@ Use `fail_open` only when bypassing the middleware preserves the intended securi
 
 An explicit deny decision always stops the chain and denies the request, regardless of `on_error`.
 
+Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
+
 ## Set Body Limits
 
 Every middleware binding declares the largest request or replacement body it supports.
 
 - Built-in middleware uses its OpenShell-defined limit.
 - Each operator-run registration sets `max_body_bytes` no higher than the service capability.
-- A selected chain buffers using its smallest stage limit.
+- A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
-The gateway rejects a registration whose operator limit exceeds the service capability instead of silently clamping it. At request time, exceeding a selected stage's limit is a middleware failure and follows that config's `on_error` behavior.
+The gateway rejects a registration whose operator limit exceeds the service capability instead of silently clamping it. At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. A body larger than every stage limit cannot be inspected at all and is denied unless every selected stage is `fail_open`.
+
+## Add Request Headers
+
+A middleware result can add new request headers before OpenShell injects credentials. Header names are case-insensitive and must start with `x-openshell-middleware-`. Values must not contain control characters.
+
+A result that rewrites an existing request header, uses a name outside the required prefix, or carries an unsafe value is treated as a middleware failure and follows that config's `on_error` behavior. The failure reason names the offending header. Protected headers, including `authorization`, `cookie`, `host`, `content-length`, `transfer-encoding`, and OpenShell credential and signature headers, are always rejected.
 
 ## Operate Middleware Services
 
@@ -131,7 +144,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 
 ## Current Limitations
 
-- Middleware applies only to HTTP requests parsed by the supervisor.
+- Middleware applies only to HTTP requests parsed by the supervisor. Traffic the supervisor cannot inspect, such as HTTP/2 prior knowledge or non-HTTP TCP protocols, is denied on hosts matched by a fail-closed middleware, and relayed with a detection finding when every matching middleware is `fail_open`.
 - The typed operation and phase are `HTTP_REQUEST/PRE_CREDENTIALS`.
 - Selection uses destination host include and exclude patterns.
 - Required middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic.

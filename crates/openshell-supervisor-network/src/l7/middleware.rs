@@ -10,7 +10,6 @@ use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -19,11 +18,77 @@ pub enum MiddlewareApplyResult {
     Denied(String),
 }
 
-/// Smallest body-buffering limit across the entries that actually resolved to a
-/// registered binding. Unresolved entries (`is_resolved() == false`) report a
-/// zero limit and are excluded here: they are handled by their `on_error` policy
-/// in `evaluate_described` without inspecting the body, so letting a zero drag
-/// the chain limit to zero would spuriously fail the whole chain over capacity.
+/// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
+/// protocols without an L7 relay) must be handled for a matching chain.
+///
+/// This is derived from each entry's `on_error` today. A future per-config
+/// `on_uninspectable` knob could let an operator keep `fail_closed` error
+/// handling for HTTP traffic while allowing uninspectable protocols through
+/// without maintaining host excludes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninspectableTrafficGate {
+    /// No middleware matches this destination; raw relay is unaffected.
+    Unrestricted,
+    /// Every matching entry is `fail_open`: relay raw bytes but emit a bypass
+    /// detection finding.
+    BypassWithFinding,
+    /// At least one matching entry is `fail_closed`: deny, the middleware
+    /// must be able to see the traffic for it to flow.
+    Deny,
+}
+
+pub fn uninspectable_traffic_gate(
+    chain: &[openshell_supervisor_middleware::ChainEntry],
+) -> UninspectableTrafficGate {
+    if chain.is_empty() {
+        return UninspectableTrafficGate::Unrestricted;
+    }
+    if chain
+        .iter()
+        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen)
+    {
+        UninspectableTrafficGate::BypassWithFinding
+    } else {
+        UninspectableTrafficGate::Deny
+    }
+}
+
+/// Emit the detection finding for traffic a matching middleware chain cannot
+/// inspect: denied under a fail-closed chain, bypassed under fail-open.
+pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: bool) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(if denied {
+            SeverityId::High
+        } else {
+            SeverityId::Medium
+        })
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.traffic_uninspectable",
+            "Supervisor middleware cannot inspect this traffic",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("protocol", detail),
+            ("disposition", if denied { "denied" } else { "fail_open" }),
+        ])
+        .message(if denied {
+            "Uninspectable traffic to host with required middleware; denied"
+        } else {
+            "Uninspectable traffic bypassed middleware (fail_open)"
+        })
+        .build();
+    ocsf_emit!(event);
+}
+
+/// Largest body-buffering limit across the entries that actually resolved to a
+/// registered binding. Buffering for the most capable stage lets every stage
+/// that can handle the body run; stages whose own limit is smaller are failed
+/// individually with `request_body_over_capacity` through their `on_error`
+/// policy in `evaluate_described`, instead of one undersized stage forcing the
+/// whole chain onto the unbuffered path. Unresolved entries
+/// (`is_resolved() == false`) report a zero limit and are excluded here: they
+/// are handled by their `on_error` policy without inspecting the body.
 /// Returns `None` when no entry resolved, so the caller can skip buffering.
 pub(super) fn middleware_chain_body_limit(
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
@@ -32,7 +97,7 @@ pub(super) fn middleware_chain_body_limit(
         .iter()
         .filter(|entry| entry.is_resolved())
         .map(openshell_supervisor_middleware::DescribedChainEntry::max_body_bytes)
-        .min()
+        .max()
 }
 
 pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -42,11 +107,22 @@ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
 ) -> Result<MiddlewareApplyResult> {
-    apply_middleware_chain_for_scheme(req, client, ctx, "https", chain, runner, generation_guard)
-        .await
+    apply_middleware_chain_for_scheme(
+        req,
+        client,
+        ctx,
+        "https",
+        chain,
+        runner,
+        generation_guard,
+        transformed_body_policy,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
@@ -55,6 +131,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     runner: &openshell_supervisor_middleware::ChainRunner,
     generation_guard: &PolicyGenerationGuard,
+    transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
@@ -65,14 +142,8 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input = middleware_request_input(
-            scheme,
-            &req,
-            ctx,
-            BTreeMap::new(),
-            String::new(),
-            Vec::new(),
-        );
+        let input =
+            middleware_request_input(scheme, &req, ctx, Vec::new(), String::new(), Vec::new());
         let outcome = runner.evaluate_described(&chain, input).await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
@@ -97,26 +168,30 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = middleware_request_input(scheme, &req, ctx, headers, query, buffered.body);
-    let outcome = runner.evaluate_described(&chain, input).await?;
+    // The explicitly selected transformation policy either re-checks every
+    // replacement or documents that this protocol's policy is body-independent.
+    // An ALLOW outcome therefore means the final body is policy-compliant.
+    let outcome = runner
+        .evaluate_described_with_policy(&chain, input, transformed_body_policy)
+        .await?;
     emit_middleware_events(ctx, &req, &outcome);
+    if !outcome.allowed {
+        return Ok(MiddlewareApplyResult::Denied(outcome.reason));
+    }
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
         &req,
         &buffered.headers,
         &outcome.body,
         &outcome.added_headers,
     )?;
-    if outcome.allowed {
-        Ok(MiddlewareApplyResult::Allowed(rebuilt))
-    } else {
-        Ok(MiddlewareApplyResult::Denied(outcome.reason))
-    }
+    Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }
 
 pub(super) fn middleware_request_input(
     scheme: &str,
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
-    headers: BTreeMap<String, String>,
+    headers: Vec<(String, String)>,
     query: String,
     body: Vec<u8>,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
@@ -147,10 +222,11 @@ pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
         .map_or_else(String::new, |(_, query)| query.to_string()))
 }
 
-/// Apply the chain's `on_error` policy when the request body cannot be buffered
-/// for inspection because it exceeds the size cap. The RFC treats an unbufferable
-/// body as an `on_error` event: it is denied unless every attached middleware is
-/// `fail_open`, and passing it through is only safe when no bytes were consumed.
+/// Apply the chain's `on_error` policy when the request body exceeds every
+/// stage's buffering limit. No stage can inspect such a body, so each stage
+/// would individually fail with `request_body_over_capacity`; the aggregate is
+/// a deny unless every attached middleware is `fail_open`, and passing the
+/// body through is only safe when no bytes were consumed.
 pub(super) fn resolve_unbuffered_body(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,
@@ -193,10 +269,13 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
     ocsf_emit!(event);
 }
 
-fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
+/// Parse the raw header block into middleware-visible headers, preserving
+/// wire order and repeated names so middleware inspects every value the
+/// upstream will receive. Credential-bearing headers are omitted.
+fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for line in header_str.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -205,19 +284,24 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
         if name.is_empty()
             || matches!(
                 name.as_str(),
-                "authorization" | "cookie" | "host" | "content-length" | "transfer-encoding"
+                "authorization"
+                    | "proxy-authorization"
+                    | "cookie"
+                    | "host"
+                    | "content-length"
+                    | "transfer-encoding"
             )
             || name.starts_with("x-amz-")
             || name.starts_with("x-openshell-credential")
         {
             continue;
         }
-        out.insert(name, value.trim().to_string());
+        out.push((name, value.trim().to_string()));
     }
     Ok(out)
 }
 
-pub(super) fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
+pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
     crate::opa::NetworkInput {
         host: ctx.host.clone(),
         port: ctx.port,
@@ -313,6 +397,25 @@ pub(super) fn middleware_events(
             .build();
         events.push(event);
     }
+    if !outcome.allowed
+        && outcome
+            .reason
+            .starts_with("transformed_body_policy_evaluation_failed:")
+    {
+        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(SeverityId::High)
+            .finding_info(FindingInfo::new(
+                "openshell.middleware.policy_evaluation_failure",
+                "Post-middleware policy evaluation failed",
+            ))
+            .evidence_pairs(&[
+                ("policy", ctx.policy_name.as_str()),
+                ("host", ctx.host.as_str()),
+            ])
+            .message("Transformed request denied because policy evaluation failed")
+            .build();
+        events.push(event);
+    }
     for finding in &outcome.findings {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(match finding.finding.severity.as_str() {
@@ -349,5 +452,50 @@ fn emit_middleware_events(
 ) {
     for event in middleware_events(ctx, req, outcome) {
         ocsf_emit!(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_middleware_headers;
+
+    #[test]
+    fn middleware_headers_exclude_origin_and_proxy_credentials() {
+        let headers = safe_middleware_headers(
+            b"GET http://api.example.test/v1 HTTP/1.1\r\n\
+              Authorization: Bearer origin-secret\r\n\
+              Proxy-Authorization: Basic proxy-secret\r\n\
+              X-Request-ID: request-123\r\n\r\n",
+        )
+        .expect("headers should parse");
+
+        assert_eq!(
+            headers,
+            vec![("x-request-id".to_string(), "request-123".to_string())]
+        );
+    }
+
+    #[test]
+    fn middleware_headers_preserve_repeated_names_in_wire_order() {
+        // Repeated header names must reach middleware as separate entries in
+        // wire order: keeping only one value would let a request smuggle a
+        // differently-positioned duplicate past inspection while the upstream
+        // still receives every original value.
+        let headers = safe_middleware_headers(
+            b"POST /v1 HTTP/1.1\r\n\
+              X-Api-Key: first-value\r\n\
+              Accept: application/json\r\n\
+              X-Api-Key: second-value\r\n\r\n",
+        )
+        .expect("headers should parse");
+
+        assert_eq!(
+            headers,
+            vec![
+                ("x-api-key".to_string(), "first-value".to_string()),
+                ("accept".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), "second-value".to_string()),
+            ]
+        );
     }
 }

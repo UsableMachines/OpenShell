@@ -8,8 +8,8 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 /// Errors converting JSON values into protobuf well-known types.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoStructError {
-    /// A JSON number cannot be represented by protobuf's double value.
-    #[error("JSON number {0} cannot be represented as a protobuf double")]
+    /// A JSON number cannot be represented exactly by protobuf's double value.
+    #[error("JSON number {0} cannot be represented exactly as a protobuf double")]
     UnrepresentableNumber(serde_json::Number),
 }
 
@@ -34,11 +34,7 @@ pub fn json_value_to_proto(
     let kind = match value {
         serde_json::Value::Null => Kind::NullValue(0),
         serde_json::Value::Bool(value) => Kind::BoolValue(value),
-        serde_json::Value::Number(value) => Kind::NumberValue(
-            value
-                .as_f64()
-                .ok_or_else(|| ProtoStructError::UnrepresentableNumber(value.clone()))?,
-        ),
+        serde_json::Value::Number(value) => Kind::NumberValue(number_to_f64_exact(&value)?),
         serde_json::Value::String(value) => Kind::StringValue(value),
         serde_json::Value::Array(values) => Kind::ListValue(ListValue {
             values: values
@@ -50,6 +46,27 @@ pub fn json_value_to_proto(
     };
 
     Ok(Value { kind: Some(kind) })
+}
+
+fn number_to_f64_exact(value: &serde_json::Number) -> Result<f64, ProtoStructError> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| ProtoStructError::UnrepresentableNumber(value.clone()))?;
+
+    let exact = value.as_i64().map_or_else(
+        || value.as_u64().is_none_or(integer_is_exact_in_f64),
+        |integer| integer_is_exact_in_f64(integer.unsigned_abs()),
+    );
+
+    exact
+        .then_some(number)
+        .ok_or_else(|| ProtoStructError::UnrepresentableNumber(value.clone()))
+}
+
+fn integer_is_exact_in_f64(integer: u64) -> bool {
+    integer == 0
+        || (u64::BITS - integer.leading_zeros()).saturating_sub(integer.trailing_zeros())
+            <= f64::MANTISSA_DIGITS
 }
 
 /// Convert a protobuf Struct into a JSON object for typed serde decoding.
@@ -135,6 +152,29 @@ mod tests {
         let proto = json_object_to_struct(object).unwrap();
 
         assert_eq!(struct_to_json_value(&proto), json);
+    }
+
+    #[test]
+    fn rejects_integer_that_cannot_round_trip_through_protobuf_double() {
+        let value = serde_json::json!(9_007_199_254_740_993_u64);
+
+        let err = json_value_to_proto(value).expect_err("lossy integer must be rejected");
+
+        assert!(err.to_string().contains("9007199254740993"));
+        assert!(err.to_string().contains("exactly"));
+    }
+
+    #[test]
+    fn accepts_integer_that_round_trips_through_protobuf_double() {
+        let value = serde_json::json!(9_007_199_254_740_992_u64);
+
+        let proto = json_value_to_proto(value.clone()).expect("integer should be exact");
+
+        assert_eq!(
+            value_to_json(&proto).as_f64(),
+            value.as_f64(),
+            "protobuf Struct stores all numbers as doubles"
+        );
     }
 
     #[derive(Debug, Default, Deserialize)]

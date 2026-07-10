@@ -34,6 +34,8 @@ pub use merge::{
     merge_policy, policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
+pub use middleware::validate_json as validate_network_middleware_json;
+pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -1132,8 +1134,6 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
-    /// A built-in middleware configuration is invalid.
-    InvalidBuiltinMiddlewareConfig { name: String, reason: String },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Middleware configuration names must be unique.
@@ -1208,8 +1208,7 @@ impl fmt::Display for PolicyViolation {
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
-            Self::InvalidBuiltinMiddlewareConfig { name, reason }
-            | Self::InvalidMiddlewareConfig { name, reason } => {
+            Self::InvalidMiddlewareConfig { name, reason } => {
                 write!(f, "middleware config '{name}' is invalid: {reason}")
             }
             Self::DuplicateMiddlewareConfigName { name } => {
@@ -1798,6 +1797,45 @@ network_policies:
     }
 
     #[test]
+    fn structural_validation_defers_implementation_owned_config() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("future", "openshell/future");
+        middleware.config = Some(
+            openshell_core::proto_struct::json_object_to_struct(
+                std::iter::once(("implementation_field".into(), serde_json::json!(42))).collect(),
+            )
+            .unwrap(),
+        );
+        policy.network_middlewares.push(middleware);
+
+        validate_sandbox_policy(&policy)
+            .expect("generic policy validation must not select installed implementations");
+    }
+
+    #[test]
+    fn json_validation_delegates_implementation_owned_config() {
+        let data = serde_json::json!({
+            "network_middlewares": [{
+                "name": "future",
+                "middleware": "openshell/future",
+                "config": {"implementation_field": 42},
+                "endpoints": {"include": ["api.example.com"]}
+            }]
+        });
+
+        let violations =
+            validate_network_middleware_json_with_config(&data, |implementation, _config| {
+                Err(format!("{implementation} is not installed"))
+            })
+            .expect("parse middleware policy");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidMiddlewareConfig { name, reason }
+                if name == "future" && reason.contains("not installed")
+        )));
+    }
+
+    #[test]
     fn validate_rejects_root_run_as_user() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
@@ -1826,27 +1864,6 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_invalid_builtin_middleware_config() {
-        let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redact-secrets", "openshell/secrets");
-        middleware.config = Some(
-            openshell_core::proto_struct::json_object_to_struct(
-                std::iter::once(("secrets".into(), serde_json::Value::String("allow".into())))
-                    .collect(),
-            )
-            .unwrap(),
-        );
-        policy.network_middlewares.push(middleware);
-
-        let violations = validate_sandbox_policy(&policy).expect_err("invalid config");
-        assert!(violations.iter().any(|violation| matches!(
-            violation,
-            PolicyViolation::InvalidBuiltinMiddlewareConfig { name, .. }
-                if name == "redact-secrets"
-        )));
-    }
-
-    #[test]
     fn validate_rejects_invalid_middleware_control_fields() {
         let cases = [
             (
@@ -1856,10 +1873,6 @@ network_policies:
             (
                 middleware_config("redactor", ""),
                 "implementation must not be empty",
-            ),
-            (
-                middleware_config("redactor", "openshell/unknown"),
-                "unsupported built-in",
             ),
             (
                 {
@@ -1940,7 +1953,9 @@ network_policies:
     fn middleware_host_selector_matching_is_case_insensitive() {
         assert!(middleware_host_matches("*.Example.COM", "API.example.com").unwrap());
         assert!(!middleware_host_matches("*.example.com", "example.com").unwrap());
-        assert!(middleware_host_matches("*", "deep.api.example.com").unwrap());
+        assert!(!middleware_host_matches("*.example.com", "deep.api.example.com").unwrap());
+        assert!(middleware_host_matches("**.example.com", "deep.api.example.com").unwrap());
+        assert!(!middleware_host_matches("**.example.com", "example.com").unwrap());
     }
 
     #[test]
@@ -1971,6 +1986,37 @@ network_policies:
                 policy_name,
                 host,
             } if middleware_name == "redactor" && policy_name == "api" && host == "api.example.com"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_concrete_selector_overlapping_tls_skip_wildcard() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        middleware.endpoints.as_mut().unwrap().include = vec!["api.example.com".into()];
+        policy.network_middlewares.push(middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } if middleware_name == "redactor" && policy_name == "api" && host == "*.example.com"
         )));
     }
 

@@ -371,5 +371,5 @@ message SupervisorMiddlewareService {
   // gRPC endpoint reachable from the sandbox supervisor.
   string grpc_endpoint = 2;
   // Operator-owned body limit applied to every binding exposed by the service.
-  uint64 max_body_bytes = 4;
+  uint64 max_body_bytes = 3;
 }
