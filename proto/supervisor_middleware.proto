@@ -22,38 +22,37 @@ service SupervisorMiddleware {
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 }
 
-// MiddlewareManifest describes one service and the bindings it exposes.
+// MiddlewareManifest describes one middleware service and the bindings it
+// exposes. The service is the operator-run gRPC server implementing
+// SupervisorMiddleware.
 message MiddlewareManifest {
-  // Middleware protocol version implemented by the service.
-  string api_version = 1;
-  // Human-readable service name used for diagnostics.
-  string name = 2;
-  // Service-defined version string used for diagnostics.
-  string service_version = 3;
-  // Bindings exposed by this service.
-  repeated MiddlewareBinding bindings = 4;
+  // Human-readable middleware service name used for diagnostics.
+  string name = 1;
+  // Release version of the middleware service implementation, used for
+  // diagnostics.
+  string service_version = 2;
+  // Bindings exposed by this middleware service.
+  repeated MiddlewareBinding bindings = 3;
 }
 
 // MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
   // Stable binding id used by policy configuration and audit logs.
   string id = 1;
-  // Supported operation name. V1 supports "HttpRequest".
-  string operation = 2;
-  // Supported evaluation phase. V1 supports "pre_credentials".
-  string phase = 3;
+  // Supported operation. V1 supports HTTP_REQUEST.
+  SupervisorMiddlewareOperation operation = 2;
+  // Supported evaluation phase. V1 supports PRE_CREDENTIALS.
+  SupervisorMiddlewarePhase phase = 3;
   // Maximum request or replacement body this binding can process.
   uint64 max_body_bytes = 4;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
 message ValidateConfigRequest {
-  // Middleware protocol version selected by OpenShell.
-  string api_version = 1;
   // Manifest binding id associated with this configuration.
-  string binding_id = 2;
+  string binding_id = 1;
   // Service-specific policy configuration.
-  google.protobuf.Struct config = 3;
+  google.protobuf.Struct config = 2;
 }
 
 // ValidateConfigResponse reports whether a policy configuration is accepted.
@@ -66,22 +65,43 @@ message ValidateConfigResponse {
 
 // HttpRequestEvaluation contains one buffered HTTP request to evaluate.
 message HttpRequestEvaluation {
-  // Middleware protocol version selected by OpenShell.
-  string api_version = 1;
   // Manifest binding id selected for this evaluation.
-  string binding_id = 2;
+  string binding_id = 1;
   // Evaluation phase selected for this request.
-  string phase = 3;
+  SupervisorMiddlewarePhase phase = 2;
   // Sandbox and request identity available to the supervisor.
-  RequestContext context = 4;
+  RequestContext context = 3;
   // Validated service-specific policy configuration.
-  google.protobuf.Struct config = 5;
+  google.protobuf.Struct config = 4;
   // Destination and HTTP request target.
-  HttpRequestTarget target = 6;
-  // HTTP request headers before OpenShell injects credentials.
-  map<string, string> headers = 7;
+  HttpRequestTarget target = 5;
+  // HTTP request headers before OpenShell injects credentials, in wire
+  // order. Repeated header names are preserved as separate entries so a
+  // service inspects every value the upstream will receive. Protected
+  // headers such as authorization or cookie are omitted.
+  repeated HttpHeader headers = 6;
   // Buffered request body. Empty for a bodyless request.
-  bytes body = 8;
+  bytes body = 7;
+}
+
+// HttpHeader is one request header line.
+message HttpHeader {
+  // Lowercased header name.
+  string name = 1;
+  // Header value with surrounding whitespace trimmed.
+  string value = 2;
+}
+
+// Supervisor operation selected for middleware evaluation.
+enum SupervisorMiddlewareOperation {
+  SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
+  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
+}
+
+// Ordered phase within a supervisor operation.
+enum SupervisorMiddlewarePhase {
+  SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED = 0;
+  SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS = 1;
 }
 
 // RequestContext identifies the sandbox request being evaluated.
@@ -148,13 +168,20 @@ message Finding {
 message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
-  // Human-readable reason used for diagnostics and denied responses.
+  // Audit-safe human-readable reason used for diagnostics, denied responses,
+  // and security logs. Must not contain request content, configured terms,
+  // credentials, or other secrets.
   string reason = 2;
   // Replacement request body when has_body is true.
   bytes body = 3;
   // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
-  // Request headers to add before forwarding. Protected headers are rejected.
+  // Request headers to add before forwarding. Only new headers whose
+  // case-insensitive names start with "x-openshell-middleware-" are accepted.
+  // Existing request headers cannot be rewritten, protected headers such as
+  // authorization or transfer-encoding are always rejected, and values must
+  // not contain control characters. A violating result is a middleware
+  // failure handled according to the policy failure mode.
   map<string, string> add_headers = 5;
   // Audit-safe findings produced during evaluation.
   repeated Finding findings = 6;

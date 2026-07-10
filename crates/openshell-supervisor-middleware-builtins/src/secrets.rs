@@ -7,26 +7,49 @@ use std::sync::LazyLock;
 use miette::{Result, miette};
 use openshell_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
 };
 use regex::Regex;
+use serde::Deserialize;
 
 pub const BINDING_ID: &str = "openshell/secrets";
-const OPERATION: &str = "HttpRequest";
-const PHASE: &str = "pre_credentials";
 const MAX_BODY_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// Redaction mode. Omitting the field selects [`SecretsMode::Redact`].
+    pub secrets: SecretsMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretsMode {
+    #[default]
+    Redact,
+}
+
+impl SecretsConfig {
+    pub fn from_struct(config: &prost_types::Struct) -> Result<Self> {
+        serde_json::from_value(openshell_core::proto_struct::struct_to_json_value(config)).map_err(
+            |error| {
+                miette!(
+                    "invalid {BINDING_ID} config: {error}; phase 1 supports only secrets: redact"
+                )
+            },
+        )
+    }
+}
 
 pub fn describe() -> MiddlewareBinding {
     MiddlewareBinding {
         id: BINDING_ID.into(),
-        operation: OPERATION.into(),
-        phase: PHASE.into(),
+        operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+        phase: SupervisorMiddlewarePhase::PreCredentials as i32,
         max_body_bytes: MAX_BODY_BYTES,
     }
 }
 
-/// A named secret-detection pattern. The `kind` is an audit-safe label that
-/// flows into findings so operators can see *what* matched without seeing the
-/// raw value.
 struct SecretPattern {
     kind: &'static str,
     regex: Regex,
@@ -41,8 +64,6 @@ impl SecretPattern {
     }
 }
 
-/// Compiled once: recompiling per request would put regex construction on the
-/// egress hot path.
 static SECRET_PATTERNS: LazyLock<[SecretPattern; 2]> = LazyLock::new(|| {
     [
         SecretPattern::new(
@@ -54,21 +75,7 @@ static SECRET_PATTERNS: LazyLock<[SecretPattern; 2]> = LazyLock::new(|| {
 });
 
 pub fn validate_config(config: &prost_types::Struct) -> Result<()> {
-    let mode = config
-        .fields
-        .get("secrets")
-        .and_then(|value| match value.kind.as_ref() {
-            Some(prost_types::value::Kind::StringValue(value)) => Some(value.as_str()),
-            _ => None,
-        })
-        .unwrap_or("redact");
-    if mode != "redact" {
-        return Err(miette!(
-            "{} only supports config.secrets: redact in phase 1",
-            BINDING_ID
-        ));
-    }
-    Ok(())
+    SecretsConfig::from_struct(config).map(|_| ())
 }
 
 pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
@@ -89,17 +96,16 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
         findings: Vec::new(),
         metadata: HashMap::new(),
     };
+    for (kind, count) in &matches {
+        result.findings.push(Finding {
+            r#type: format!("secret.{kind}"),
+            label: format!("{kind} secret pattern"),
+            count: *count,
+            confidence: "medium".into(),
+            severity: "medium".into(),
+        });
+    }
     if !matches.is_empty() {
-        // One finding per matched pattern kind, so audit shows what matched.
-        for (kind, count) in &matches {
-            result.findings.push(Finding {
-                r#type: format!("secret.{kind}"),
-                label: format!("{kind} secret pattern"),
-                count: *count,
-                confidence: "medium".into(),
-                severity: "medium".into(),
-            });
-        }
         result
             .metadata
             .insert("secrets_redacted".into(), total.to_string());
@@ -107,8 +113,6 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
     Ok(result)
 }
 
-/// Redact every configured secret pattern, returning the transformed text and
-/// the per-kind match counts (only kinds that matched are included).
 fn redact_common_secrets(input: &str) -> (String, Vec<(&'static str, u32)>) {
     let mut output = input.to_string();
     let mut matches = Vec::new();

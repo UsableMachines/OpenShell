@@ -20,6 +20,7 @@ pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
+pub mod host_pattern;
 pub mod image;
 pub mod inference;
 pub mod metadata;

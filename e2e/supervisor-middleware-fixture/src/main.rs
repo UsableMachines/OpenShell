@@ -10,14 +10,16 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
 };
 use openshell_core::proto::{
     Decision, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding, MiddlewareManifest,
-    ValidateConfigRequest, ValidateConfigResponse,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use serde_json::Value;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-const API_VERSION: &str = "openshell.middleware.v1";
 const BINDING_ID: &str = "e2e/scripted";
+const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
+const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 const MAX_BODY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Default)]
@@ -30,13 +32,12 @@ impl SupervisorMiddleware for ScriptedMiddleware {
         _request: Request<()>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
-            api_version: API_VERSION.into(),
             name: "openshell-e2e-middleware-fixture".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![MiddlewareBinding {
                 id: BINDING_ID.into(),
-                operation: "HttpRequest".into(),
-                phase: "pre_credentials".into(),
+                operation: OPERATION as i32,
+                phase: PHASE as i32,
                 max_body_bytes: 4 * 1024,
             }],
         }))
@@ -46,12 +47,16 @@ impl SupervisorMiddleware for ScriptedMiddleware {
         &self,
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
-        let fields = request.into_inner().config.unwrap_or_default().fields;
-        let valid = !fields.contains_key("reject_fixture_config");
+        let request = request.into_inner();
+        let fields = request.config.unwrap_or_default().fields;
+        let valid =
+            request.binding_id == BINDING_ID && !fields.contains_key("reject_fixture_config");
         Ok(Response::new(ValidateConfigResponse {
             valid,
             reason: if valid {
                 String::new()
+            } else if request.binding_id != BINDING_ID {
+                format!("unsupported binding_id '{}'", request.binding_id)
             } else {
                 "fixture configuration rejected".into()
             },
@@ -63,6 +68,18 @@ impl SupervisorMiddleware for ScriptedMiddleware {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
         let request = request.into_inner();
+        if request.binding_id != BINDING_ID {
+            return Err(Status::invalid_argument(format!(
+                "unsupported binding_id '{}'",
+                request.binding_id
+            )));
+        }
+        if request.phase != PHASE as i32 {
+            return Err(Status::invalid_argument(format!(
+                "unsupported phase '{}'",
+                request.phase
+            )));
+        }
         let action = serde_json::from_slice::<Value>(&request.body)
             .ok()
             .and_then(|value| {

@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-supervisor-middleware"
-description = "In-process supervisor middleware contract and built-ins for OpenShell"
+description = "Supervisor middleware registry and chain execution for OpenShell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,11 +15,11 @@ openshell-core = { path = "../openshell-core", default-features = false }
 
 miette = { workspace = true }
 prost-types = { workspace = true }
-regex = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["channel", "server", "tls-native-roots"] }
 
 [dev-dependencies]
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]

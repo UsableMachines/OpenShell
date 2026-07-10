@@ -12,6 +12,7 @@ pub mod graphql;
 pub(crate) mod http;
 pub mod inference;
 pub mod jsonrpc;
+pub(crate) mod middleware;
 pub mod path;
 pub mod provider;
 pub mod relay;

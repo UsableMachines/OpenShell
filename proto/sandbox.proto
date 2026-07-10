@@ -77,6 +77,8 @@ message NetworkMiddlewareConfig {
   string on_error = 4;
   // Host selector controlling which admitted destinations use this config.
   MiddlewareEndpointSelector endpoints = 5;
+  // Deterministic execution order. Lower values run first; names break ties.
+  int32 order = 6;
 }
 
 // Host selector controlling which admitted destinations use a middleware config.
@@ -369,5 +371,5 @@ message SupervisorMiddlewareService {
   // gRPC endpoint reachable from the sandbox supervisor.
   string grpc_endpoint = 2;
   // Operator-owned body limit applied to every binding exposed by the service.
-  uint64 max_body_bytes = 4;
+  uint64 max_body_bytes = 3;
 }

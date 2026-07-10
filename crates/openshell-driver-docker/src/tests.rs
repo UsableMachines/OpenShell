@@ -118,40 +118,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
-    match json_value(value).kind {
-        Some(prost_types::value::Kind::StructValue(value)) => value,
-        _ => panic!("expected JSON object"),
-    }
-}
-
-fn json_value(value: serde_json::Value) -> prost_types::Value {
-    match value {
-        serde_json::Value::Null => prost_types::Value { kind: None },
-        serde_json::Value::Bool(value) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::BoolValue(value)),
-        },
-        serde_json::Value::Number(value) => prost_types::Value {
-            kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
-        },
-        serde_json::Value::String(value) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::StringValue(value)),
-        },
-        serde_json::Value::Array(values) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::ListValue(
-                prost_types::ListValue {
-                    values: values.into_iter().map(json_value).collect(),
-                },
-            )),
-        },
-        serde_json::Value::Object(values) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                fields: values
-                    .into_iter()
-                    .map(|(key, value)| (key, json_value(value)))
-                    .collect(),
-            })),
-        },
-    }
+    let serde_json::Value::Object(object) = value else {
+        panic!("expected JSON object");
+    };
+    openshell_core::proto_struct::json_object_to_struct(object)
+        .expect("test JSON must convert to a protobuf Struct")
 }
 
 fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::models::Volume {
@@ -753,6 +724,39 @@ fn driver_config_allows_explicit_writable_volume_mounts() {
         .expect("driver config mounts should be set");
 
     assert_eq!(mounts[0].read_only, Some(false));
+}
+
+#[test]
+fn driver_config_rejects_duplicate_mount_targets() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [
+            {
+                "type": "volume",
+                "source": "work-nfs",
+                "target": "/sandbox/work"
+            },
+            {
+                "type": "tmpfs",
+                "target": "/sandbox/work"
+            }
+        ]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("duplicate docker driver_config mount target")
+    );
 }
 
 #[test]
@@ -2018,7 +2022,7 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
 
 #[test]
 fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
-    let image = default_docker_supervisor_image();
+    let image = openshell_core::config::default_supervisor_image();
     assert!(
         image.starts_with("ghcr.io/nvidia/openshell/supervisor:"),
         "unexpected default image reference: {image}",
@@ -2057,36 +2061,25 @@ fn configured_supervisor_image_takes_precedence_over_local_binaries() {
 
 #[test]
 fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
+    use openshell_core::config::resolve_supervisor_image_tag;
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
-        "1.2.3",
+        resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
+        "1.2.3"
     );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, Some("sha"), "0.0.0"),
-        "sha",
-    );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, None, "1.2.3"),
-        "1.2.3",
-    );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
-        "dev",
-    );
+    assert_eq!(resolve_supervisor_image_tag(&["", "sha", "0.0.0"]), "sha");
+    assert_eq!(resolve_supervisor_image_tag(&["", "", "1.2.3"]), "1.2.3");
+    assert_eq!(resolve_supervisor_image_tag(&["", "", "0.0.0"]), "dev");
 }
 
 #[test]
 fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+    use openshell_core::config::resolve_supervisor_image_tag;
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+        resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
         "0.0.37-dev.156-g1d3b741ee",
     );
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(
-            Some("0.0.37-dev.156+g1d3b741ee"),
-            None,
-            "0.0.0",
-        ),
+        resolve_supervisor_image_tag(&["0.0.37-dev.156+g1d3b741ee", "", "0.0.0"]),
         "0.0.37-dev.156-g1d3b741ee",
     );
 }

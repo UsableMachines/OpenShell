@@ -1648,39 +1648,9 @@ fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
         ));
     };
 
-    Ok(prost_types::Struct {
-        fields: fields
-            .into_iter()
-            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-            .collect::<Result<_>>()?,
-    })
-}
-
-fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value> {
-    use prost_types::{ListValue, Struct, Value, value::Kind};
-
-    let kind = match value {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(value) => Kind::BoolValue(value),
-        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().ok_or_else(|| {
-            miette!("--driver-config-json contains a number that cannot be represented")
-        })?),
-        serde_json::Value::String(value) => Kind::StringValue(value),
-        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
-            values: values
-                .into_iter()
-                .map(json_to_protobuf_value)
-                .collect::<Result<_>>()?,
-        }),
-        serde_json::Value::Object(fields) => Kind::StructValue(Struct {
-            fields: fields
-                .into_iter()
-                .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-                .collect::<Result<_>>()?,
-        }),
-    };
-
-    Ok(Value { kind: Some(kind) })
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .into_diagnostic()
+        .wrap_err("--driver-config-json contains a value that cannot be represented")
 }
 
 fn validate_cpu_quantity(value: &str) -> Result<String> {
@@ -4007,6 +3977,47 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Resolve `--secret-material-env KEY[=ENVVAR]` values from the CLI process
+/// environment (`ENVVAR` defaults to `KEY`) so secrets never transit argv.
+pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let (key, env_name) = match item.split_once('=') {
+            Some((key, env_name)) => (key.trim(), env_name.trim()),
+            None => (item.trim(), item.trim()),
+        };
+        if key.is_empty() {
+            return Err(miette::miette!("--secret-material-env key cannot be empty"));
+        }
+        if env_name.is_empty() {
+            return Err(miette::miette!(
+                "--secret-material-env {key} names an empty environment variable"
+            ));
+        }
+
+        let value = std::env::var(env_name).map_err(|_| {
+            miette::miette!(
+                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
+            )
+        })?;
+        if value.trim().is_empty() {
+            return Err(miette::miette!(
+                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
+            ));
+        }
+
+        if map.contains_key(key) {
+            return Err(miette::miette!(
+                "--secret-material-env key '{key}' supplied more than once"
+            ));
+        }
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
 fn is_valid_env_name(key: &str) -> bool {
     let mut bytes = key.bytes();
     let Some(first) = bytes.next() else {
@@ -5282,6 +5293,7 @@ pub struct ProviderRefreshConfigInput<'a> {
     pub credential_key: &'a str,
     pub strategy: &'a str,
     pub material: &'a [String],
+    pub secret_material_env: &'a [String],
     pub secret_material_keys: &'a [String],
     pub credential_expires_at_ms: Option<i64>,
 }
@@ -5292,7 +5304,21 @@ pub async fn provider_refresh_config(
     tls: &TlsOptions,
 ) -> Result<()> {
     let strategy = provider_refresh_strategy(input.strategy)?;
-    let material = parse_key_value_pairs(input.material, "--material")?;
+    let mut material = parse_key_value_pairs(input.material, "--material")?;
+    let mut secret_material_keys = input.secret_material_keys.to_vec();
+    // Env-resolved secrets are auto-marked secret; duplicate keys are an
+    // error rather than a precedence order.
+    for (key, value) in parse_secret_material_env_pairs(input.secret_material_env)? {
+        if material.contains_key(&key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both --material and --secret-material-env"
+            ));
+        }
+        if !secret_material_keys.contains(&key) {
+            secret_material_keys.push(key.clone());
+        }
+        material.insert(key, value);
+    }
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
@@ -5300,7 +5326,7 @@ pub async fn provider_refresh_config(
             credential_key: input.credential_key.to_string(),
             strategy: strategy as i32,
             material,
-            secret_material_keys: input.secret_material_keys.to_vec(),
+            secret_material_keys,
             expires_at_ms: input.credential_expires_at_ms,
         })
         .await
@@ -7845,11 +7871,12 @@ mod tests {
         gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
-        progress_step_from_metadata, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
+        plaintext_gateway_is_remote, progress_step_from_metadata,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7991,6 +8018,73 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
+
+        let parsed =
+            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+                .expect("parse");
+        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
+
+        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+            .expect("parse");
+        assert_eq!(
+            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+            Some(&"key-only-material".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_missing_environment() {
+        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
+
+        let err =
+            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                .expect_err("missing env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
+
+        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
+            .expect_err("blank env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_empty_key() {
+        let err = parse_secret_material_env_pairs(&["=NAV_PARSE_SME_NO_KEY".to_string()])
+            .expect_err("empty key should error");
+        assert!(err.to_string().contains("key cannot be empty"));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
+
+        let err = parse_secret_material_env_pairs(&[
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+        ])
+        .expect_err("duplicate key should error");
+        assert!(
+            err.to_string()
+                .contains("key 'private_key' supplied more than once")
+        );
     }
 
     #[test]

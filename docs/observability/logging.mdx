@@ -94,9 +94,9 @@ CLASS:ACTIVITY [SEVERITY] ACTION DETAILS [CONTEXT]
 - SSH: peer address and authentication type
 - Process: `name(pid)` with exit code or command line
 - Config: description of what changed
-- Finding: quoted title with the stable finding type, optional confidence, and allowlisted evidence fields when available
+- Finding: quoted title with the stable finding type, optional confidence, and source-specific context attributes when available
 
-**Context** in brackets at the end provides the policy rule and enforcement engine that produced the decision.
+**Context** in brackets provides structured fields such as policy provenance, source-specific attributes, and denial reasons.
 
 ### Examples
 
@@ -133,8 +133,8 @@ OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy
 A supervisor middleware HTTP event records whether it transformed the request. If the middleware also emits a finding, that remains a separate event:
 
 ```text
-OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware transformed:true failed:false]
-OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match middleware:prototype-content-guard count:1]
+OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware] [failed:false transformed:true]
+OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match count:1 middleware:prototype-content-guard]
 ```
 
 Proxy and SSH servers ready:
@@ -166,6 +166,8 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 ## Denial Reasons
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
+
+For supervisor middleware denials, `status_detail` contains the service-provided audit-safe reason from the gRPC response.
 
 Common reason phrases emitted by the sandbox include:
 
