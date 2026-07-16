@@ -1701,8 +1701,11 @@ async fn stream_exec_over_relay(
         }
     };
 
-    let _ = proxy_task.await;
-
+    // Send the exit event before tearing down the proxy. Awaiting `proxy_task`
+    // waits for the relay bridge to collapse, which also drops the receiver of
+    // the outer ExecSandbox response stream; sending afterwards races that
+    // teardown and the exit event is silently lost on fast one-shot commands.
+    // The timeout branch above already sends before awaiting `proxy_task`.
     let _ = tx
         .send(Ok(ExecSandboxEvent {
             payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
@@ -1710,6 +1713,8 @@ async fn stream_exec_over_relay(
             )),
         }))
         .await;
+
+    let _ = proxy_task.await;
 
     Ok(())
 }
@@ -1783,8 +1788,11 @@ async fn stream_interactive_exec_over_relay(
         }
     };
 
-    let _ = proxy_task.await;
-
+    // Send the exit event before tearing down the proxy. Awaiting `proxy_task`
+    // waits for the relay bridge to collapse, which also drops the receiver of
+    // the outer ExecSandbox response stream; sending afterwards races that
+    // teardown and the exit event is silently lost on fast one-shot commands.
+    // The timeout branch above already sends before awaiting `proxy_task`.
     let _ = tx
         .send(Ok(ExecSandboxEvent {
             payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
@@ -1792,6 +1800,8 @@ async fn stream_interactive_exec_over_relay(
             )),
         }))
         .await;
+
+    let _ = proxy_task.await;
 
     Ok(())
 }
