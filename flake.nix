@@ -48,6 +48,7 @@
             llvmPackages.libclang
             # system dependency for openshell-prover
             z3
+            uv
           ];
 
           env = {
