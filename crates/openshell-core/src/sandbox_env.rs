@@ -114,3 +114,13 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// Used alongside UID for PVC init container `chown` operations and when the
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
+
+/// Opt-in toggle to reconcile ownership of existing sandbox-writable paths.
+///
+/// The default (unset) preserves the create-only chown contract: an existing
+/// `read_write` path is never re-owned. When set to `"1"` or `"true"`, the
+/// supervisor recursively repairs a persisted state tree whose host-side
+/// ownership no longer matches the configured sandbox identity — for example
+/// after a host reboot shifted the rootless user-namespace subuid base and left
+/// the sandbox unable to read its own state. See NVIDIA/OpenShell#2336.
+pub const RECONCILE_SANDBOX_OWNERSHIP: &str = "OPENSHELL_RECONCILE_SANDBOX_OWNERSHIP";
