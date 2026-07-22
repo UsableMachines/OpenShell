@@ -1,0 +1,4 @@
+exports_files([
+    "aws-lc-sys.MODULE.bazel",
+    "zstd-sys.MODULE.bazel",
+])
