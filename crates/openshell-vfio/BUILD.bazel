@@ -3,7 +3,7 @@ load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 
 rust_library(
-    name = "openshell-vfio",
+    name = "openshell_vfio",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     deps = all_crate_deps(normal = True),
