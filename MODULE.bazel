@@ -4,6 +4,19 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "protobuf", version = "34.0.bcr.1")
 
+osx = use_extension("@llvm//extensions:osx.bzl", "osx")
+osx.frameworks(
+    names = [
+        "CoreFoundation",
+        "CoreServices",
+        "Foundation",
+        "Kernel",
+        "OSLog",
+        "Security",
+        "SystemConfiguration",
+    ],
+)
+
 workspace_version_repository = use_repo_rule("//bazel:cargo_version.bzl", "workspace_version_repository")
 
 workspace_version_repository(
