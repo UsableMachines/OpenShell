@@ -4,7 +4,7 @@ load("@rules_rs//rs:rust_test.bzl", "rust_test")
 load("@workspace_version//:version.bzl", "WORKSPACE_VERSION")
 
 rust_library(
-    name = "openshell_core",
+    name = "openshell-core",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     compile_data = [
@@ -18,6 +18,7 @@ rust_library(
     },
     rustc_flags = ["--cfg=bazel"],
     version = WORKSPACE_VERSION,
+    visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True) + [
         "//proto:descriptor_rust_proto",
         "//proto:empty_rust_proto",
@@ -26,8 +27,8 @@ rust_library(
 )
 
 rust_test(
-    name = "openshell_core_test",
-    crate = ":openshell_core",
+    name = "openshell-core_test",
+    crate = ":openshell-core",
     crate_features = ["telemetry"],
     rustc_flags = ["--cfg=bazel"],
     deps = all_crate_deps(normal_dev = True),
