@@ -7,11 +7,13 @@ rust_library(
     name = "openshell_vfio",
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
+    target_compatible_with = ["@platforms//os:linux"],
     deps = all_crate_deps(normal = True),
 )
 
 rust_test(
     name = "openshell_vfio_test",
     crate = ":openshell_vfio",
+    target_compatible_with = ["@platforms//os:linux"],
     deps = all_crate_deps(normal_dev = True),
 )

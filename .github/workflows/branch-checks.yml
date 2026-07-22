@@ -139,6 +139,31 @@ jobs:
           fi
           exit 0
 
+  bazel:
+    name: Bazel (${{ matrix.runner }})
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-amd64-cpu8, linux-arm64-cpu8, macos-latest-xlarge]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.runner }}
+          repository-cache: true
+
+      - name: Build
+        run: bazel build //...
+
+      - name: Test
+        run: bazel test //...
+
   python:
     name: Python (${{ matrix.runner }})
     needs: pr_metadata
