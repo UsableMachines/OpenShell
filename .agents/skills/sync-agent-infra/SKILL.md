@@ -87,7 +87,7 @@ The canonical workflow chains are defined in `AGENTS.md` under "## Workflow Chai
 
 ### Labels
 
-The canonical label set is used by skills and templates. The key labels are: `state:agent-ready`, `state:review-ready`, `state:in-progress`, `state:pr-opened`, `state:triage-needed`, `topic:security`, `good first issue`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels.
+The canonical label set is used by skills and templates. The key labels are: `state:triage-needed`, `state:needs-info`, `state:validated`, `state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, `roadmap`, `topic:security`, `good first issue`, `help wanted`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels.
 
 ## Step 2: Check Each File for Drift
 

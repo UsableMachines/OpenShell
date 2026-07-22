@@ -11,6 +11,7 @@ Review an issue that outlines a security, vulnerability, or privacy concern.
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
+- The issue must have both `topic:security` and the human-applied `agent:plan-requested` label. If either is missing, do not perform the review.
 
 ## Agent Comment Marker
 
@@ -40,7 +41,8 @@ gh issue view <id> --json title,body,state,labels,author
 
 First, check the issue's labels from the metadata fetched in Step 1.
 
-- **If the issue has the `state:agent-ready` label**, the issue has already been reviewed and is ready for implementation. There is no review to perform. Report to the user that this issue is already reviewed and marked as `state:agent-ready`, and suggest using the `fix-security-issue` skill instead. Stop.
+- **If the issue has `agent:implementation-requested`**, the issue has already been reviewed and a human authorized remediation. There is no review to perform. Suggest using `fix-security-issue` and stop.
+- **If `topic:security` or `agent:plan-requested` is missing**, report the missing label and stop. Do not add or offer to add either label; `agent:plan-requested` is a deliberate human gate.
 
 Next, fetch existing comments on the issue:
 
@@ -133,15 +135,15 @@ EOF
 )"
 ```
 
-## Step 5: Add `state:review-ready` Label
+## Step 5: Mark the Security Plan Ready
 
-After posting the review comment (whether legitimate or not actionable), add the `state:review-ready` label to the issue:
+After posting a legitimate-concern review with a remediation plan, replace `agent:plan-requested` with `agent:plan-ready`:
 
 ```bash
-gh issue edit <id> --add-label "state:review-ready"
+gh issue edit <id> --remove-label "agent:plan-requested" --add-label "agent:plan-ready"
 ```
 
-This signals to humans and downstream skills (e.g., `fix-security-issue`) that the review is complete.
+This signals that the agent-produced remediation plan awaits human review. A human applies `agent:implementation-requested` if remediation should proceed. For a not-actionable determination, remove `agent:plan-requested`, do not add another `agent:*` label, and report that a human should close the issue or record the risk decision.
 
 ## Step 6: Address Follow-up Comments
 
@@ -163,7 +165,7 @@ For each unanswered human comment:
 | `gh issue view <id> --json title,body,state,labels,author` | Fetch full issue metadata as JSON |
 | `gh issue view <id> --json comments --jq '.comments[].body'` | Fetch all comments on an issue |
 | `gh issue comment <id> --body "..."` | Post a comment on an issue |
-| `gh issue edit <id> --add-label "state:review-ready"` | Add a label to an issue |
+| `gh issue edit <id> --remove-label "agent:plan-requested" --add-label "agent:plan-ready"` | Mark a remediation plan ready for human review |
 
 ## Example Usage
 
@@ -176,7 +178,7 @@ User says: "Review security issue #42"
 3. No prior review found -- pass issue to `principal-engineer-reviewer` with security lens
 4. Reviewer determines it's a legitimate XSS vulnerability in the API response handler
 5. Post a comment with severity assessment and remediation plan
-6. Add the `state:review-ready` label to the issue
+6. Replace `agent:plan-requested` with `agent:plan-ready`
 7. Report the finding and posted comment to the user
 
 ### Re-review with new comments
