@@ -31,5 +31,6 @@ rust_test(
     crate = ":openshell-core",
     crate_features = ["telemetry"],
     rustc_flags = ["--cfg=bazel"],
+    tags = ["no-sandbox"],
     deps = all_crate_deps(normal_dev = True),
 )

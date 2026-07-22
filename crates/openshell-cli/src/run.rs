@@ -9036,40 +9036,21 @@ mod tests {
         assert_eq!(message, "sandbox provisioning timed out after 120s");
     }
 
-    struct GitPathGuard {
-        _path: Option<EnvVarGuard>,
+    struct GitTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
-    impl GitPathGuard {
+    impl GitTestGuard {
         fn new() -> Self {
             let lock = TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let path = std::env::var_os("OPENSHELL_TEST_GIT_PATH").map(|git_path| {
-                let git_path = std::env::current_dir()
-                    .expect("resolve current directory")
-                    .join(git_path);
-                let git_dir = git_path.parent().expect("Git executable has a parent");
-                let mut paths = vec![git_dir.to_path_buf()];
-                if let Some(path) = std::env::var_os("PATH") {
-                    paths.extend(std::env::split_paths(&path));
-                }
-                let path = std::env::join_paths(paths)
-                    .expect("join PATH entries")
-                    .to_string_lossy()
-                    .into_owned();
-                EnvVarGuard::set("PATH", &path)
-            });
-            Self {
-                _path: path,
-                _lock: lock,
-            }
+            Self { _lock: lock }
         }
     }
 
-    fn init_git_repo(path: &Path) -> GitPathGuard {
-        let guard = GitPathGuard::new();
+    fn init_git_repo(path: &Path) -> GitTestGuard {
+        let guard = GitTestGuard::new();
         let mut command = Command::new("git");
         super::scrub_git_env(&mut command);
         let status = command
