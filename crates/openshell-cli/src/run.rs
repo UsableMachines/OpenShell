@@ -9036,7 +9036,40 @@ mod tests {
         assert_eq!(message, "sandbox provisioning timed out after 120s");
     }
 
-    fn init_git_repo(path: &Path) {
+    struct GitPathGuard {
+        _path: Option<EnvVarGuard>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl GitPathGuard {
+        fn new() -> Self {
+            let lock = TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let path = std::env::var_os("OPENSHELL_TEST_GIT_PATH").map(|git_path| {
+                let git_path = std::env::current_dir()
+                    .expect("resolve current directory")
+                    .join(git_path);
+                let git_dir = git_path.parent().expect("Git executable has a parent");
+                let mut paths = vec![git_dir.to_path_buf()];
+                if let Some(path) = std::env::var_os("PATH") {
+                    paths.extend(std::env::split_paths(&path));
+                }
+                let path = std::env::join_paths(paths)
+                    .expect("join PATH entries")
+                    .to_string_lossy()
+                    .into_owned();
+                EnvVarGuard::set("PATH", &path)
+            });
+            Self {
+                _path: path,
+                _lock: lock,
+            }
+        }
+    }
+
+    fn init_git_repo(path: &Path) -> GitPathGuard {
+        let guard = GitPathGuard::new();
         let mut command = Command::new("git");
         super::scrub_git_env(&mut command);
         let status = command
@@ -9045,6 +9078,7 @@ mod tests {
             .status()
             .expect("git init");
         assert!(status.success(), "git init should succeed");
+        guard
     }
 
     #[test]
@@ -9052,7 +9086,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("nested")).expect("create repo");
-        init_git_repo(&repo);
+        let _git = init_git_repo(&repo);
 
         fs::write(repo.join("tracked.txt"), "tracked").expect("write tracked.txt");
         fs::write(repo.join("nested/other.txt"), "other").expect("write other.txt");
@@ -9071,7 +9105,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("nested/inner")).expect("create repo");
-        init_git_repo(&repo);
+        let _git = init_git_repo(&repo);
 
         fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
         fs::write(repo.join("nested/inner/child.txt"), "child").expect("write child.txt");
@@ -9106,7 +9140,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(&repo).expect("create repo");
-        init_git_repo(&repo);
+        let _git = init_git_repo(&repo);
         let missing = repo.join("missing");
 
         let err = sandbox_upload_plan(&missing, true).expect_err("missing path should error");
@@ -9123,7 +9157,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("real-dir")).expect("create repo");
-        init_git_repo(&repo);
+        let _git = init_git_repo(&repo);
         fs::write(repo.join("real-dir/file.txt"), "file").expect("write file.txt");
         std::os::unix::fs::symlink("real-dir", repo.join("link-dir")).expect("create symlink");
 
@@ -9151,7 +9185,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("runs")).expect("create repo");
-        init_git_repo(&repo);
+        let _git = init_git_repo(&repo);
         fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
         fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
 
@@ -9167,13 +9201,10 @@ mod tests {
 
     #[test]
     fn git_sync_files_ignores_inherited_git_env() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("nested")).expect("create repo");
-        init_git_repo(&repo);
+        let _git = init_git_repo(&repo);
 
         fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
         fs::write(repo.join("top.txt"), "top").expect("write top.txt");
