@@ -31,7 +31,6 @@ rust_binary(
 rust_test(
     name = "openshell-cli_lib_test",
     crate = ":openshell-cli",
-    tags = ["no-sandbox"],
     deps = all_crate_deps(normal_dev = True),
 )
 
@@ -86,7 +85,6 @@ rust_test(
     aliases = aliases(),
     crate_root = "tests/sandbox_create_lifecycle_integration.rs",
     data = [":fake-forward-process"],
-    tags = ["no-sandbox"],
     deps = all_crate_deps(normal = True, normal_dev = True) + [":openshell-cli"],
     env = {
         "OPENSHELL_TEST_FAKE_FORWARD_PATH": "$(rootpath :fake-forward-process)",
