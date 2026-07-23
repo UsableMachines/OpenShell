@@ -1,0 +1,35 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "openshell-server",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/main.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["migrations/**/*"]),
+    crate_features = ["telemetry"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "crates/openshell-server",
+    },
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "openshell-gateway",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [":openshell-server"],
+)
+
+rust_test(
+    name = "openshell-server_test",
+    crate = ":openshell-server",
+    data = ["//:deploy/rpm/gateway.toml.default"],
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "crates/openshell-server",
+    },
+    deps = all_crate_deps(normal_dev = True),
+)
