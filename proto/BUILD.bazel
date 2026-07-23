@@ -1,4 +1,4 @@
-load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_descriptor_set", "proto_library")
 load("@rules_rust//extensions/prost:defs.bzl", "rust_prost_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -25,10 +25,9 @@ filegroup(
     output_group = "rust_generated_srcs",
 )
 
-filegroup(
+proto_descriptor_set(
     name = "openshell_proto_descriptor_set",
-    srcs = [":openshell_rust_proto"],
-    output_group = "proto_descriptor_set",
+    deps = [":openshell_proto"],
 )
 
 rust_prost_library(
