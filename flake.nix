@@ -34,6 +34,7 @@
           packages = with pkgs; [
             bazel_9
             buildifier
+            lcov
           ];
         };
 
