@@ -1,1 +1,2 @@
 build --@rules_rs//rs/private/prost:compile_well_known_types=false
+test  --test_env=PATH
