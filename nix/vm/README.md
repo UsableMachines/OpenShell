@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Test VMs
 
-This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable. A separate Linux-only app boots the pinned ARM64 guest with TCG on either an x86_64 or ARM64 host for performance comparisons.
+This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable. The ARM64 fallback switches to QEMU's bundled EDK2 firmware, which is validated with TCG. A separate Linux-only app boots the pinned ARM64 guest with TCG on either an x86_64 or ARM64 host for performance comparisons.
 
 ## Requirements
 
@@ -177,7 +177,7 @@ Arguments after `--` are executed inside the guest. Without a command, the runne
 Nix downloads and caches the selected, hash-pinned cloud image. Each invocation then:
 
 1. Creates a temporary QCOW2 overlay.
-2. Boots QEMU with HVF, KVM, or the Linux TCG fallback.
+2. Boots QEMU with HVF, KVM, or the Linux TCG fallback. Native ARM64 Linux guests use QEMU's bundled EDK2 firmware when KVM is unavailable.
 3. Creates an ephemeral `openshell` user and SSH key through cloud-init.
 4. Applies the selected Ansible configurations.
 5. Installs or copies the supplied artifacts.

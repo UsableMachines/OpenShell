@@ -88,6 +88,10 @@ let
       export TEST_VM_QEMU=${qemuBinary}
       export TEST_VM_FIRMWARE_CODE=${firmwareCode}
       export TEST_VM_FIRMWARE_VARS=${firmwareVars}
+      ${pkgs.lib.optionalString isAarch64 ''
+        export TEST_VM_TCG_FIRMWARE_CODE=${qemu}/share/qemu/edk2-aarch64-code.fd
+        export TEST_VM_TCG_FIRMWARE_VARS=${qemu}/share/qemu/edk2-arm-vars.fd
+      ''}
       export TEST_VM_MACHINE=${if isAarch64 then "virt" else "q35"}
       export TEST_VM_ACCELERATOR=${selectedAccelerator}
       export TEST_VM_ARCHITECTURE=${architecture}
