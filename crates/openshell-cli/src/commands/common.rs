@@ -733,7 +733,8 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| miette::miette!("duration value is too large: {s}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -947,4 +948,19 @@ pub fn scrub_git_env(command: &mut Command) -> &mut Command {
         command.env_remove(key);
     }
     command
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_to_ms_rejects_overflow() {
+        let err = parse_duration_to_ms("100000000000000h").expect_err("overflow should error");
+        assert!(err.to_string().contains("too large"));
+    }
 }
