@@ -650,6 +650,15 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn sleep_binary() -> PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH should be set for tests");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("sleep"))
+            .find(|candidate| candidate.is_file())
+            .expect("sleep should be available on PATH")
+    }
+
     #[test]
     fn file_sha256_computes_correct_hash() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -698,10 +707,10 @@ mod tests {
     fn binary_path_strips_deleted_suffix() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        // Copy sleep to a temp path we control so we can unlink it.
         let tmp = tempfile::TempDir::new().unwrap();
         let exe_path = tmp.path().join("deleted-sleep");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(sleep_binary(), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Spawn a child from the temp binary, then unlink it while the
@@ -755,7 +764,7 @@ mod tests {
         // Basename literally ends with " (deleted)" while the file is still
         // on disk — a pathological but legal filename.
         let exe_path = tmp.path().join("sleepy (deleted)");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(sleep_binary(), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
@@ -798,7 +807,7 @@ mod tests {
         raw_name.extend_from_slice(b".bin");
         let exe_path = tmp.path().join(OsString::from_vec(raw_name));
 
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(sleep_binary(), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
