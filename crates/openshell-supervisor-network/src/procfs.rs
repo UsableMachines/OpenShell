@@ -507,6 +507,8 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::CommandExt as _;
 
     /// Block until `/proc/<pid>/exe` points at `target`. `Command::spawn` returns
     /// once the child is scheduled, not once it has completed `exec()`; on
@@ -622,6 +624,7 @@ mod tests {
         // `/proc/<pid>/exe`, but readlink will now return the tainted
         // "<path> (deleted)" string.
         let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg0("sleep");
         cmd.arg("5");
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
@@ -672,6 +675,7 @@ mod tests {
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg0("sleep");
         cmd.arg("5");
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
@@ -715,6 +719,7 @@ mod tests {
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg0("sleep");
         cmd.arg("5");
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
