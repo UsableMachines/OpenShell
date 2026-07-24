@@ -38,9 +38,20 @@
           programs.nixfmt.enable = true;
         };
         testVm = import ./nix/vm { inherit pkgs; };
+        testVmArm64Tcg = import ./nix/vm {
+          inherit pkgs;
+          accelerator = "tcg";
+          architecture = "aarch64";
+          useQemuFirmware = true;
+        };
       in
       {
-        apps.test-vm = testVm.app;
+        apps = {
+          test-vm = testVm.app;
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          test-vm-arm64-tcg = testVmArm64Tcg.app;
+        };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [

@@ -166,8 +166,16 @@ for copy_spec in "${copies[@]}"; do
 	esac
 done
 
-test_vm_cpu=host
-ssh_wait_seconds=180
+case "${TEST_VM_ACCELERATOR}" in
+tcg)
+	test_vm_cpu=max
+	ssh_wait_seconds=600
+	;;
+*)
+	test_vm_cpu=host
+	ssh_wait_seconds=180
+	;;
+esac
 if [ "${TEST_VM_ACCELERATOR}" = kvm ] &&
 	{ [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
 	echo "==> /dev/kvm is unavailable; falling back to QEMU/TCG"
@@ -262,6 +270,7 @@ qemu-img resize -q "${overlay}" +16G
 cp "${TEST_VM_FIRMWARE_VARS}" "${vars}"
 chmod 0600 "${vars}"
 
+boot_started_seconds=${SECONDS}
 for attempt in $(seq 1 5); do
 	ssh_port=${requested_ssh_port:-$(pick_free_port)}
 	: >"${qemu_log}"
@@ -311,7 +320,7 @@ ssh_args=(
 	-i "${private_key}"
 	-p "${ssh_port}"
 	-o BatchMode=yes
-	-o ConnectTimeout=5
+	-o ConnectTimeout=2
 	-o LogLevel=ERROR
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
@@ -321,7 +330,7 @@ scp_args=(
 	-i "${private_key}"
 	-P "${ssh_port}"
 	-o BatchMode=yes
-	-o ConnectTimeout=5
+	-o ConnectTimeout=2
 	-o LogLevel=ERROR
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
@@ -329,7 +338,8 @@ scp_args=(
 
 echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
-for _ in $(seq 1 "$((ssh_wait_seconds / 2))"); do
+ssh_deadline_seconds=$((boot_started_seconds + ssh_wait_seconds))
+while [ "${SECONDS}" -lt "${ssh_deadline_seconds}" ]; do
 	if ! kill -0 "${qemu_pid}" 2>/dev/null; then
 		wait "${qemu_pid}" || true
 		qemu_pid=
@@ -340,12 +350,18 @@ for _ in $(seq 1 "$((ssh_wait_seconds / 2))"); do
 		ssh_ready=1
 		break
 	fi
-	sleep 2
+	remaining_seconds=$((ssh_deadline_seconds - SECONDS))
+	if [ "${remaining_seconds}" -gt 2 ]; then
+		sleep 2
+	elif [ "${remaining_seconds}" -gt 0 ]; then
+		sleep "${remaining_seconds}"
+	fi
 done
 if [ "${ssh_ready}" -ne 1 ]; then
 	echo "SSH did not become ready within ${ssh_wait_seconds} seconds" >&2
 	exit 1
 fi
+echo "==> SSH ready after $((SECONDS - boot_started_seconds)) seconds"
 
 echo "==> Validating ${distro}"
 # Profile values come from the trusted Nix-generated catalog.

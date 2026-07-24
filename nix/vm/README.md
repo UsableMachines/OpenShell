@@ -5,14 +5,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Test VMs
 
-This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
+This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable. A separate Linux-only app boots the pinned ARM64 guest with TCG on either an x86_64 or ARM64 host for performance comparisons.
 
 ## Requirements
 
 - Nix with flakes enabled.
-- Apple Silicon macOS with HVF, or a native-architecture Linux host. Linux uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
+- Apple Silicon macOS with HVF, or a Linux host. The default app uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
 - Enough local capacity for a four-vCPU, 4 GiB guest and a disposable disk overlay.
-- Native-architecture artifacts. TCG emulates the guest CPU on Linux but does not enable cross-architecture guests.
+- Artifacts matching the guest architecture.
 
 The first run downloads the selected cloud image and VM runtime. Nix reuses those immutable inputs on later runs, while each guest starts from a fresh writable overlay.
 
@@ -40,7 +40,7 @@ nix/vm/
 - `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
 - `README.md` documents the supported combinations and developer interface.
 
-The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-vm` app. Debian artifact creation remains outside the VM harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
+The root [`flake.nix`](../../flake.nix) exposes this directory as the native-architecture `test-vm` app and the Linux-only `test-vm-arm64-tcg` app. Debian artifact creation remains outside the VM harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
 
 ## Supported configurations
 
@@ -56,6 +56,18 @@ List the available distros and configurations:
 ```shell
 nix run .#test-vm -- --list
 ```
+
+## Benchmark ARM64 TCG across Linux hosts
+
+Boot the pinned ARM64 Ubuntu image with QEMU TCG, validate the guest over SSH, and shut it down:
+
+```shell
+nix run .#test-vm-arm64-tcg -- \
+  --distro ubuntu \
+  -- true
+```
+
+Run the same command on x86_64 and ARM64 Linux hosts to compare TCG boot behavior. The app holds the ARM64 cloud image, QEMU version, firmware, vCPU count, and memory constant. The runner prints the elapsed time from QEMU startup until SSH becomes ready.
 
 ## Open an interactive VM
 
@@ -129,7 +141,7 @@ nix run .#test-vm -- \
   -- openshell --version
 ```
 
-For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. The package architecture must match the host and guest architecture.
+For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. The package architecture must match the guest architecture.
 
 `--install` is repeatable. Debian packages are accepted by Ubuntu; RPM packages are accepted by CentOS, Fedora, and Rocky Linux. This prototype can install an existing RPM but does not build one.
 
@@ -176,7 +188,7 @@ Use `--keep` to preserve the overlay, cloud-init seed, SSH key, and serial log f
 
 ## Current limitations
 
-- Host and guest architectures must match.
+- The default `test-vm` app uses a guest matching the host architecture. `test-vm-arm64-tcg` is the supported cross-architecture exception on Linux.
 - TCG is slower than hardware virtualization and uses a longer SSH readiness timeout.
 - Configurations are applied fresh on every run; prepared VM caching is not implemented.
 - Only loopback SSH is forwarded to the host; guest gateway ports are not exposed.
