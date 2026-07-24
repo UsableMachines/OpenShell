@@ -101,3 +101,12 @@ rust_test(
     crate_root = "tests/sandbox_name_fallback_integration.rs",
     deps = all_crate_deps(normal = True, normal_dev = True) + [":openshell-cli"],
 )
+
+rust_test(
+    name = "sandbox_upload_integration_test",
+    srcs = ["tests/sandbox_upload_integration.rs"],
+    aliases = aliases(),
+    crate_root = "tests/sandbox_upload_integration.rs",
+    data = [":openshell"],
+    deps = all_crate_deps(normal = True, normal_dev = True) + [":openshell-cli"],
+)
