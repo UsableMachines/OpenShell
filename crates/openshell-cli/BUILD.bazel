@@ -83,11 +83,18 @@ rust_test(
         "tests/sandbox_create_lifecycle_integration.rs",
     ],
     aliases = aliases(),
+    compile_data = [":openshell"],
     crate_root = "tests/sandbox_create_lifecycle_integration.rs",
-    data = [":fake-forward-process"],
+    data = [
+        ":fake-forward-process",
+        ":openshell",
+    ],
     deps = all_crate_deps(normal = True, normal_dev = True) + [":openshell-cli"],
     env = {
         "OPENSHELL_TEST_FAKE_FORWARD_PATH": "$(rootpath :fake-forward-process)",
+    },
+    rustc_env = {
+        "CARGO_BIN_EXE_openshell": "$(rootpath :openshell)",
     },
 )
 
