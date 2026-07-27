@@ -1756,6 +1756,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 

@@ -19,6 +19,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
+use openshell_core::host_pattern::host_matches;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -338,6 +339,9 @@ fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
     }
     if endpoint.request_body_credential_rewrite {
         parts.push("request_body_credential_rewrite=true".to_string());
+    }
+    if endpoint.allow_uninspected_credentials {
+        parts.push("allow_uninspected_credentials=true".to_string());
     }
     if !endpoint.allowed_ips.is_empty() {
         parts.push(format!("allowed_ips={}", endpoint.allowed_ips.len()));
@@ -1039,7 +1043,12 @@ async fn current_effective_policy_for_sandbox(
     sandbox: &Sandbox,
     sandbox_id: &str,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    let mut policy = if let Some(record) = state
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let policy = if let Some(record) = state
         .store
         .get_latest_policy(sandbox_id)
         .await
@@ -1055,6 +1064,16 @@ async fn current_effective_policy_for_sandbox(
             .unwrap_or_default()
     };
 
+    effective_policy_for_source(state, catalog, workspace, &provider_names, policy).await
+}
+
+async fn effective_policy_for_source(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+    mut policy: ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy, Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
         PolicySource::Sandbox,
@@ -1066,25 +1085,44 @@ async fn current_effective_policy_for_sandbox(
 
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
-    if providers_v2_enabled && !matches!(policy_source, PolicySource::Global) {
-        let provider_names = sandbox
-            .spec
-            .as_ref()
-            .map(|spec| spec.providers.clone())
-            .unwrap_or_default();
-        let provider_layers = profile_provider_policy_layers_with_catalog(
-            state.store.as_ref(),
-            catalog,
-            workspace,
-            &provider_names,
-        )
-        .await?;
-        if !provider_layers.is_empty() {
-            policy = compose_effective_policy(&policy, &provider_layers);
-        }
+    clear_provider_credentialed_markers(&mut policy);
+    let provider_context = provider_policy_context_with_catalog(
+        state.store.as_ref(),
+        catalog,
+        workspace,
+        provider_names,
+    )
+    .await?;
+    if providers_v2_enabled
+        && !matches!(policy_source, PolicySource::Global)
+        && !provider_context.layers.is_empty()
+    {
+        policy = compose_effective_policy(&policy, &provider_context.layers);
     }
+    stamp_provider_credentialed_endpoints(&mut policy, &provider_context.credentialed_scopes);
 
     Ok(policy)
+}
+
+pub(super) async fn validate_candidate_sandbox_credential_policy(
+    state: &ServerState,
+    workspace: &str,
+    provider_names: &[String],
+    policy: Option<&ProtoSandboxPolicy>,
+) -> Result<(), Status> {
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let effective = effective_policy_for_source(
+        state,
+        &catalog,
+        workspace,
+        provider_names,
+        policy.cloned().unwrap_or_default(),
+    )
+    .await?;
+    validate_uninspected_credentialed_endpoints(&effective)
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1365,6 +1403,13 @@ pub(super) async fn handle_get_sandbox_config(
         load_sandbox_settings(state.store.as_ref(), &workspace, sandbox.object_name()).await?;
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+    let provider_policy_context = provider_policy_context_with_catalog(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &sandbox_provider_names,
+    )
+    .await?;
 
     let mut global_policy_version: u32 = 0;
 
@@ -1384,28 +1429,36 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
+    if let Some(source_policy) = policy.as_mut() {
+        // Never trust provenance supplied by a persisted/user-authored policy.
+        // The gateway derives it from the attached provider catalog below.
+        clear_provider_credentialed_markers(source_policy);
+    }
+
     if providers_v2_enabled
         && !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
+        && !provider_policy_context.layers.is_empty()
     {
-        let provider_layers = profile_provider_policy_layers_with_catalog(
-            state.store.as_ref(),
-            &provider_profile_catalog,
-            &workspace,
-            &sandbox_provider_names,
-        )
-        .await?;
-        if !provider_layers.is_empty() {
-            let effective_policy = compose_effective_policy(source_policy, &provider_layers);
-            validate_policy_safety(&effective_policy).map_err(|error| {
-                Status::failed_precondition(format!(
-                    "provider composition produced an invalid effective policy: {}",
-                    error.message()
-                ))
-            })?;
-            policy_hash = deterministic_policy_hash(&effective_policy);
-            policy = Some(effective_policy);
-        }
+        let effective_policy =
+            compose_effective_policy(source_policy, &provider_policy_context.layers);
+        validate_policy_safety(&effective_policy).map_err(|error| {
+            Status::failed_precondition(format!(
+                "provider composition produced an invalid effective policy: {}",
+                error.message()
+            ))
+        })?;
+        policy_hash = deterministic_policy_hash(&effective_policy);
+        policy = Some(effective_policy);
+    }
+
+    if let Some(effective_policy) = policy.as_mut() {
+        stamp_provider_credentialed_endpoints(
+            effective_policy,
+            &provider_policy_context.credentialed_scopes,
+        );
+        report_uninspected_credentialed_endpoints(effective_policy, &sandbox_id);
+        policy_hash = deterministic_policy_hash(effective_policy);
     }
 
     if let Some(policy) = policy.as_ref() {
@@ -1534,13 +1587,40 @@ async fn profile_provider_policy_layers(
     profile_provider_policy_layers_with_catalog(store, &catalog, workspace, provider_names).await
 }
 
+#[cfg(test)]
 async fn profile_provider_policy_layers_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    Ok(
+        provider_policy_context_with_catalog(store, catalog, workspace, provider_names)
+            .await?
+            .layers,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CredentialedEndpointScope {
+    host: String,
+    ports: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderPolicyContext {
+    layers: Vec<ProviderPolicyLayer>,
+    credentialed_scopes: Vec<CredentialedEndpointScope>,
+}
+
+async fn provider_policy_context_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<ProviderPolicyContext, Status> {
     let mut layers = Vec::new();
+    let mut credentialed_scopes = Vec::new();
 
     for name in provider_names {
         let provider = store
@@ -1565,13 +1645,196 @@ async fn profile_provider_policy_layers_with_catalog(
         };
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+        let mut rule = profile.network_policy_rule(&rule_name);
+        if profile.has_credentialed_endpoints() {
+            for endpoint in &mut rule.endpoints {
+                endpoint.provider_credentialed = true;
+                let scope = CredentialedEndpointScope {
+                    host: endpoint.host.to_ascii_lowercase(),
+                    ports: endpoint_ports(endpoint),
+                };
+                if !credentialed_scopes.contains(&scope) {
+                    credentialed_scopes.push(scope);
+                }
+            }
+        }
         layers.push(ProviderPolicyLayer {
             rule_name: rule_name.clone(),
-            rule: profile.network_policy_rule(&rule_name),
+            rule,
         });
     }
 
-    Ok(layers)
+    Ok(ProviderPolicyContext {
+        layers,
+        credentialed_scopes,
+    })
+}
+
+fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
+    if endpoint.ports.is_empty() {
+        (endpoint.port > 0)
+            .then_some(endpoint.port)
+            .into_iter()
+            .collect()
+    } else {
+        endpoint.ports.clone()
+    }
+}
+
+fn host_patterns_overlap(left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    let left_has_wildcard = left.contains('*');
+    let right_has_wildcard = right.contains('*');
+
+    if !right_has_wildcard {
+        return host_matches(&left, &right).unwrap_or(false);
+    }
+    if !left_has_wildcard {
+        return host_matches(&right, &left).unwrap_or(false);
+    }
+
+    fn literal_suffix(pattern: &str) -> &str {
+        pattern
+            .rfind('*')
+            .map_or(pattern, |index| &pattern[index + 1..])
+    }
+
+    let left_suffix = literal_suffix(&left);
+    let right_suffix = literal_suffix(&right);
+    left_suffix.is_empty()
+        || right_suffix.is_empty()
+        || left_suffix.ends_with(right_suffix)
+        || right_suffix.ends_with(left_suffix)
+}
+
+fn endpoint_matches_credentialed_scope(
+    endpoint: &NetworkEndpoint,
+    scope: &CredentialedEndpointScope,
+) -> bool {
+    if !host_patterns_overlap(&endpoint.host, &scope.host) {
+        return false;
+    }
+    let endpoint_ports = endpoint_ports(endpoint);
+    endpoint_ports.is_empty()
+        || scope.ports.is_empty()
+        || endpoint_ports.iter().any(|port| scope.ports.contains(port))
+}
+
+pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.provider_credentialed = false;
+        }
+    }
+}
+
+fn stamp_provider_credentialed_endpoints(
+    policy: &mut ProtoSandboxPolicy,
+    scopes: &[CredentialedEndpointScope],
+) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.provider_credentialed = scopes
+                .iter()
+                .any(|scope| endpoint_matches_credentialed_scope(endpoint, scope));
+        }
+    }
+}
+
+/// A credentialed endpoint whose configured mode disables the L7 inspection a
+/// reviewer would expect, without an explicit `allow_uninspected_credentials`.
+struct UninspectedCredentialedEndpoint {
+    rule_name: String,
+    host: String,
+    port: u32,
+    mode: &'static str,
+}
+
+/// Scan the effective policy for credentialed endpoints on uninspected modes.
+///
+/// Explicit opt-ins are logged and skipped. Never logs credential names,
+/// placeholders, or secret values.
+fn find_uninspected_credentialed_endpoint(
+    policy: &ProtoSandboxPolicy,
+) -> Option<UninspectedCredentialedEndpoint> {
+    for (rule_name, rule) in &policy.network_policies {
+        for endpoint in &rule.endpoints {
+            if !endpoint.provider_credentialed {
+                continue;
+            }
+
+            let mode = if endpoint.protocol.trim().is_empty() {
+                "L4-only"
+            } else if endpoint.tls.trim().eq_ignore_ascii_case("skip") {
+                "tls: skip"
+            } else {
+                continue;
+            };
+
+            if endpoint.allow_uninspected_credentials {
+                warn!(
+                    rule_name,
+                    host = %endpoint.host,
+                    ports = ?endpoint_ports(endpoint),
+                    mode,
+                    "credentialed endpoint explicitly allows uninspected traffic"
+                );
+                continue;
+            }
+
+            return Some(UninspectedCredentialedEndpoint {
+                rule_name: rule_name.clone(),
+                host: endpoint.host.clone(),
+                port: endpoint_ports(endpoint)
+                    .first()
+                    .copied()
+                    .unwrap_or(endpoint.port),
+                mode,
+            });
+        }
+    }
+    None
+}
+
+/// Admission gate for policy-authoring paths (create, attach, operator config
+/// update). Rejects credentialed endpoints that would lose L7 inspection.
+fn validate_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    let Some(violation) = find_uninspected_credentialed_endpoint(policy) else {
+        return Ok(());
+    };
+
+    warn!(
+        rule_name = %violation.rule_name,
+        host = %violation.host,
+        port = violation.port,
+        mode = violation.mode,
+        "rejecting uninspected credentialed endpoint"
+    );
+    Err(Status::failed_precondition(format!(
+        "credentialed endpoint '{}:{}' in rule '{}' uses {}; configure L7 inspection or explicitly set allow_uninspected_credentials: true",
+        violation.host, violation.port, violation.rule_name, violation.mode
+    )))
+}
+
+/// Delivery-path reporting for an already-persisted policy. Sandbox config
+/// delivery must not fail closed here: refusing the config would crash-loop a
+/// running supervisor. The runtime backstop denies the traffic instead.
+fn report_uninspected_credentialed_endpoints(policy: &ProtoSandboxPolicy, sandbox_id: &str) {
+    if let Some(violation) = find_uninspected_credentialed_endpoint(policy) {
+        warn!(
+            sandbox_id,
+            rule_name = %violation.rule_name,
+            host = %violation.host,
+            port = violation.port,
+            mode = violation.mode,
+            "delivering credentialed endpoint without L7 inspection; the sandbox proxy will deny this traffic unless allow_uninspected_credentials is set"
+        );
+    }
 }
 
 pub(super) fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
@@ -1738,6 +2001,7 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            clear_provider_credentialed_markers(&mut new_policy);
             openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
@@ -2097,6 +2361,7 @@ async fn handle_update_config_inner(
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
+    clear_provider_credentialed_markers(&mut new_policy);
     openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
     if sandbox_caller {
         if openshell_policy::strip_provider_rule_names(&mut new_policy) {
@@ -2118,6 +2383,18 @@ async fn handle_update_config_inner(
 
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
+    // Sandbox-authored syncs replay a policy the supervisor already discovered
+    // on disk. Rejecting it here would crash-loop the sandbox instead of
+    // surfacing an operator decision, so only operator-authored updates gate.
+    if !sandbox_caller {
+        validate_candidate_sandbox_credential_policy(
+            state,
+            &workspace,
+            &spec.providers,
+            Some(&new_policy),
+        )
+        .await?;
+    }
 
     let _sandbox_sync_guard = if backfill_policy.is_some() {
         Some(state.compute.sandbox_sync_guard().await)
@@ -3723,6 +4000,12 @@ fn generate_security_notes(rule: &NetworkPolicyRule) -> String {
     for endpoint in &rule.endpoints {
         let host = endpoint.host.to_lowercase();
 
+        if endpoint.allow_uninspected_credentials {
+            notes.push(format!(
+                "Endpoint '{host}' explicitly allows credentials on traffic OpenShell cannot inspect or rewrite."
+            ));
+        }
+
         // Flag destinations that are an internal/private address. Parse the host as
         // an IP literal and defer to the canonical RFC-accurate classifier
         // (openshell-core net::is_internal_ip) rather than naive string prefixes:
@@ -4564,6 +4847,96 @@ mod tests {
     }
 
     #[test]
+    fn provider_credentialed_stamping_matches_host_patterns_and_ports() {
+        let mut policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([(
+                "test".to_string(),
+                NetworkPolicyRule {
+                    endpoints: vec![
+                        NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 443,
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "api.example.com".to_string(),
+                            port: 8443,
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let scopes = vec![CredentialedEndpointScope {
+            host: "*.example.com".to_string(),
+            ports: vec![443],
+        }];
+
+        clear_provider_credentialed_markers(&mut policy);
+        stamp_provider_credentialed_endpoints(&mut policy, &scopes);
+
+        let endpoints = &policy.network_policies["test"].endpoints;
+        assert!(endpoints[0].provider_credentialed);
+        assert!(!endpoints[1].provider_credentialed);
+    }
+
+    #[test]
+    fn credentialed_l4_and_tls_skip_require_explicit_opt_in() {
+        let endpoint = |protocol: &str, tls: &str, allow: bool| NetworkEndpoint {
+            host: "api.vendor.example".to_string(),
+            port: 443,
+            protocol: protocol.to_string(),
+            tls: tls.to_string(),
+            provider_credentialed: true,
+            allow_uninspected_credentials: allow,
+            ..Default::default()
+        };
+        let policy = |endpoint| ProtoSandboxPolicy {
+            network_policies: HashMap::from([(
+                "vendor".to_string(),
+                NetworkPolicyRule {
+                    endpoints: vec![endpoint],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert!(
+            validate_uninspected_credentialed_endpoints(&policy(endpoint("", "", false))).is_err()
+        );
+        assert!(
+            validate_uninspected_credentialed_endpoints(&policy(endpoint("rest", "skip", false)))
+                .is_err()
+        );
+        assert!(
+            validate_uninspected_credentialed_endpoints(&policy(endpoint("", "", true))).is_ok()
+        );
+
+        let mut plain = endpoint("", "", false);
+        plain.provider_credentialed = false;
+        assert!(validate_uninspected_credentialed_endpoints(&policy(plain)).is_ok());
+    }
+
+    #[test]
+    fn security_notes_flag_allow_uninspected_credentials() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "api.vendor.example".to_string(),
+                port: 443,
+                allow_uninspected_credentials: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(notes.contains("cannot inspect or rewrite"));
+    }
+
+    #[test]
     fn security_notes_use_canonical_internal_ip_classifier() {
         // RFC 1918 is 172.16.0.0/12 only: the old starts_with("172.") prefix
         // wrongly flagged 172.15/172.32 and missed CGNAT (100.64.0.0/10). #1777.
@@ -5237,6 +5610,8 @@ mod tests {
                 endpoints: vec![NetworkEndpoint {
                     host: host.to_string(),
                     port: 443,
+                    protocol: "rest".to_string(),
+                    access: "full".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -5608,6 +5983,13 @@ mod tests {
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].rule_name, "_provider_work_github");
         assert_eq!(layers[0].rule.endpoints.len(), 3);
+        assert!(
+            layers[0]
+                .rule
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.provider_credentialed)
+        );
         assert!(
             layers[0]
                 .rule
@@ -6163,12 +6545,20 @@ mod tests {
             .put_message(&test_provider("work-github", "github"))
             .await
             .unwrap();
+        let mut policy = test_policy_with_rule("custom_github", "api.github.com");
+        let endpoint = &mut policy
+            .network_policies
+            .get_mut("custom_github")
+            .expect("custom rule")
+            .endpoints[0];
+        endpoint.protocol = "rest".to_string();
+        endpoint.access = "read-only".to_string();
         state
             .store
             .put_message(&test_sandbox(
                 "sb-overlap",
                 "overlap",
-                test_policy_with_rule("custom_github", "api.github.com"),
+                policy,
                 vec!["work-github".to_string()],
             ))
             .await
@@ -6343,6 +6733,8 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.custom.example".to_string(),
                         port: 443,
+                        protocol: "rest".to_string(),
+                        access: "full".to_string(),
                         ..Default::default()
                     }],
                     binaries: Vec::new(),

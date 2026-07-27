@@ -897,6 +897,7 @@ async fn handle_tcp_connection(
     // connect and before `200 Connection Established`.
     let effective_tls_skip =
         query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+    let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
@@ -1219,6 +1220,51 @@ async fn handle_tcp_connection(
             TLS_TERMINATION_UNAVAILABLE_DETAIL,
             "connect-tls-termination-unavailable",
         );
+        return Ok(());
+    }
+
+    if credential_guard.blocks_connect() {
+        const DETAIL: &str =
+            "credentialed endpoint requires L7 inspection; raw tunnel is not explicitly allowed";
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "credentials")
+            .message(format!(
+                "CONNECT refused for {host_lc}:{port}: uninspected credential traffic"
+            ))
+            .status_detail(DETAIL)
+            .build();
+        ocsf_emit!(event);
+        crate::l7::emit_uninspected_credential_finding(
+            &host_lc,
+            policy_str,
+            if effective_tls_skip { "tls-skip" } else { "l4" },
+        );
+        emit_activity_simple(activity_tx.as_ref(), true, "uninspected_credentials");
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            DETAIL,
+            "connect-uninspected-credentials",
+        );
+        respond(
+            &mut client,
+            &build_json_error_response(403, "Forbidden", "uninspected_credentials", DETAIL),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2575,6 +2621,55 @@ fn query_tls_mode(
     }
 }
 
+fn query_endpoint_credential_guard(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Result<crate::l7::EndpointCredentialGuard> {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return Ok(crate::l7::EndpointCredentialGuard::default());
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+    let values = engine.query_endpoint_credential_guards(&input)?;
+    let credentialed: Vec<_> = values
+        .iter()
+        .map(crate::l7::parse_endpoint_credential_guard)
+        .filter(|guard| guard.provider_credentialed)
+        .collect();
+    if credentialed.is_empty() {
+        return Ok(crate::l7::EndpointCredentialGuard::default());
+    }
+
+    Ok(crate::l7::EndpointCredentialGuard {
+        provider_credentialed: true,
+        allow_uninspected_credentials: credentialed
+            .iter()
+            .all(|guard| guard.allow_uninspected_credentials),
+        has_l7_protocol: credentialed.iter().all(|guard| guard.has_l7_protocol),
+        tls: if credentialed
+            .iter()
+            .any(|guard| guard.tls == crate::l7::TlsMode::Skip)
+        {
+            crate::l7::TlsMode::Skip
+        } else {
+            crate::l7::TlsMode::Auto
+        },
+    })
+}
+
 /// When the policy endpoint host is a literal IP address, the user has
 /// explicitly declared intent to allow that destination.  Synthesize an
 /// `allowed_ips` entry so the existing allowlist-validation path is used
@@ -3560,6 +3655,7 @@ struct ForwardRelayOptions<'a> {
     websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
     secret_resolver: Option<&'a SecretResolver>,
     request_body_credential_rewrite: bool,
+    deny_uninspected_credentials: bool,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -3598,6 +3694,7 @@ where
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
+            deny_uninspected_credentials: options.deny_uninspected_credentials,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
@@ -3910,6 +4007,7 @@ async fn handle_forward_proxy(
     let mut forward_websocket_request =
         crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
     let mut request_body_credential_rewrite = false;
+    let mut deny_uninspected_credentials = false;
     let l7_ctx = crate::l7::relay::L7EvalContext {
         host: host_lc.clone(),
         port,
@@ -4125,6 +4223,9 @@ async fn handle_forward_proxy(
         websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
         request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
             && l7_config.config.request_body_credential_rewrite;
+        deny_uninspected_credentials = l7_config
+            .config
+            .deny_uninspected_body_credentials(secret_resolver.is_some());
         forward_upgrade_config = Some(l7_config.config.clone());
         forward_upgrade_target = path.clone();
         forward_upgrade_query_params = query_params.clone();
@@ -4899,6 +5000,7 @@ async fn handle_forward_proxy(
             websocket_extensions,
             secret_resolver: secret_resolver.as_deref(),
             request_body_credential_rewrite,
+            deny_uninspected_credentials,
         },
     )
     .await?;
@@ -5400,6 +5502,8 @@ network_policies:
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -5909,6 +6013,7 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: resolver,
                 request_body_credential_rewrite,
+                deny_uninspected_credentials: false,
             },
         )
         .await?;
@@ -6090,6 +6195,7 @@ network_policies:
                     websocket_extensions,
                     secret_resolver: None,
                     request_body_credential_rewrite: false,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await?;
@@ -6353,6 +6459,8 @@ network_policies:
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
+                    allow_uninspected_credentials: false,
+                    provider_credentialed: false,
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
@@ -6371,6 +6479,8 @@ network_policies:
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
+                    allow_uninspected_credentials: false,
+                    provider_credentialed: false,
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
@@ -8949,6 +9059,7 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: true,
+                deny_uninspected_credentials: false,
             },
         )
         .await
@@ -9029,6 +9140,7 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
+                deny_uninspected_credentials: false,
             },
         )
         .await;
@@ -9072,6 +9184,7 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
+                deny_uninspected_credentials: false,
             },
         )
         .await;

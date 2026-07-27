@@ -175,11 +175,19 @@ async fn handle_create_sandbox_inner(
     // Ensure process identity defaults to "sandbox" when missing or
     // empty, then validate policy safety before persisting.
     if let Some(ref mut policy) = spec.policy {
+        super::policy::clear_provider_credentialed_markers(policy);
         openshell_policy::ensure_sandbox_process_identity(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
+    super::policy::validate_candidate_sandbox_credential_policy(
+        state,
+        &workspace,
+        &spec.providers,
+        spec.policy.as_ref(),
+    )
+    .await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let name = if request.name.is_empty() {
@@ -421,6 +429,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         state.store.as_ref(),
         &workspace,
         &candidate_spec.providers,
+    )
+    .await?;
+    super::policy::validate_candidate_sandbox_credential_policy(
+        state,
+        &workspace,
+        &candidate_spec.providers,
+        candidate_spec.policy.as_ref(),
     )
     .await?;
 
