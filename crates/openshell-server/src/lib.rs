@@ -70,7 +70,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::ComputeRuntime;
+use compute::{ComputeRuntime, GatewayListenerRequirement};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -426,8 +426,11 @@ pub(crate) async fn run_server(
     // snapshot on its first poll.
     ensure_default_workspace(&store).await?;
 
-    let gateway_listeners =
-        bind_gateway_listeners(config.bind_address, state.compute.gateway_bind_addresses()).await?;
+    let gateway_listeners = bind_gateway_listeners(
+        config.bind_address,
+        state.compute.gateway_listener_requirements(),
+    )
+    .await?;
 
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
@@ -543,7 +546,7 @@ pub(crate) async fn run_server(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GatewayListenerPurpose {
     Primary,
-    ComputeDriverCallback,
+    ComputeDriverCallback { driver_name: String, reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -554,31 +557,72 @@ struct GatewayListenerSpec {
 
 fn gateway_listener_specs(
     bind_address: SocketAddr,
-    extra_addresses: &[SocketAddr],
-) -> Vec<GatewayListenerSpec> {
+    requirements: &[GatewayListenerRequirement],
+) -> Result<Vec<GatewayListenerSpec>> {
     let mut specs = vec![GatewayListenerSpec {
         address: bind_address,
         purpose: GatewayListenerPurpose::Primary,
     }];
-    for address in extra_addresses {
+    for requirement in requirements {
+        validate_gateway_listener_requirement(bind_address, requirement)?;
+        let address = requirement.address;
         if !specs
             .iter()
-            .any(|existing| listener_covers(existing.address, *address))
+            .any(|existing| listener_covers(existing.address, address))
         {
             specs.push(GatewayListenerSpec {
-                address: *address,
-                purpose: GatewayListenerPurpose::ComputeDriverCallback,
+                address,
+                purpose: GatewayListenerPurpose::ComputeDriverCallback {
+                    driver_name: requirement.driver_name.clone(),
+                    reason: requirement.reason.clone(),
+                },
             });
         }
     }
-    specs
+    Ok(specs)
+}
+
+fn validate_gateway_listener_requirement(
+    primary_listener: SocketAddr,
+    requirement: &GatewayListenerRequirement,
+) -> Result<()> {
+    let requested_listener = requirement.address;
+    if requirement.driver_name != ComputeDriverKind::Docker.as_str() {
+        return Err(Error::config(format!(
+            "compute driver '{}' is not authorized to request gateway listeners in this proof of concept",
+            requirement.driver_name
+        )));
+    }
+    if requested_listener.ip().is_unspecified() {
+        return Err(Error::config(format!(
+            "compute driver requested wildcard gateway listener {requested_listener}"
+        )));
+    }
+    if requested_listener.ip().is_multicast() {
+        return Err(Error::config(format!(
+            "compute driver requested multicast gateway listener {requested_listener}"
+        )));
+    }
+    if requested_listener.port() == 0 {
+        return Err(Error::config(format!(
+            "compute driver requested zero-port gateway listener {requested_listener}"
+        )));
+    }
+    if requested_listener.port() != primary_listener.port() {
+        return Err(Error::config(format!(
+            "compute driver requested gateway listener {requested_listener} with port {}, but the primary listener uses port {}",
+            requested_listener.port(),
+            primary_listener.port()
+        )));
+    }
+    Ok(())
 }
 
 async fn bind_gateway_listeners(
     bind_address: SocketAddr,
-    extra_addresses: &[SocketAddr],
+    requirements: &[GatewayListenerRequirement],
 ) -> Result<Vec<(TcpListener, SocketAddr, GatewayListenerPurpose)>> {
-    let specs = gateway_listener_specs(bind_address, extra_addresses);
+    let specs = gateway_listener_specs(bind_address, requirements)?;
     let mut listeners = Vec::with_capacity(specs.len());
     for spec in specs {
         let listener = TcpListener::bind(spec.address)
@@ -1052,9 +1096,9 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerPurpose, GatewayListenerSpec,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_specs, is_benign_tls_handshake_failure,
+        GatewayListenerRequirement, MultiplexService, ServerState, TlsAcceptor,
+        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
+        configured_compute_driver, gateway_listener_specs, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
@@ -1533,9 +1577,13 @@ mod tests {
     fn gateway_listener_specs_skip_driver_address_covered_by_wildcard() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let requirements = [
+            docker_listener_requirement(docker),
+            docker_listener_requirement(docker),
+        ];
 
         assert_eq!(
-            gateway_listener_specs(primary, &[docker, docker]),
+            gateway_listener_specs(primary, &requirements).unwrap(),
             vec![GatewayListenerSpec {
                 address: primary,
                 purpose: GatewayListenerPurpose::Primary,
@@ -1547,9 +1595,13 @@ mod tests {
     fn gateway_listener_specs_preserve_driver_callback_purpose() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let requirements = [
+            docker_listener_requirement(docker),
+            docker_listener_requirement(docker),
+        ];
 
         assert_eq!(
-            gateway_listener_specs(primary, &[docker, docker]),
+            gateway_listener_specs(primary, &requirements).unwrap(),
             vec![
                 GatewayListenerSpec {
                     address: primary,
@@ -1557,7 +1609,10 @@ mod tests {
                 },
                 GatewayListenerSpec {
                     address: docker,
-                    purpose: GatewayListenerPurpose::ComputeDriverCallback,
+                    purpose: GatewayListenerPurpose::ComputeDriverCallback {
+                        driver_name: "docker".to_string(),
+                        reason: "managed bridge".to_string(),
+                    },
                 },
             ]
         );
@@ -1571,7 +1626,11 @@ mod tests {
         let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let result: openshell_core::Result<()> = async {
-            let _listeners = bind_gateway_listeners(primary_address, &[occupied_address]).await?;
+            let _listeners = bind_gateway_listeners(
+                primary_address,
+                &[docker_listener_requirement(occupied_address)],
+            )
+            .await?;
             resume_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1585,5 +1644,43 @@ mod tests {
             !resume_attempted.load(Ordering::SeqCst),
             "persisted sandbox resume must not run before every gateway listener is bound"
         );
+    }
+
+    #[test]
+    fn gateway_listener_specs_reject_unauthorized_external_driver() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let requirement = GatewayListenerRequirement {
+            address: "172.18.0.1:8080".parse().unwrap(),
+            driver_name: "external-test".to_string(),
+            reason: "external bridge".to_string(),
+        };
+
+        let err = gateway_listener_specs(primary, &[requirement]).unwrap_err();
+        assert!(err.to_string().contains("not authorized"));
+    }
+
+    #[test]
+    fn gateway_listener_specs_reject_invalid_exact_addresses() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        for address in [
+            "0.0.0.0:8080",
+            "224.0.0.1:8080",
+            "172.18.0.1:0",
+            "172.18.0.1:9090",
+        ] {
+            let requirement = docker_listener_requirement(address.parse().unwrap());
+            assert!(
+                gateway_listener_specs(primary, &[requirement]).is_err(),
+                "{address} should be rejected"
+            );
+        }
+    }
+
+    fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement {
+            address,
+            driver_name: "docker".to_string(),
+            reason: "managed bridge".to_string(),
+        }
     }
 }
