@@ -35,7 +35,7 @@ use tower_http::request_id::{MakeRequestId, RequestId};
 use tracing::{Span, warn};
 
 use crate::{
-    OpenShellService, ServerState,
+    GatewayListenerPurpose, OpenShellService, ServerState,
     auth::authenticator::AuthenticatorChain,
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
@@ -144,7 +144,22 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity(stream, None).await
+        self.serve_on_listener(stream, GatewayListenerPurpose::Primary)
+            .await
+    }
+
+    /// Serve a connection and preserve its listener purpose in request
+    /// extensions for downstream routing and policy decisions.
+    pub(crate) async fn serve_on_listener<S>(
+        &self,
+        stream: S,
+        listener_purpose: GatewayListenerPurpose,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_on_listener(stream, None, listener_purpose)
+            .await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -152,6 +167,25 @@ impl MultiplexService {
         &self,
         stream: S,
         peer_identity: Option<Identity>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_on_listener(
+            stream,
+            peer_identity,
+            GatewayListenerPurpose::Primary,
+        )
+        .await
+    }
+
+    /// Serve a TLS connection and preserve its listener purpose in request
+    /// extensions for downstream routing and policy decisions.
+    pub(crate) async fn serve_with_peer_identity_on_listener<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        listener_purpose: GatewayListenerPurpose,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -188,7 +222,10 @@ impl MultiplexService {
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
 
-        let service = MultiplexedService::new(grpc_service, http_service);
+        let service = GatewayListenerContextService::new(
+            MultiplexedService::new(grpc_service, http_service),
+            listener_purpose,
+        );
 
         let mut builder = Builder::new(TokioExecutor::new());
         // Server-side HTTP/2 keepalive: supervisors hold long-lived sessions, and without
@@ -217,15 +254,64 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let http_service = TowerToHyperService::new(request_id_middleware!(service_http_router(
-            self.state.clone()
-        )));
+        self.serve_service_http_on_listener(stream, GatewayListenerPurpose::Primary)
+            .await
+    }
+
+    /// Serve a plaintext service HTTP connection and preserve its listener
+    /// purpose in request extensions.
+    pub(crate) async fn serve_service_http_on_listener<S>(
+        &self,
+        stream: S,
+        listener_purpose: GatewayListenerPurpose,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let http_service = GatewayListenerContextService::new(
+            TowerToHyperService::new(request_id_middleware!(service_http_router(
+                self.state.clone()
+            ))),
+            listener_purpose,
+        );
 
         Builder::new(TokioExecutor::new())
             .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
             .await?;
 
         Ok(())
+    }
+}
+
+/// Adds immutable connection provenance to every request served on a listener.
+#[derive(Clone)]
+struct GatewayListenerContextService<S> {
+    inner: S,
+    listener_purpose: GatewayListenerPurpose,
+}
+
+impl<S> GatewayListenerContextService<S> {
+    fn new(inner: S, listener_purpose: GatewayListenerPurpose) -> Self {
+        Self {
+            inner,
+            listener_purpose,
+        }
+    }
+}
+
+impl<S, B> hyper::service::Service<Request<B>> for GatewayListenerContextService<S>
+where
+    S: hyper::service::Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn call(&self, mut request: Request<B>) -> Self::Future {
+        request
+            .extensions_mut()
+            .insert(self.listener_purpose.clone());
+        self.inner.call(request)
     }
 }
 
@@ -1099,6 +1185,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_stream::wrappers::TcpListenerStream;
     use tower::Service;
+
+    #[tokio::test]
+    async fn listener_context_service_preserves_listener_purpose() {
+        let observed = Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+        let inner = hyper::service::service_fn(move |request: Request<Empty<Bytes>>| {
+            *captured.lock().unwrap() = request
+                .extensions()
+                .get::<GatewayListenerPurpose>()
+                .cloned();
+            async move { Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new())) }
+        });
+        let service = GatewayListenerContextService::new(inner, GatewayListenerPurpose::Primary);
+        hyper::service::Service::call(&service, Request::new(Empty::<Bytes>::new()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(GatewayListenerPurpose::Primary)
+        );
+    }
 
     #[derive(Clone)]
     struct PostCommitTestInterceptor;

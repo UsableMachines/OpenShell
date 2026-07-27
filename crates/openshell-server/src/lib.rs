@@ -509,10 +509,11 @@ pub(crate) async fn run_server(
 
     let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
-    for (listener, listen_addr) in gateway_listeners {
+    for (listener, listen_addr, purpose) in gateway_listeners {
         listener_tasks.push(tokio::spawn(serve_gateway_listener(
             listener,
             listen_addr,
+            purpose,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -539,35 +540,53 @@ pub(crate) async fn run_server(
     Ok(())
 }
 
-fn gateway_listener_addresses(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GatewayListenerPurpose {
+    Primary,
+    ComputeDriverCallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayListenerSpec {
+    address: SocketAddr,
+    purpose: GatewayListenerPurpose,
+}
+
+fn gateway_listener_specs(
     bind_address: SocketAddr,
     extra_addresses: &[SocketAddr],
-) -> Vec<SocketAddr> {
-    let mut addresses = vec![bind_address];
+) -> Vec<GatewayListenerSpec> {
+    let mut specs = vec![GatewayListenerSpec {
+        address: bind_address,
+        purpose: GatewayListenerPurpose::Primary,
+    }];
     for address in extra_addresses {
-        if !addresses
+        if !specs
             .iter()
-            .any(|existing| listener_covers(*existing, *address))
+            .any(|existing| listener_covers(existing.address, *address))
         {
-            addresses.push(*address);
+            specs.push(GatewayListenerSpec {
+                address: *address,
+                purpose: GatewayListenerPurpose::ComputeDriverCallback,
+            });
         }
     }
-    addresses
+    specs
 }
 
 async fn bind_gateway_listeners(
     bind_address: SocketAddr,
     extra_addresses: &[SocketAddr],
-) -> Result<Vec<(TcpListener, SocketAddr)>> {
-    let addresses = gateway_listener_addresses(bind_address, extra_addresses);
-    let mut listeners = Vec::with_capacity(addresses.len());
-    for address in addresses {
-        let listener = TcpListener::bind(address)
+) -> Result<Vec<(TcpListener, SocketAddr, GatewayListenerPurpose)>> {
+    let specs = gateway_listener_specs(bind_address, extra_addresses);
+    let mut listeners = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let listener = TcpListener::bind(spec.address)
             .await
-            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
-        let local_addr = listener.local_addr().unwrap_or(address);
+            .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", spec.address)))?;
+        let local_addr = listener.local_addr().unwrap_or(spec.address);
         info!(address = %local_addr, "Server listening");
-        listeners.push((listener, local_addr));
+        listeners.push((listener, local_addr, spec.purpose));
     }
     Ok(listeners)
 }
@@ -590,6 +609,7 @@ fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
 async fn serve_gateway_listener(
     listener: TcpListener,
     listen_addr: SocketAddr,
+    purpose: GatewayListenerPurpose,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
@@ -618,6 +638,7 @@ async fn serve_gateway_listener(
             stream,
             addr,
             listen_addr,
+            purpose.clone(),
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -686,6 +707,7 @@ fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
     listen_addr: SocketAddr,
+    listener_purpose: GatewayListenerPurpose,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
@@ -700,7 +722,10 @@ fn spawn_gateway_connection(
                         addr,
                     ) =>
                 {
-                    if let Err(e) = service.serve_service_http(stream).await {
+                    if let Err(e) = service
+                        .serve_service_http_on_listener(stream, listener_purpose)
+                        .await
+                    {
                         if is_benign_connection_close(e.as_ref()) {
                             debug!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection closed");
                         } else {
@@ -719,7 +744,11 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .serve_with_peer_identity_on_listener(
+                                    tls_stream,
+                                    peer_identity,
+                                    listener_purpose,
+                                )
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {
@@ -745,7 +774,7 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            if let Err(e) = service.serve_on_listener(stream, listener_purpose).await {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -1022,9 +1051,10 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
+        ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerPurpose, GatewayListenerSpec,
+        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
+        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
+        gateway_listener_specs, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
@@ -1121,6 +1151,7 @@ mod tests {
         let handle = tokio::spawn(serve_gateway_listener(
             listener,
             listen_addr,
+            GatewayListenerPurpose::Primary,
             service,
             Some(tls_acceptor),
             enable_loopback_service_http,
@@ -1499,24 +1530,36 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_addresses_skip_driver_address_covered_by_wildcard() {
+    fn gateway_listener_specs_skip_driver_address_covered_by_wildcard() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_addresses(primary, &[docker, docker]),
-            vec![primary]
+            gateway_listener_specs(primary, &[docker, docker]),
+            vec![GatewayListenerSpec {
+                address: primary,
+                purpose: GatewayListenerPurpose::Primary,
+            }]
         );
     }
 
     #[test]
-    fn gateway_listener_addresses_include_driver_address_on_distinct_ip() {
+    fn gateway_listener_specs_preserve_driver_callback_purpose() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_addresses(primary, &[docker, docker]),
-            vec![primary, docker]
+            gateway_listener_specs(primary, &[docker, docker]),
+            vec![
+                GatewayListenerSpec {
+                    address: primary,
+                    purpose: GatewayListenerPurpose::Primary,
+                },
+                GatewayListenerSpec {
+                    address: docker,
+                    purpose: GatewayListenerPurpose::ComputeDriverCallback,
+                },
+            ]
         );
     }
 
