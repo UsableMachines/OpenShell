@@ -79,6 +79,22 @@ e2e/run.sh \
   --suite smoke
 ```
 
+Use `--guest-setup` when a driver needs checkout-specific guest preparation
+before the gateway starts. For example, the Podman shutdown suite builds a
+supervisor image around the staged `openshell-sandbox` binary:
+
+```shell
+e2e/run.sh \
+  --vm ubuntu \
+  --with podman \
+  --guest-setup e2e/guest-setup/podman-supervisor.sh \
+  --gateway-config e2e/configs/gateway/podman.toml \
+  --suite podman-shutdown
+```
+
+Set `OPENSHELL_E2E_EXPECT_SHUTDOWN_CLOSES=1` when a stacked change must
+classify supervisor and relay transport closures as expected teardown events.
+
 Supplying `--with` without `--vm` selects Ubuntu. `--with` is repeatable and configurations run in input order. Supplying `--vm` without `--with` boots the selected base image without adding software. The wrapper validates both values against the test-VM catalogs:
 
 ```shell
