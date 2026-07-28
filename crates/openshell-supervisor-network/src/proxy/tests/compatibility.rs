@@ -171,6 +171,11 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     let subscriber = tracing_subscriber::registry().with(layer);
     let denial_reason = "target.example resolves to internal address 10.0.0.5";
     tracing::subscriber::with_default(subscriber, || {
+        // Other parallel tests may register this callsite while no subscriber
+        // is active. Refresh the process-wide cache after installing this
+        // thread-local subscriber so the OCSF events cannot remain disabled.
+        tracing::callsite::rebuild_interest_cache();
+
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
