@@ -162,7 +162,7 @@ impl std::fmt::Display for AppArmorProfile {
     }
 }
 
-/// How OpenShell provisions Kubernetes sandboxes.
+/// How `OpenShell` provisions Kubernetes sandboxes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProvisioningMode {

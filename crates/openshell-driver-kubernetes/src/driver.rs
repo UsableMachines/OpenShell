@@ -249,11 +249,14 @@ impl From<&KubernetesDriverVolumeMountConfig> for VolumeMount {
     }
 }
 
+const BIND_VOLUME_NAME: &str = "openshell-bind";
+const BIND_MOUNT_PATH: &str = "/var/run/openshell-bind";
 const CLIENT_TLS_VOLUME_NAME: &str = "openshell-client-tls";
 const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
 const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
 
 const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
+    BIND_VOLUME_NAME,
     CLIENT_TLS_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
@@ -1020,7 +1023,7 @@ impl KubernetesComputeDriver {
                 labels: Some(sandbox_labels(sandbox)),
                 ..Default::default()
             };
-            obj.data = claim_to_k8s_spec(sandbox, &self.config)?;
+            obj.data = claim_to_k8s_spec(sandbox, &self.config);
             let api = self.claim_api();
 
             return match tokio::time::timeout(
@@ -1729,7 +1732,7 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, S
     ))
 }
 
-fn claim_status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
+fn claim_status_from_object(obj: &DynamicObject) -> SandboxStatus {
     let claim_name = obj.metadata.name.clone().unwrap_or_default();
     let status_obj = obj.data.get("status").and_then(|status| status.as_object());
 
@@ -1753,14 +1756,14 @@ fn claim_status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
         })
         .unwrap_or_default();
 
-    Some(SandboxStatus {
+    SandboxStatus {
         sandbox_name: claim_name,
         instance_id: String::new(),
         agent_fd: String::new(),
         sandbox_fd: String::new(),
         conditions,
         deleting: obj.metadata.deletion_timestamp.is_some(),
-    })
+    }
 }
 
 fn claim_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
@@ -1775,7 +1778,7 @@ fn claim_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, Str
         .namespace
         .clone()
         .unwrap_or_else(|| namespace.to_string());
-    let status = claim_status_from_object(&obj);
+    let status = Some(claim_status_from_object(&obj));
 
     Ok(Sandbox {
         id,
@@ -2801,7 +2804,7 @@ fn warm_pool_claim_env_is_unsafe(spec: Option<&SandboxSpec>) -> bool {
 fn claim_to_k8s_spec(
     sandbox: &Sandbox,
     config: &KubernetesComputeConfig,
-) -> Result<serde_json::Value, KubernetesDriverError> {
+) -> serde_json::Value {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
 
@@ -2849,9 +2852,9 @@ fn claim_to_k8s_spec(
         );
     }
 
-    Ok(serde_json::Value::Object(
+    serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(claim_spec))).collect(),
-    ))
+    )
 }
 
 fn sandbox_to_k8s_spec(
@@ -3162,8 +3165,8 @@ fn sandbox_template_to_k8s_with_validated_config(
             .map(kubernetes_driver_volume_mount_to_k8s),
     );
     volume_mounts.push(serde_json::json!({
-        "name": "openshell-bind",
-        "mountPath": "/var/run/openshell-bind",
+        "name": BIND_VOLUME_NAME,
+        "mountPath": BIND_MOUNT_PATH,
         "readOnly": true,
     }));
     container.insert(
@@ -3236,7 +3239,7 @@ fn sandbox_template_to_k8s_with_validated_config(
             .map(kubernetes_driver_volume_to_k8s),
     );
     volumes.push(serde_json::json!({
-        "name": "openshell-bind",
+        "name": BIND_VOLUME_NAME,
         "downwardAPI": {
             "items": [
                 {
@@ -6629,7 +6632,7 @@ mod tests {
             }
         });
 
-        let status = claim_status_from_object(&obj).expect("claim status should parse");
+        let status = claim_status_from_object(&obj);
         assert_eq!(status.sandbox_name, "claim-a");
         assert_eq!(status.instance_id, "");
         assert_eq!(status.conditions.len(), 1);
@@ -6662,7 +6665,7 @@ mod tests {
             }
         });
 
-        let status = claim_status_from_object(&obj).expect("claim status should parse");
+        let status = claim_status_from_object(&obj);
         let ready = &status.conditions[0];
         assert_eq!(ready.reason, "ImagePullBackOff");
         assert_eq!(ready.message, "Failed to pull image");
