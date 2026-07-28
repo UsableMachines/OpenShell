@@ -12,6 +12,9 @@
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::auth::workspace_authz::{
+    MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
+};
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectName, ObjectType, ObjectWorkspace, PolicyRecord, Store,
 };
@@ -1266,6 +1269,7 @@ pub(super) async fn handle_get_sandbox_config(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let sandbox_id = request.get_ref().sandbox_id.clone();
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
@@ -1277,6 +1281,14 @@ pub(super) async fn handle_get_sandbox_config(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let workspace = sandbox.object_workspace().to_string();
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
     let sandbox_provider_names = sandbox
         .spec
         .as_ref()
@@ -1660,12 +1672,12 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let principal = request.extensions().get::<Principal>().cloned();
-    let sandbox_caller = matches!(principal, Some(Principal::Sandbox(_)));
+    let principal = super::extract_principal(&request)?;
+    let sandbox_caller = matches!(&principal, Principal::Sandbox(_));
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request, principal, sandbox_caller).await;
+    let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -1675,22 +1687,39 @@ pub(super) async fn handle_update_config(
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
-    principal: Option<Principal>,
+    principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
+    let workspace = if req.global {
+        require_platform_admin(&state.admin_role, principal)?;
+        String::new()
+    } else {
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name;
+        let min_role = if sandbox_caller {
+            MinWorkspaceRole::User
+        } else {
+            MinWorkspaceRole::Admin
+        };
+        authorize_sandbox_workspace(
+            &state.store,
+            &state.admin_role,
+            principal,
+            &workspace,
+            min_role,
+        )
+        .await?;
+        workspace
+    };
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
             state.store.as_ref(),
             &workspace,
-            principal
-                .as_ref()
-                .expect("sandbox_caller implies principal"),
+            principal,
             &req.name,
         )
         .await?;
@@ -2285,13 +2314,24 @@ pub(super) async fn handle_get_sandbox_policy_status(
     state: &Arc<ServerState>,
     request: Request<GetSandboxPolicyStatusRequest>,
 ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
+        require_platform_admin(&state.admin_role, &principal)?;
         String::new()
     } else {
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        let ws = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
             .await?
-            .name
+            .name;
+        authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &ws,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        ws
     };
 
     let (policy_id, active_version) = if req.global {
@@ -2343,13 +2383,24 @@ pub(super) async fn handle_list_sandbox_policies(
     state: &Arc<ServerState>,
     request: Request<ListSandboxPoliciesRequest>,
 ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
+        require_platform_admin(&state.admin_role, &principal)?;
         String::new()
     } else {
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        let ws = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
             .await?
-            .name
+            .name;
+        authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &ws,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        ws
     };
 
     let policy_id = if req.global {
@@ -2466,20 +2517,29 @@ pub(super) async fn handle_report_policy_status(
 // Sandbox logs handlers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::unused_async)] // Must be async to match the trait signature
 pub(super) async fn handle_get_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<GetSandboxLogsRequest>,
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    // TODO(phase2): workspace is resolved but not used for authorization.
-    // Verify the sandbox belongs to this workspace before returning logs.
-    let _workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&req.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        sandbox.object_workspace(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
     let tail = state.tracing_log_bus.tail(&req.sandbox_id, lines as usize);
@@ -2887,6 +2947,14 @@ pub(super) async fn handle_get_draft_policy(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -2955,10 +3023,19 @@ async fn handle_approve_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3058,10 +3135,19 @@ async fn handle_reject_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3159,10 +3245,19 @@ async fn handle_approve_all_draft_chunks_inner(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3284,10 +3379,19 @@ pub(super) async fn handle_edit_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3351,10 +3455,19 @@ async fn handle_undo_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3439,10 +3552,19 @@ pub(super) async fn handle_clear_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3478,10 +3600,19 @@ pub(super) async fn handle_get_draft_history(
     state: &Arc<ServerState>,
     request: Request<GetDraftHistoryRequest>,
 ) -> Result<Response<GetDraftHistoryResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
+    authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -4511,7 +4642,7 @@ mod tests {
     use crate::auth::principal::{
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{authed_request, test_server_state};
     use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -4770,6 +4901,150 @@ mod tests {
             },
         }));
         assert!(!is_sandbox_caller(&req));
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_logs_authorizes_persisted_sandbox_workspace() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-b-id".to_string(),
+                name: "sandbox-b".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "workspace-b".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            ..Sandbox::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let member = WorkspaceMember {
+            metadata: Some(ObjectMeta {
+                id: "member-a-id".to_string(),
+                name: "test-user".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            principal_subject: "test-user".to_string(),
+            role: WorkspaceRole::User.into(),
+        };
+        state.store.put_message(&member).await.unwrap();
+
+        let error = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-b-id".to_string(),
+                workspace: "default".to_string(),
+                ..GetSandboxLogsRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn update_config_global_requires_platform_admin() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        let member = WorkspaceMember {
+            metadata: Some(ObjectMeta {
+                id: "default-admin-member-id".to_string(),
+                name: "test-user".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            principal_subject: "test-user".to_string(),
+            role: WorkspaceRole::Admin.into(),
+        };
+        state.store.put_message(&member).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: "log_level".to_string(),
+                delete_setting: true,
+                ..UpdateConfigRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn global_policy_reads_require_platform_admin() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let get_error = handle_get_sandbox_policy_status(
+            &state,
+            with_user(Request::new(GetSandboxPolicyStatusRequest {
+                global: true,
+                ..GetSandboxPolicyStatusRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(get_error.code(), Code::PermissionDenied);
+        assert!(get_error.message().contains("platform admin role required"));
+
+        let list_error = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                global: true,
+                ..ListSandboxPoliciesRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(list_error.code(), Code::PermissionDenied);
+        assert!(
+            list_error
+                .message()
+                .contains("platform admin role required")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_missing_principal() {
+        let state = test_server_state().await;
+
+        let error = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: "log_level".to_string(),
+                delete_setting: true,
+                ..UpdateConfigRequest::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(error.message(), "missing principal");
     }
 
     #[test]
@@ -6500,7 +6775,7 @@ mod tests {
 
         handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -6551,7 +6826,7 @@ mod tests {
         enable_providers_v2(&state).await;
         handle_import_provider_profiles(
             &state,
-            Request::new(ImportProviderProfilesRequest {
+            authed_request(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
@@ -6671,7 +6946,7 @@ mod tests {
 
         handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
@@ -7505,7 +7780,7 @@ mod tests {
 
         let approve = handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -7519,7 +7794,7 @@ mod tests {
 
         let history_after_approve = handle_get_draft_history(
             &state,
-            Request::new(GetDraftHistoryRequest {
+            authed_request(GetDraftHistoryRequest {
                 name: sandbox_name.clone(),
                 workspace: "default".to_string(),
             }),
@@ -7534,7 +7809,7 @@ mod tests {
 
         let policies_after_approve = handle_list_sandbox_policies(
             &state,
-            Request::new(ListSandboxPoliciesRequest {
+            authed_request(ListSandboxPoliciesRequest {
                 name: sandbox_name.clone(),
                 limit: 10,
                 offset: 0,
@@ -7550,7 +7825,7 @@ mod tests {
 
         let undo = handle_undo_draft_chunk(
             &state,
-            Request::new(UndoDraftChunkRequest {
+            authed_request(UndoDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -7578,7 +7853,7 @@ mod tests {
 
         let history_after_undo = handle_get_draft_history(
             &state,
-            Request::new(GetDraftHistoryRequest {
+            authed_request(GetDraftHistoryRequest {
                 name: sandbox_name.clone(),
                 workspace: "default".to_string(),
             }),
@@ -7591,7 +7866,7 @@ mod tests {
 
         let policies_after_undo = handle_list_sandbox_policies(
             &state,
-            Request::new(ListSandboxPoliciesRequest {
+            authed_request(ListSandboxPoliciesRequest {
                 name: sandbox_name.clone(),
                 limit: 10,
                 offset: 0,
@@ -7608,7 +7883,7 @@ mod tests {
 
         let cleared = handle_clear_draft_chunks(
             &state,
-            Request::new(ClearDraftChunksRequest {
+            authed_request(ClearDraftChunksRequest {
                 name: sandbox_name.clone(),
                 workspace: "default".to_string(),
             }),
@@ -7633,7 +7908,7 @@ mod tests {
 
         let history_after_clear = handle_get_draft_history(
             &state,
-            Request::new(GetDraftHistoryRequest {
+            authed_request(GetDraftHistoryRequest {
                 name: sandbox_name,
                 workspace: "default".to_string(),
             }),
@@ -7708,7 +7983,7 @@ mod tests {
         let guidance = "scope to docs/ paths only, not all repo contents";
         handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: guidance.to_string(),
@@ -9678,7 +9953,7 @@ mod tests {
         // exact path the smoke test exercises end-to-end.
         handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: sandbox_name,
                 chunk_id: second.accepted_chunk_ids[0].clone(),
                 reason: "redraft test".to_string(),
@@ -10134,7 +10409,7 @@ mod tests {
 
         handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "scope too broad".to_string(),
@@ -10146,7 +10421,7 @@ mod tests {
 
         handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10157,7 +10432,7 @@ mod tests {
 
         handle_undo_draft_chunk(
             &state,
-            Request::new(UndoDraftChunkRequest {
+            authed_request(UndoDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10293,7 +10568,7 @@ mod tests {
 
         let approve_err = handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10305,7 +10580,7 @@ mod tests {
 
         let reject_err = handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "wrong sandbox".to_string(),
@@ -10318,7 +10593,7 @@ mod tests {
 
         let edit_err = handle_edit_draft_chunk(
             &state,
-            Request::new(EditDraftChunkRequest {
+            authed_request(EditDraftChunkRequest {
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(proposed_rule.clone()),
@@ -10331,7 +10606,7 @@ mod tests {
 
         handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: sandbox_a.object_name().to_string(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10342,7 +10617,7 @@ mod tests {
 
         let undo_err = handle_undo_draft_chunk(
             &state,
-            Request::new(UndoDraftChunkRequest {
+            authed_request(UndoDraftChunkRequest {
                 name: other_name,
                 chunk_id,
                 workspace: "default".to_string(),
@@ -12082,7 +12357,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -12169,7 +12444,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "annotated-backfill".to_string(),
                 policy: Some(ProtoSandboxPolicy::default()),
                 setting_key: String::new(),
@@ -12245,7 +12520,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "same-hash".to_string(),
                 policy: Some(policy),
                 annotations: HashMap::from([(
@@ -12587,7 +12862,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "preserve-backfill".to_string(),
                 policy: Some(ProtoSandboxPolicy::default()),
                 expected_resource_version: current_version,
@@ -12861,7 +13136,7 @@ mod tests {
 
         let err = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -12960,7 +13235,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 handle_update_config(
                     &state_clone,
-                    Request::new(UpdateConfigRequest {
+                    authed_request(UpdateConfigRequest {
                         name: "test-sandbox".to_string(),
                         policy: Some(new_policy),
                         setting_key: String::new(),
