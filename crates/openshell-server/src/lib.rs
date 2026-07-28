@@ -56,6 +56,7 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
 use openshell_supervisor_middleware::MiddlewareRegistry;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
@@ -735,15 +736,39 @@ async fn bind_gateway_listeners(
 ) -> Result<Vec<(TcpListener, SocketAddr, GatewayListenerPurpose)>> {
     let specs = gateway_listener_specs(bind_address, requirements)?;
     let mut listeners = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let listener = TcpListener::bind(spec.address)
+    for spec in &specs {
+        let ipv6_only = matches!(
+            spec.address.ip(),
+            IpAddr::V6(address) if address.is_unspecified()
+        ) && specs.iter().any(|candidate| {
+            candidate.address.port() == spec.address.port() && candidate.address.is_ipv4()
+        });
+        let listener = bind_gateway_listener(spec.address, ipv6_only)
             .await
             .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", spec.address)))?;
         let local_addr = listener.local_addr().unwrap_or(spec.address);
         info!(address = %local_addr, "Server listening");
-        listeners.push((listener, local_addr, spec.purpose));
+        listeners.push((listener, local_addr, spec.purpose.clone()));
     }
     Ok(listeners)
+}
+
+async fn bind_gateway_listener(
+    address: SocketAddr,
+    ipv6_only: bool,
+) -> std::io::Result<TcpListener> {
+    if ipv6_only {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_only_v6(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        socket.listen(1024)?;
+        let listener: std::net::TcpListener = socket.into();
+        return TcpListener::from_std(listener);
+    }
+
+    TcpListener::bind(address).await
 }
 
 fn listener_satisfies_loopback_interface(address: SocketAddr) -> bool {
@@ -1974,6 +1999,25 @@ mod tests {
             assert_eq!(specs.len(), 2);
             assert_eq!(specs[1].address, SocketAddr::from(([127, 0, 0, 1], 8080)));
         }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn gateway_listeners_bind_ipv6_wildcard_and_ipv4_callback_on_same_port() {
+        let probe = TcpListener::bind("[::1]:0")
+            .await
+            .expect("IPv6 loopback probe should bind");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let primary = format!("[::]:{port}").parse().unwrap();
+        let listeners = bind_gateway_listeners(primary, &[podman_loopback_listener_requirement()])
+            .await
+            .expect("IPv6 wildcard and IPv4 callback listeners should both bind");
+
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0].1, primary);
+        assert_eq!(listeners[1].1, SocketAddr::from(([127, 0, 0, 1], port)));
     }
 
     #[test]
