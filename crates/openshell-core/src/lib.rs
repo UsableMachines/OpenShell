@@ -15,6 +15,7 @@ pub mod config;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
+pub mod endpoint_path;
 pub mod error;
 pub mod forward;
 pub mod google_cloud;
