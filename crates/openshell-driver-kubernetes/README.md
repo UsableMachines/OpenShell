@@ -6,6 +6,10 @@ The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources in the configured namespace. It runs in-process with the
 gateway server.
 
+Sandbox resource names are workspace-qualified as `{workspace}--{sandbox-name}`
+to avoid collisions between workspaces. The combined name must be no more than
+63 characters, as required by Kubernetes DNS-1123 labels.
+
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to

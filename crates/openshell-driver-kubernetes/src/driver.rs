@@ -765,6 +765,7 @@ impl KubernetesComputeDriver {
         if self.is_claim_mode() {
             self.validate_claim_mode_sandbox(sandbox)
                 .map_err(tonic::Status::failed_precondition)?;
+            validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
             return Ok(());
         }
 
@@ -1016,9 +1017,10 @@ impl KubernetesComputeDriver {
 
             let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
             let resource = ApiResource::from_gvk(&gvk);
-            let mut obj = DynamicObject::new(name, &resource);
+            let kube_name = kube_resource_name(&sandbox.workspace, name);
+            let mut obj = DynamicObject::new(&kube_name, &resource);
             obj.metadata = ObjectMeta {
-                name: Some(name.to_string()),
+                name: Some(kube_name),
                 namespace: Some(self.config.namespace.clone()),
                 labels: Some(sandbox_labels(sandbox)),
                 ..Default::default()
@@ -1768,10 +1770,14 @@ fn claim_status_from_object(obj: &DynamicObject) -> SandboxStatus {
 
 fn claim_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
     let id = sandbox_id_from_object(&obj)?;
-    let name = obj.metadata.name.clone().unwrap_or_default();
+    let kube_name = obj.metadata.name.clone().unwrap_or_default();
+    let Some(name) = annotation_or_label(&obj, LABEL_SANDBOX_NAME) else {
+        warn!(object = %kube_name, "openshell-managed sandbox claim missing name");
+        return Err(format!("object {kube_name} missing sandbox name"));
+    };
     let Some(workspace) = annotation_or_label(&obj, LABEL_SANDBOX_WORKSPACE) else {
-        warn!(object = %name, "openshell-managed sandbox claim missing workspace");
-        return Err(format!("object {name} missing sandbox workspace"));
+        warn!(object = %kube_name, "openshell-managed sandbox claim missing workspace");
+        return Err(format!("object {kube_name} missing sandbox workspace"));
     };
     let namespace = obj
         .metadata
@@ -2801,10 +2807,7 @@ fn warm_pool_claim_env_is_unsafe(spec: Option<&SandboxSpec>) -> bool {
     !env.is_empty()
 }
 
-fn claim_to_k8s_spec(
-    sandbox: &Sandbox,
-    config: &KubernetesComputeConfig,
-) -> serde_json::Value {
+fn claim_to_k8s_spec(sandbox: &Sandbox, config: &KubernetesComputeConfig) -> serde_json::Value {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
 
@@ -6611,6 +6614,33 @@ mod tests {
         };
         assert!(sandbox_id_from_object(&obj).is_err());
     }
+
+    #[test]
+    fn claim_from_object_reads_logical_name_from_label() {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("alpha--work", &resource);
+        obj.metadata = ObjectMeta {
+            name: Some("alpha--work".to_string()),
+            namespace: Some("default".to_string()),
+            labels: Some(BTreeMap::from([
+                (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let sandbox = claim_from_object("default", obj).unwrap();
+        assert_eq!(sandbox.name, "work");
+        assert_eq!(sandbox.workspace, "alpha");
+        assert_eq!(sandbox.id, "uuid-123");
+    }
+
     #[test]
     fn claim_status_from_object_rewrites_sandbox_not_ready_to_dependencies_not_ready() {
         let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
