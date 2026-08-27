@@ -154,6 +154,23 @@ data:
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
+    {{- with .Values.server.upstreamProxy }}
+    {{- if .url }}
+    https_proxy                  = {{ .url | quote }}
+    {{- if .noProxy }}
+    no_proxy                     = {{ .noProxy | quote }}
+    {{- end }}
+    {{- if .authSecretName }}
+    proxy_auth_secret_name       = {{ .authSecretName | quote }}
+    proxy_auth_allow_insecure    = {{ .authAllowInsecure }}
+    {{- end }}
+    {{- if .connectByHostname }}
+    proxy_connect_by_hostname    = true
+    {{- end }}
+    {{- else if or .noProxy .authSecretName .connectByHostname }}
+    {{- fail "server.upstreamProxy: noProxy, authSecretName, and connectByHostname require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly" }}
+    {{- end }}
+    {{- end }}
 
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}

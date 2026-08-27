@@ -293,6 +293,40 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # back to 1000 on non-OpenShift clusters.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+# Corporate forward proxy for sandbox egress. The network supervisor chains
+# policy-approved TLS tunnels through this proxy with HTTP CONNECT instead of
+# dialing destinations directly. Semantics, NO_PROXY matching, the CONNECT
+# target warning, and the fail-closed behaviour are identical to the Podman
+# driver's settings documented under "Podman" below; only credential delivery
+# differs.
+#
+# In combined topology the flags land on the agent container's supervisor; in
+# sidecar topology they land on the network sidecar. The process-only
+# supervisor never dials upstream destinations and is deliberately left
+# without them.
+#
+# Credentials are supplied as an existing Secret in the sandbox namespace
+# rather than a gateway-host file path: the credential must be stored under
+# the "upstream-proxy" key in the user:pass form, and kubelet projects it
+# into the pod at /etc/openshell/auth/upstream-proxy. The gateway therefore
+# never reads or re-delivers the credential bytes. Create it with:
+#   kubectl -n <sandbox-namespace> create secret generic \
+#     openshell-upstream-proxy-auth --from-literal=upstream-proxy='user:pass'
+#
+# WARNING: the supervisor sends the credential as a Proxy-Authorization:
+# Basic header over the plain-TCP connection to the http:// proxy. Basic auth
+# is base64, not encryption: anyone on the network path between the sandbox
+# pod and the proxy can recover the credential. Because of that,
+# proxy_auth_secret_name requires the explicit acknowledgement
+# proxy_auth_allow_insecure = true; without it the configuration is rejected
+# at gateway startup. Only opt in when the path to the proxy is a trusted
+# network segment.
+# https_proxy               = "http://proxy.corp.com:8080"
+# no_proxy                  = "*.svc.cluster.local,10.0.0.0/8"
+# proxy_auth_secret_name    = "openshell-upstream-proxy-auth"
+# proxy_auth_allow_insecure = true
+# Last resort for hostname-filtering proxy ACLs; see the warning above.
+# proxy_connect_by_hostname = true
 
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
@@ -391,7 +425,7 @@ sandbox_pids_limit      = 2048
 # but increase process churn (each check spawns a conmon subprocess).
 # Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
-# Corporate forward proxy for sandbox egress. When set, the in-container
+# Corporate forward proxy for sandbox egress. When set, the sandbox's network
 # supervisor chains policy-approved TLS tunnels through this proxy with HTTP
 # CONNECT instead of dialing destinations directly. Plain-HTTP requests are
 # not proxied and always dial the destination directly. Only http:// proxy

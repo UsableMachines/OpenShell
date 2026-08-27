@@ -347,6 +347,66 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// `http://host:port` corporate forward proxy. The network supervisor
+    /// chains policy-approved egress through it with HTTP CONNECT instead of
+    /// dialing destinations directly.
+    ///
+    /// The chain applies *after* policy evaluation, DNS resolution, and
+    /// SSRF/`allowed_ips` validation, so only the final TCP dial changes.
+    /// Only `http://` proxy URLs in explicit `http://host:port` form (scheme
+    /// and port required) are supported. This is an operator-owned egress
+    /// boundary delivered on the supervisor's command line, so sandbox and
+    /// template environment cannot override it, and the conventional
+    /// `HTTPS_PROXY` variables are not consulted.
+    ///
+    /// Mirrors the Podman driver's `https_proxy` setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL (e.g.
+    /// `*.svc.cluster.local,10.0.0.0/8`). Destinations matching an entry are
+    /// dialed directly instead of through the corporate proxy. Entries take
+    /// an optional `:port` qualifier that limits them to that destination
+    /// port, and IP/CIDR entries also match hostnames through their
+    /// validated DNS resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+    /// Name of an existing Kubernetes `Secret` in the sandbox namespace
+    /// holding the corporate proxy credential as `user:pass` under the
+    /// `upstream-proxy` key.
+    ///
+    /// This is the Kubernetes counterpart of the Podman driver's
+    /// `proxy_auth_file`. The two differ deliberately: Podman reads the
+    /// credential on the gateway host and re-delivers it as a container
+    /// secret, whereas on Kubernetes kubelet projects the `Secret` into the
+    /// pod directly, so the gateway never handles the credential bytes.
+    /// Either way the credential reaches the supervisor as a file mount and
+    /// never appears on argv, in the environment, or in pod metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_secret_name: Option<String>,
+    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
+    ///
+    /// `Proxy-Authorization: Basic` is base64, not encryption, and the
+    /// connection to an `http://` corporate proxy is plain TCP, so anyone on
+    /// the network path between the sandbox pod and the proxy can recover the
+    /// credential. Setting `proxy_auth_secret_name` therefore requires
+    /// `proxy_auth_allow_insecure = true`; without it the configuration is
+    /// rejected at startup. Set it only when the path to the proxy is a
+    /// trusted network segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_allow_insecure: Option<bool>,
+    /// Send the destination *hostname* in CONNECT requests to the corporate
+    /// proxy instead of a validated IP.
+    ///
+    /// By default the supervisor CONNECTs to an address that already passed
+    /// SSRF and `allowed_ips` validation, so the proxy performs no DNS
+    /// resolution and the tunnel stays bound to the validated answer. Set
+    /// this to `true` only when the proxy's ACLs filter on hostnames and
+    /// reject IP CONNECT targets: the proxy then resolves the name itself, so
+    /// a name that resolves differently at the proxy (split-horizon DNS,
+    /// rebinding) can reach destinations the sandbox policy never approved,
+    /// and the proxy's own ACLs become the effective egress control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_connect_by_hostname: Option<bool>,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -402,6 +462,11 @@ impl Default for KubernetesComputeConfig {
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_secret_name: None,
+            proxy_auth_allow_insecure: None,
+            proxy_connect_by_hostname: None,
         }
     }
 }
@@ -436,6 +501,89 @@ impl KubernetesComputeConfig {
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
         self.sidecar.validate_proxy_uid()
+    }
+
+    /// Validate optional corporate upstream-proxy configuration.
+    ///
+    /// Shares validation semantics with the in-pod supervisor through
+    /// [`openshell_core::driver_utils::parse_upstream_proxy_url`], so a value
+    /// accepted here can never be rejected by the supervisor at sandbox
+    /// startup (or vice versa). The supervisor only supports `http://`
+    /// forward proxies, so other schemes are rejected at config time instead
+    /// of failing inside every sandbox. Credentials must be supplied through
+    /// `proxy_auth_secret_name`; an inline `user:pass@` in the URL is
+    /// rejected because it would otherwise be stored in `gateway.toml` and
+    /// exposed in pod specs.
+    pub fn validate_proxy_config(&self) -> Result<(), String> {
+        use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+        if let Some(url) = &self.https_proxy {
+            parse_upstream_proxy_url(url).map_err(|err| match err {
+                UpstreamProxyUrlError::Empty => {
+                    "https_proxy must not be empty when set".to_string()
+                }
+                UpstreamProxyUrlError::InlineCredentials => {
+                    "https_proxy must not embed credentials in the URL; supply them via \
+                     proxy_auth_secret_name so they are not stored in config or pod specs"
+                        .to_string()
+                }
+                err => format!("https_proxy {err}"),
+            })?;
+        }
+
+        // The supervisor treats a present-but-empty driver-supplied argument
+        // as a fatal misconfiguration, so never accept (and later pass) one.
+        if let Some(list) = self.no_proxy.as_deref() {
+            if list.trim().is_empty() {
+                return Err("no_proxy must not be empty when set; omit it instead".to_string());
+            }
+            // A bypass list only makes sense relative to a proxy boundary. An
+            // operator who set one believed proxying was in effect, so
+            // accepting it while all egress dials directly would hide a
+            // fail-open state.
+            if self.https_proxy.is_none() {
+                return Err("no_proxy is set but no https_proxy is configured".to_string());
+            }
+        }
+
+        if let Some(name) = self.proxy_auth_secret_name.as_deref() {
+            if name.trim().is_empty() {
+                return Err("proxy_auth_secret_name must not be empty when set".to_string());
+            }
+            if self.https_proxy.is_none() {
+                return Err(
+                    "proxy_auth_secret_name is set but no https_proxy is configured".to_string(),
+                );
+            }
+            // Basic auth over the plain-TCP proxy connection is readable by
+            // anyone on the network path; sending it requires an explicit
+            // operator acknowledgement rather than being an implicit side
+            // effect of configuring credentials.
+            if self.proxy_auth_allow_insecure != Some(true) {
+                return Err(
+                    "proxy_auth_secret_name sends the credential as cleartext Basic auth over \
+                     the plain-TCP connection to the http:// proxy; set \
+                     proxy_auth_allow_insecure = true to accept that exposure, or remove \
+                     proxy_auth_secret_name"
+                        .to_string(),
+                );
+            }
+        } else if self.proxy_auth_allow_insecure.is_some() {
+            // The acknowledgement without credentials means the operator
+            // believed a credential secret was configured; surface the
+            // mismatch.
+            return Err(
+                "proxy_auth_allow_insecure is set but no proxy_auth_secret_name is configured"
+                    .to_string(),
+            );
+        }
+
+        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            );
+        }
+
+        Ok(())
     }
 
     /// Resolve the sandbox UID/GID pair.
@@ -1020,5 +1168,159 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.provisioning_mode, ProvisioningMode::Claim);
+    }
+
+    fn proxy_cfg(url: Option<&str>) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            https_proxy: url.map(str::to_owned),
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_an_unconfigured_boundary() {
+        KubernetesComputeConfig::default()
+            .validate_proxy_config()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_a_plain_http_proxy() {
+        proxy_cfg(Some("http://proxy.corp.example:8080"))
+            .validate_proxy_config()
+            .unwrap();
+    }
+
+    /// The supervisor only chains through `http://` forward proxies, so
+    /// rejecting other schemes here turns a per-sandbox startup failure into
+    /// a gateway startup failure the operator sees immediately.
+    #[test]
+    fn validate_proxy_config_rejects_unsupported_schemes() {
+        for url in [
+            "https://proxy.corp.example:8443",
+            "socks5://proxy.corp.example:1080",
+        ] {
+            assert!(
+                proxy_cfg(Some(url)).validate_proxy_config().is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_inline_credentials() {
+        let err = proxy_cfg(Some("http://user:pass@proxy.corp.example:8080"))
+            .validate_proxy_config()
+            .unwrap_err();
+        assert!(err.contains("proxy_auth_secret_name"), "{err}");
+    }
+
+    /// Each auxiliary setting implies the operator believed a proxy boundary
+    /// was in effect. Accepting one while all egress dials directly would
+    /// hide a fail-open state.
+    #[test]
+    fn validate_proxy_config_rejects_auxiliary_settings_without_a_proxy() {
+        let cases: Vec<(&str, KubernetesComputeConfig)> = vec![
+            (
+                "no_proxy",
+                KubernetesComputeConfig {
+                    no_proxy: Some("10.0.0.0/8".to_string()),
+                    ..KubernetesComputeConfig::default()
+                },
+            ),
+            (
+                "proxy_auth_secret_name",
+                KubernetesComputeConfig {
+                    proxy_auth_secret_name: Some("proxy-auth".to_string()),
+                    proxy_auth_allow_insecure: Some(true),
+                    ..KubernetesComputeConfig::default()
+                },
+            ),
+            (
+                "proxy_connect_by_hostname",
+                KubernetesComputeConfig {
+                    proxy_connect_by_hostname: Some(true),
+                    ..KubernetesComputeConfig::default()
+                },
+            ),
+        ];
+        for (field, cfg) in cases {
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(err.contains(field), "{field}: {err}");
+            assert!(err.contains("https_proxy"), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_empty_present_values() {
+        let mut cfg = proxy_cfg(Some("http://proxy.corp.example:8080"));
+        cfg.no_proxy = Some("   ".to_string());
+        assert!(cfg.validate_proxy_config().is_err());
+
+        let mut cfg = proxy_cfg(Some("http://proxy.corp.example:8080"));
+        cfg.proxy_auth_secret_name = Some("  ".to_string());
+        cfg.proxy_auth_allow_insecure = Some(true);
+        assert!(cfg.validate_proxy_config().is_err());
+
+        assert!(proxy_cfg(Some("")).validate_proxy_config().is_err());
+    }
+
+    /// Basic auth over the plain-TCP proxy hop is recoverable by anyone on the
+    /// path, so sending it requires an explicit acknowledgement rather than
+    /// being an implicit side effect of configuring credentials.
+    #[test]
+    fn validate_proxy_config_requires_the_cleartext_acknowledgement() {
+        let mut cfg = proxy_cfg(Some("http://proxy.corp.example:8080"));
+        cfg.proxy_auth_secret_name = Some("proxy-auth".to_string());
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
+
+        cfg.proxy_auth_allow_insecure = Some(false);
+        assert!(cfg.validate_proxy_config().is_err());
+
+        cfg.proxy_auth_allow_insecure = Some(true);
+        cfg.validate_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_the_acknowledgement_without_credentials() {
+        let mut cfg = proxy_cfg(Some("http://proxy.corp.example:8080"));
+        cfg.proxy_auth_allow_insecure = Some(true);
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_secret_name"), "{err}");
+    }
+
+    #[test]
+    fn serde_defaults_leave_the_upstream_proxy_unconfigured() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.https_proxy, None);
+        assert_eq!(cfg.no_proxy, None);
+        assert_eq!(cfg.proxy_auth_secret_name, None);
+        assert_eq!(cfg.proxy_auth_allow_insecure, None);
+        assert_eq!(cfg.proxy_connect_by_hostname, None);
+    }
+
+    #[test]
+    fn serde_reads_the_upstream_proxy_table() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
+            "https_proxy": "http://proxy.corp.example:8080",
+            "no_proxy": "*.svc.cluster.local",
+            "proxy_auth_secret_name": "openshell-upstream-proxy-auth",
+            "proxy_auth_allow_insecure": true,
+            "proxy_connect_by_hostname": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.https_proxy.as_deref(),
+            Some("http://proxy.corp.example:8080")
+        );
+        assert_eq!(cfg.no_proxy.as_deref(), Some("*.svc.cluster.local"));
+        assert_eq!(
+            cfg.proxy_auth_secret_name.as_deref(),
+            Some("openshell-upstream-proxy-auth")
+        );
+        assert_eq!(cfg.proxy_auth_allow_insecure, Some(true));
+        assert_eq!(cfg.proxy_connect_by_hostname, Some(true));
+        cfg.validate_proxy_config().unwrap();
     }
 }

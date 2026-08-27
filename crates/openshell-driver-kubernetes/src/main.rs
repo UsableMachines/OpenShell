@@ -145,6 +145,37 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_K8S_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
+
+    /// Corporate forward proxy URL for the network supervisor's upstream
+    /// dials, in explicit `http://host:port` form (scheme and port
+    /// required). Credentials must not be embedded in the URL; use
+    /// `--sandbox-proxy-auth-secret-name` instead.
+    #[arg(long, env = "OPENSHELL_SANDBOX_HTTPS_PROXY")]
+    sandbox_https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL.
+    #[arg(long, env = "OPENSHELL_SANDBOX_NO_PROXY")]
+    sandbox_no_proxy: Option<String>,
+
+    /// Name of an existing `Secret` in the sandbox namespace holding the
+    /// corporate proxy credential as `user:pass` under the `upstream-proxy`
+    /// key. Projected into the pod by kubelet, so the gateway never handles
+    /// the credential bytes and it never appears in pod specs.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_SECRET_NAME")]
+    sandbox_proxy_auth_secret_name: Option<String>,
+
+    /// Explicit acknowledgement (`true`) that the proxy credential is sent
+    /// as cleartext Basic auth over the plain-TCP connection to the http://
+    /// proxy. Required when `--sandbox-proxy-auth-secret-name` is set.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE")]
+    sandbox_proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send the destination hostname in CONNECT requests to the corporate
+    /// proxy instead of a validated IP. Only for proxies whose ACLs filter
+    /// on hostnames: the proxy then resolves the name itself, so sandbox
+    /// SSRF/`allowed_ips` validation no longer binds the connection.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
+    sandbox_proxy_connect_by_hostname: Option<bool>,
 }
 
 #[tokio::main]
@@ -196,6 +227,11 @@ async fn main() -> Result<()> {
             .unwrap_or_default(),
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        https_proxy: args.sandbox_https_proxy,
+        no_proxy: args.sandbox_no_proxy,
+        proxy_auth_secret_name: args.sandbox_proxy_auth_secret_name,
+        proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+        proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
     })
     .await
     .into_diagnostic()?;

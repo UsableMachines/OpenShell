@@ -483,3 +483,91 @@ tests:
       - matchRegex:
           path: spec.template.spec.volumes[1].name
           pattern: '^sandbox-jwt$'
+
+  - it: omits every upstream-proxy key when no proxy URL is configured
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'https_proxy'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_connect_by_hostname'
+
+  - it: renders the upstream proxy URL alone when only the URL is set
+    set:
+      server.upstreamProxy.url: "http://proxy.corp.example:8080"
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'https_proxy\s*=\s*"http://proxy\.corp\.example:8080"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'no_proxy'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_connect_by_hostname'
+
+  - it: renders every upstream-proxy setting when all are configured
+    set:
+      server.upstreamProxy.url: "http://proxy.corp.example:8080"
+      server.upstreamProxy.noProxy: "*.svc.cluster.local,10.0.0.0/8"
+      server.upstreamProxy.authSecretName: "openshell-upstream-proxy-auth"
+      server.upstreamProxy.authAllowInsecure: true
+      server.upstreamProxy.connectByHostname: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'no_proxy\s*=\s*"\*\.svc\.cluster\.local,10\.0\.0\.0/8"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name\s*=\s*"openshell-upstream-proxy-auth"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_allow_insecure\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_connect_by_hostname\s*=\s*true'
+
+  # The credential itself lives in an operator-managed Secret that kubelet
+  # projects into the pod. It must never reach gateway.toml.
+  - it: never renders a proxy credential into the gateway config
+    set:
+      server.upstreamProxy.url: "http://proxy.corp.example:8080"
+      server.upstreamProxy.authSecretName: "openshell-upstream-proxy-auth"
+      server.upstreamProxy.authAllowInsecure: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_file'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '@proxy\.corp\.example'
+
+  # The gateway rejects auxiliary settings without a URL. Failing in the
+  # chart turns a crash-looping gateway into a failed `helm upgrade`.
+  - it: fails rendering when auxiliary proxy settings have no proxy URL
+    set:
+      server.upstreamProxy.noProxy: "10.0.0.0/8"
+    template: templates/gateway-config.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, and connectByHostname require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'
+
+  - it: fails rendering when only a credential secret is configured
+    set:
+      server.upstreamProxy.authSecretName: "openshell-upstream-proxy-auth"
+      server.upstreamProxy.authAllowInsecure: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, and connectByHostname require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'

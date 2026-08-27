@@ -465,6 +465,9 @@ impl KubernetesComputeDriver {
         config
             .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_proxy_config()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -1113,6 +1116,13 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy: self.config.https_proxy.as_deref(),
+                no_proxy: self.config.no_proxy.as_deref(),
+                auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
+                auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
+                connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+            },
         };
         validate_sidecar_proxy_identity(&params)?;
 
@@ -1947,6 +1957,18 @@ const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
 /// Shared volume used by the network sidecar and process-only supervisor for
 /// local coordination in sidecar topology.
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
+
+/// Pod volume projecting the corporate upstream-proxy credential `Secret`.
+const UPSTREAM_PROXY_AUTH_VOLUME_NAME: &str = "openshell-upstream-proxy-auth";
+
+/// Directory the credential volume is mounted at. Together with
+/// `UPSTREAM_PROXY_AUTH_SECRET_KEY` this must reconstruct
+/// `openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH`, the path
+/// the supervisor reads the credential from; a unit test asserts it does.
+const UPSTREAM_PROXY_AUTH_MOUNT_DIR: &str = "/etc/openshell/auth";
+
+/// Key within the credential `Secret`, also the filename it is projected to.
+const UPSTREAM_PROXY_AUTH_SECRET_KEY: &str = "upstream-proxy";
 const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
 const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
 // Linux abstract socket names are scoped to the pod's shared network namespace.
@@ -2159,6 +2181,131 @@ fn apply_supervisor_sideload(
     }
 }
 
+/// Build the corporate upstream-proxy arguments passed to the network
+/// supervisor.
+///
+/// This operator-owned egress boundary travels on argv, which sandbox spec,
+/// template environment, and image `ENV` cannot influence. Credentials are
+/// never on argv — only the mount path is passed; the supervisor reads the
+/// secret from the projected `Secret` volume.
+fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    let Some(url) = params.upstream_proxy.https_proxy else {
+        // Config validation rejects auxiliary settings without a proxy URL,
+        // and the supervisor independently refuses them, so emitting nothing
+        // here is the only correct behavior for an unconfigured boundary.
+        return args;
+    };
+    args.push("--upstream-proxy".to_string());
+    args.push(url.to_string());
+    if let Some(list) = params.upstream_proxy.no_proxy {
+        args.push("--upstream-no-proxy".to_string());
+        args.push(list.to_string());
+    }
+    if params.upstream_proxy.auth_secret_name.is_some() {
+        args.push("--upstream-proxy-auth-file".to_string());
+        args.push(openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH.to_string());
+    }
+    // Config validation guarantees the acknowledgement is `true` whenever a
+    // credential secret is configured; the supervisor independently refuses
+    // credentials without it.
+    if params.upstream_proxy.auth_allow_insecure {
+        args.push("--upstream-proxy-auth-allow-insecure".to_string());
+    }
+    // Absent means the default validated-IP CONNECT binding; only the
+    // explicit hostname opt-in is passed through.
+    if params.upstream_proxy.connect_by_hostname {
+        args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    args
+}
+
+fn upstream_proxy_auth_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+        "mountPath": UPSTREAM_PROXY_AUTH_MOUNT_DIR,
+        "readOnly": true
+    })
+}
+
+/// Pod volume projecting the credential `Secret`, or `None` when no
+/// credential is configured.
+///
+/// `Combined` topology starts the supervisor as root, so the credential is
+/// owner-read-only. `Sidecar` topology runs the network supervisor as the
+/// non-root proxy UID with the sandbox GID, so it relies on pod `fsGroup`
+/// plus group-read — the same pairing the client TLS and projected token
+/// volumes use.
+fn upstream_proxy_auth_volume(params: &SandboxPodParams<'_>) -> Option<serde_json::Value> {
+    let secret_name = params.upstream_proxy.auth_secret_name?;
+    let default_mode = match params.topology {
+        SupervisorTopology::Combined => 0o400,
+        SupervisorTopology::Sidecar => 0o440,
+    };
+    Some(serde_json::json!({
+        "name": UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+        "secret": {
+            "secretName": secret_name,
+            "defaultMode": default_mode,
+            "items": [{
+                "key": UPSTREAM_PROXY_AUTH_SECRET_KEY,
+                "path": UPSTREAM_PROXY_AUTH_SECRET_KEY
+            }]
+        }
+    }))
+}
+
+/// Append the corporate upstream-proxy arguments to a container's command and
+/// mount the credential it reads.
+///
+/// Applied only to the container running *network* supervision: the agent
+/// container in `combined` topology, the network sidecar in `sidecar`
+/// topology. The process-only supervisor in sidecar topology never dials
+/// upstream destinations, so it is deliberately left without the flags or the
+/// credential mount.
+fn apply_upstream_proxy_to_container(
+    container: &mut serde_json::Map<String, serde_json::Value>,
+    params: &SandboxPodParams<'_>,
+) {
+    let args = upstream_proxy_cli_args(params);
+    if args.is_empty() {
+        return;
+    }
+    // The caller always sets an explicit command for the supervisor; without
+    // one there is no argv to extend and appending would be meaningless.
+    let Some(command) = container.get_mut("command").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    command.extend(args.into_iter().map(serde_json::Value::String));
+
+    if params.upstream_proxy.auth_secret_name.is_some() {
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(volume_mounts) = volume_mounts.as_array_mut() {
+            volume_mounts.push(upstream_proxy_auth_volume_mount());
+        }
+    }
+}
+
+/// Apply the upstream-proxy argv and credential mount to the agent container,
+/// which runs network supervision in `combined` topology.
+fn apply_upstream_proxy_to_agent_container(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    params: &SandboxPodParams<'_>,
+) {
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let index = containers
+        .iter()
+        .position(|c| c.get("name").and_then(|v| v.as_str()) == Some("agent"))
+        .unwrap_or(0);
+    if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+        apply_upstream_proxy_to_container(container, params);
+    }
+}
+
 fn sidecar_state_volume_mount() -> serde_json::Value {
     serde_json::json!({
         "name": SIDECAR_STATE_VOLUME_NAME,
@@ -2320,6 +2467,9 @@ fn supervisor_sidecar_container(
     }
     if let Some(profile) = params.app_armor_profile {
         container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    if let Some(container) = container.as_object_mut() {
+        apply_upstream_proxy_to_container(container, params);
     }
     container
 }
@@ -2723,6 +2873,27 @@ struct SandboxPodParams<'a> {
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
     sandbox_gid: u32,
+    /// Corporate upstream-proxy settings for the network supervisor.
+    upstream_proxy: UpstreamProxyPodParams<'a>,
+}
+
+/// Corporate upstream-proxy settings rendered onto the network supervisor's
+/// command line. Grouped so the egress boundary travels as one value rather
+/// than five loose fields threaded through pod rendering.
+#[derive(Debug, Clone, Copy, Default)]
+struct UpstreamProxyPodParams<'a> {
+    /// `http://host:port` corporate forward proxy, or `None` for direct
+    /// egress. Every other field here is meaningless without it.
+    https_proxy: Option<&'a str>,
+    /// Comma-separated `NO_PROXY` list applied to the corporate proxy.
+    no_proxy: Option<&'a str>,
+    /// Name of the `Secret` holding the corporate proxy credential.
+    auth_secret_name: Option<&'a str>,
+    /// Operator acknowledgement that the credential travels as cleartext
+    /// Basic auth over the plain-TCP connection to the proxy.
+    auth_allow_insecure: bool,
+    /// Send the destination hostname in CONNECT instead of a validated IP.
+    connect_by_hostname: bool,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -2753,6 +2924,7 @@ impl Default for SandboxPodParams<'_> {
             provider_spiffe_workload_api_socket_path: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
+            upstream_proxy: UpstreamProxyPodParams::default(),
         }
     }
 }
@@ -3213,6 +3385,11 @@ fn sandbox_template_to_k8s_with_validated_config(
             }
         }));
     }
+    // Topology-agnostic: whichever container runs network supervision mounts
+    // this volume, so the pod carries it in both arrangements.
+    if let Some(volume) = upstream_proxy_auth_volume(params) {
+        volumes.push(volume);
+    }
     // Projected ServiceAccountToken volume — kubelet writes a short-lived
     // audience-bound JWT into /var/run/secrets/openshell/token and rotates
     // it automatically. The supervisor exchanges this for a gateway-minted
@@ -3291,6 +3468,11 @@ fn sandbox_template_to_k8s_with_validated_config(
                 params.sandbox_uid,
                 params.sandbox_gid,
             );
+            // Runs after the sideload, which is what installs the explicit
+            // supervisor command this appends to.
+            if let Some(spec) = result.get_mut("spec").and_then(|v| v.as_object_mut()) {
+                apply_upstream_proxy_to_agent_container(spec, params);
+            }
         }
         SupervisorTopology::Sidecar => {
             apply_supervisor_sidecar_topology(
@@ -6699,5 +6881,291 @@ mod tests {
         let ready = &status.conditions[0];
         assert_eq!(ready.reason, "ImagePullBackOff");
         assert_eq!(ready.message, "Failed to pull image");
+    }
+
+    /// The supervisor reads the credential from a fixed absolute path shared
+    /// with the Podman driver. The Kubernetes driver reaches that path by
+    /// mounting a directory and projecting the `Secret` key as a filename, so
+    /// the two constants must reconstruct it exactly or the supervisor fails
+    /// closed at startup on an unreadable auth file.
+    #[test]
+    fn upstream_proxy_auth_mount_dir_and_key_reconstruct_the_supervisor_path() {
+        assert_eq!(
+            format!("{UPSTREAM_PROXY_AUTH_MOUNT_DIR}/{UPSTREAM_PROXY_AUTH_SECRET_KEY}"),
+            openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH
+        );
+    }
+
+    fn upstream_proxy_params<'a>(
+        topology: SupervisorTopology,
+        https_proxy: Option<&'a str>,
+        auth_secret: Option<&'a str>,
+    ) -> SandboxPodParams<'a> {
+        SandboxPodParams {
+            topology,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy,
+                auth_secret_name: auth_secret,
+                auth_allow_insecure: auth_secret.is_some(),
+                ..UpstreamProxyPodParams::default()
+            },
+            ..SandboxPodParams::default()
+        }
+    }
+
+    fn upstream_proxy_pod_template(params: &SandboxPodParams<'_>) -> serde_json::Value {
+        sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            params,
+        )
+    }
+
+    fn container_named<'a>(
+        pod_template: &'a serde_json::Value,
+        name: &str,
+    ) -> &'a serde_json::Value {
+        pod_template["spec"]["containers"]
+            .as_array()
+            .expect("containers is an array")
+            .iter()
+            .find(|container| container["name"] == name)
+            .expect("container should be rendered")
+    }
+
+    fn volume_names(pod_template: &serde_json::Value) -> Vec<String> {
+        pod_template["spec"]["volumes"]
+            .as_array()
+            .map(|volumes| {
+                volumes
+                    .iter()
+                    .filter_map(|volume| volume["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn mount_paths(container: &serde_json::Value) -> Vec<String> {
+        container["volumeMounts"]
+            .as_array()
+            .map(|mounts| {
+                mounts
+                    .iter()
+                    .filter_map(|mount| mount["mountPath"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn upstream_proxy_cli_args_are_empty_without_a_proxy_url() {
+        // Auxiliary settings without a URL are a configuration error caught at
+        // startup; if one ever reaches here it must not become a half-formed
+        // boundary on argv.
+        let params = SandboxPodParams {
+            upstream_proxy: UpstreamProxyPodParams {
+                no_proxy: Some("10.0.0.0/8"),
+                auth_secret_name: Some("proxy-auth"),
+                auth_allow_insecure: true,
+                connect_by_hostname: true,
+                ..UpstreamProxyPodParams::default()
+            },
+            ..SandboxPodParams::default()
+        };
+        assert!(upstream_proxy_cli_args(&params).is_empty());
+    }
+
+    #[test]
+    fn upstream_proxy_cli_args_render_every_configured_setting() {
+        let params = SandboxPodParams {
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy: Some("http://proxy.corp.example:8080"),
+                no_proxy: Some("*.svc.cluster.local,10.0.0.0/8"),
+                auth_secret_name: Some("proxy-auth"),
+                auth_allow_insecure: true,
+                connect_by_hostname: true,
+            },
+            ..SandboxPodParams::default()
+        };
+        assert_eq!(
+            upstream_proxy_cli_args(&params),
+            vec![
+                "--upstream-proxy",
+                "http://proxy.corp.example:8080",
+                "--upstream-no-proxy",
+                "*.svc.cluster.local,10.0.0.0/8",
+                "--upstream-proxy-auth-file",
+                openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH,
+                "--upstream-proxy-auth-allow-insecure",
+                "--upstream-proxy-connect-by-hostname",
+            ]
+        );
+    }
+
+    /// The credential path is the only credential-derived value on argv; the
+    /// secret name and its contents must never appear there.
+    #[test]
+    fn upstream_proxy_cli_args_never_carry_the_credential_or_secret_name() {
+        let params = SandboxPodParams {
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy: Some("http://proxy.corp.example:8080"),
+                auth_secret_name: Some("proxy-auth"),
+                auth_allow_insecure: true,
+                ..UpstreamProxyPodParams::default()
+            },
+            ..SandboxPodParams::default()
+        };
+        let args = upstream_proxy_cli_args(&params).join(" ");
+        assert!(!args.contains("proxy-auth "), "{args}");
+        assert!(!args.ends_with("proxy-auth"), "{args}");
+    }
+
+    #[test]
+    fn sidecar_network_supervisor_receives_upstream_proxy_flags() {
+        let params = upstream_proxy_params(
+            SupervisorTopology::Sidecar,
+            Some("http://proxy.corp.example:8080"),
+            None,
+        );
+        let pod_template = upstream_proxy_pod_template(&params);
+
+        let sidecar = container_named(&pod_template, SUPERVISOR_NETWORK_SIDECAR_NAME);
+        assert_eq!(
+            sidecar["command"],
+            serde_json::json!([
+                SUPERVISOR_IMAGE_BINARY_PATH,
+                "--mode=network",
+                "--upstream-proxy",
+                "http://proxy.corp.example:8080"
+            ])
+        );
+
+        // The process-only supervisor never dials upstream destinations, so it
+        // must not be handed the egress boundary.
+        let agent = container_named(&pod_template, "agent");
+        assert_eq!(
+            agent["command"],
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--mode=process"
+            ])
+        );
+    }
+
+    #[test]
+    fn combined_topology_appends_upstream_proxy_flags_to_the_agent_supervisor() {
+        let params = upstream_proxy_params(
+            SupervisorTopology::Combined,
+            Some("http://proxy.corp.example:8080"),
+            None,
+        );
+        let pod_template = upstream_proxy_pod_template(&params);
+
+        let agent = container_named(&pod_template, "agent");
+        assert_eq!(
+            agent["command"],
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--upstream-proxy",
+                "http://proxy.corp.example:8080"
+            ])
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_credential_is_projected_and_mounted_for_the_network_supervisor() {
+        let params = upstream_proxy_params(
+            SupervisorTopology::Sidecar,
+            Some("http://proxy.corp.example:8080"),
+            Some("openshell-upstream-proxy-auth"),
+        );
+        let pod_template = upstream_proxy_pod_template(&params);
+
+        let volume = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes is an array")
+            .iter()
+            .find(|volume| volume["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+            .expect("credential volume should be projected");
+        assert_eq!(
+            volume["secret"]["secretName"],
+            "openshell-upstream-proxy-auth"
+        );
+        // Sidecar runs the network supervisor as the non-root proxy UID with
+        // the sandbox GID, so it needs group-read plus pod fsGroup.
+        assert_eq!(volume["secret"]["defaultMode"], 0o440);
+        assert_eq!(
+            volume["secret"]["items"],
+            serde_json::json!([{
+                "key": UPSTREAM_PROXY_AUTH_SECRET_KEY,
+                "path": UPSTREAM_PROXY_AUTH_SECRET_KEY
+            }])
+        );
+
+        let sidecar = container_named(&pod_template, SUPERVISOR_NETWORK_SIDECAR_NAME);
+        assert!(
+            mount_paths(sidecar).contains(&UPSTREAM_PROXY_AUTH_MOUNT_DIR.to_string()),
+            "network supervisor must mount the credential: {:?}",
+            mount_paths(sidecar)
+        );
+
+        let agent = container_named(&pod_template, "agent");
+        assert!(
+            !mount_paths(agent).contains(&UPSTREAM_PROXY_AUTH_MOUNT_DIR.to_string()),
+            "the process supervisor must not see the credential: {:?}",
+            mount_paths(agent)
+        );
+    }
+
+    #[test]
+    fn combined_topology_credential_is_owner_read_only_and_mounted_on_the_agent() {
+        let params = upstream_proxy_params(
+            SupervisorTopology::Combined,
+            Some("http://proxy.corp.example:8080"),
+            Some("openshell-upstream-proxy-auth"),
+        );
+        let pod_template = upstream_proxy_pod_template(&params);
+
+        let volume = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes is an array")
+            .iter()
+            .find(|volume| volume["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+            .expect("credential volume should be projected");
+        // Combined starts the supervisor as root before dropping privileges.
+        assert_eq!(volume["secret"]["defaultMode"], 0o400);
+
+        let agent = container_named(&pod_template, "agent");
+        assert!(
+            mount_paths(agent).contains(&UPSTREAM_PROXY_AUTH_MOUNT_DIR.to_string()),
+            "{:?}",
+            mount_paths(agent)
+        );
+    }
+
+    /// An unconfigured boundary must leave the pod spec byte-identical, so
+    /// warm-pool fingerprints and existing deployments are unaffected.
+    #[test]
+    fn no_upstream_proxy_leaves_the_pod_spec_untouched() {
+        for topology in [SupervisorTopology::Combined, SupervisorTopology::Sidecar] {
+            let params = upstream_proxy_params(topology, None, None);
+            let pod_template = upstream_proxy_pod_template(&params);
+            assert!(
+                !volume_names(&pod_template).contains(&UPSTREAM_PROXY_AUTH_VOLUME_NAME.to_string()),
+                "{topology}"
+            );
+            let rendered = serde_json::to_string(&pod_template).expect("pod template serializes");
+            assert!(!rendered.contains("--upstream-proxy"), "{topology}");
+        }
     }
 }

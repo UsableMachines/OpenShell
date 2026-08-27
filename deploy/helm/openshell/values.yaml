@@ -298,6 +298,32 @@ server:
     # -- Lifecycle shutdown policy written into `SandboxClaim.spec.lifecycle`
     # when provisioningMode="claim".
     claimShutdownPolicy: "DeleteForeground"
+  # Corporate forward proxy for sandbox egress. When url is set, the sandbox
+  # network supervisor chains policy-approved TLS tunnels through the proxy
+  # with HTTP CONNECT instead of dialing destinations directly. Policy
+  # evaluation, DNS resolution, and SSRF validation are unchanged; only the
+  # final TCP dial moves. Plain-HTTP requests are not proxied.
+  upstreamProxy:
+    # -- Proxy URL in explicit `http://host:port` form (scheme and port both
+    # required). Credentials must not be embedded; use authSecretName.
+    # Empty disables upstream proxying entirely.
+    url: ""
+    # -- Comma-separated NO_PROXY list of destinations dialed directly
+    # (hostnames, domain suffixes, IPs, CIDRs, each with an optional :port).
+    noProxy: ""
+    # -- Name of an existing Secret in the sandbox namespace holding the proxy
+    # credential as `user:pass` under the `upstream-proxy` key. Kubelet
+    # projects it into the pod, so the gateway never reads the credential.
+    authSecretName: ""
+    # -- Explicit acknowledgement that the credential is sent as cleartext
+    # Basic auth over the plain-TCP connection to the http:// proxy. Required
+    # whenever authSecretName is set; the gateway refuses to start otherwise.
+    authAllowInsecure: false
+    # -- Send the destination hostname in CONNECT instead of a validated IP.
+    # Last resort for proxies whose ACLs filter on hostnames: the proxy then
+    # resolves the name itself, so sandbox SSRF/allowed_ips validation no
+    # longer binds the connection.
+    connectByHostname: false
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
