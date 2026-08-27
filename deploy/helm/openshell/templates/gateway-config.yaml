@@ -167,8 +167,11 @@ data:
     {{- if .connectByHostname }}
     proxy_connect_by_hostname    = true
     {{- end }}
-    {{- else if or .noProxy .authSecretName .connectByHostname }}
-    {{- fail "server.upstreamProxy: noProxy, authSecretName, and connectByHostname require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly" }}
+    {{- if .authSandboxIdentity }}
+    proxy_auth_sandbox_identity  = true
+    {{- end }}
+    {{- else if or .noProxy .authSecretName .connectByHostname .authSandboxIdentity }}
+    {{- fail "server.upstreamProxy: noProxy, authSecretName, connectByHostname, and authSandboxIdentity require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly" }}
     {{- end }}
     {{- end }}
 

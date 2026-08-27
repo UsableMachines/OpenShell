@@ -327,6 +327,16 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the warning above.
 # proxy_connect_by_hostname = true
+# Identify each sandbox to the proxy by sending its sandbox id as the
+# Proxy-Authorization Basic username with an empty password, so the proxy can
+# attribute and ACL egress per sandbox. The username is an identifier, not a
+# secret: the supervisor builds the header on the upstream hop, so a workload
+# cannot forge or alter it, but anything with direct network access to the
+# proxy can — the proxy must not treat the value as authorization on its own.
+# Mutually exclusive with proxy_auth_secret_name, and it needs no cleartext
+# acknowledgement because no credential is sent. Fail-closed: a sandbox whose
+# identity is unresolved refuses to start rather than egressing unattributed.
+# proxy_auth_sandbox_identity = true
 
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
@@ -485,6 +495,17 @@ health_check_interval_secs = 10
 # proxy_auth_allow_insecure = true
 # Last resort for hostname-filtering proxy ACLs; see the warning above.
 # proxy_connect_by_hostname = true
+# Identify each sandbox to the proxy by sending its sandbox id as the
+# Proxy-Authorization Basic username with an empty password, so the proxy can
+# attribute and ACL egress per sandbox. The username is an identifier, not a
+# secret: the supervisor builds the header on the upstream hop, so a workload
+# cannot forge or alter it, but anything with direct network access to the
+# proxy can — the proxy must not treat the value as authorization on its own.
+# Mutually exclusive with proxy_auth_file (a request carries one
+# Proxy-Authorization header), and it needs no cleartext acknowledgement
+# because no credential is sent. Fail-closed: a sandbox whose identity is
+# unresolved refuses to start rather than egressing unattributed.
+# proxy_auth_sandbox_identity = true
 ```
 
 ### MicroVM

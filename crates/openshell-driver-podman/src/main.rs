@@ -133,6 +133,13 @@ struct Args {
     /// SSRF/`allowed_ips` validation no longer binds the connection.
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
     sandbox_proxy_connect_by_hostname: Option<bool>,
+
+    /// Identify each sandbox to the corporate proxy by sending its sandbox id
+    /// as the Proxy-Authorization Basic username. Attribution only: the value
+    /// is an identifier, not a credential. Mutually exclusive with
+    /// `--sandbox-proxy-auth-file`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_SANDBOX_IDENTITY")]
+    sandbox_proxy_auth_sandbox_identity: Option<bool>,
 }
 
 #[tokio::main]
@@ -168,6 +175,7 @@ async fn main() -> Result<()> {
         proxy_auth_file: args.sandbox_proxy_auth_file,
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        proxy_auth_sandbox_identity: args.sandbox_proxy_auth_sandbox_identity,
         ..PodmanComputeConfig::default()
     })
     .await

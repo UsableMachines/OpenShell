@@ -1122,6 +1122,7 @@ impl KubernetesComputeDriver {
                 auth_secret_name: self.config.proxy_auth_secret_name.as_deref(),
                 auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
                 connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+                auth_sandbox_identity: self.config.proxy_auth_sandbox_identity == Some(true),
             },
         };
         validate_sidecar_proxy_identity(&params)?;
@@ -2217,6 +2218,11 @@ fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
     if params.upstream_proxy.connect_by_hostname {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
+    // Attribution rather than authentication: the supervisor resolves the id
+    // itself, so nothing sandbox-controlled reaches the header.
+    if params.upstream_proxy.auth_sandbox_identity {
+        args.push("--upstream-proxy-auth-sandbox-identity".to_string());
+    }
     args
 }
 
@@ -2894,6 +2900,9 @@ struct UpstreamProxyPodParams<'a> {
     auth_allow_insecure: bool,
     /// Send the destination hostname in CONNECT instead of a validated IP.
     connect_by_hostname: bool,
+    /// Send the sandbox id as the Basic-auth username so the proxy can
+    /// attribute and ACL egress per sandbox.
+    auth_sandbox_identity: bool,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -6994,6 +7003,7 @@ mod tests {
                 auth_secret_name: Some("proxy-auth"),
                 auth_allow_insecure: true,
                 connect_by_hostname: true,
+                auth_sandbox_identity: false,
             },
             ..SandboxPodParams::default()
         };
@@ -7167,5 +7177,96 @@ mod tests {
             let rendered = serde_json::to_string(&pod_template).expect("pod template serializes");
             assert!(!rendered.contains("--upstream-proxy"), "{topology}");
         }
+    }
+
+    #[test]
+    fn sandbox_identity_flag_is_rendered_for_the_network_supervisor_only() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy: Some("http://egress.openshell.svc:3128"),
+                auth_sandbox_identity: true,
+                ..UpstreamProxyPodParams::default()
+            },
+            ..SandboxPodParams::default()
+        };
+        let pod_template = upstream_proxy_pod_template(&params);
+
+        let sidecar = container_named(&pod_template, SUPERVISOR_NETWORK_SIDECAR_NAME);
+        assert_eq!(
+            sidecar["command"],
+            serde_json::json!([
+                SUPERVISOR_IMAGE_BINARY_PATH,
+                "--mode=network",
+                "--upstream-proxy",
+                "http://egress.openshell.svc:3128",
+                "--upstream-proxy-auth-sandbox-identity"
+            ])
+        );
+
+        let agent = container_named(&pod_template, "agent");
+        assert_eq!(
+            agent["command"],
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--mode=process"
+            ])
+        );
+    }
+
+    /// Identity mode carries no secret, so the pod must gain no credential
+    /// volume — nothing to mount and nothing to leak.
+    #[test]
+    fn sandbox_identity_needs_no_credential_volume() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy: Some("http://egress.openshell.svc:3128"),
+                auth_sandbox_identity: true,
+                ..UpstreamProxyPodParams::default()
+            },
+            ..SandboxPodParams::default()
+        };
+        let pod_template = upstream_proxy_pod_template(&params);
+        assert!(
+            !volume_names(&pod_template).contains(&UPSTREAM_PROXY_AUTH_VOLUME_NAME.to_string()),
+            "{:?}",
+            volume_names(&pod_template)
+        );
+        let sidecar = container_named(&pod_template, SUPERVISOR_NETWORK_SIDECAR_NAME);
+        assert!(
+            !mount_paths(sidecar).contains(&UPSTREAM_PROXY_AUTH_MOUNT_DIR.to_string()),
+            "{:?}",
+            mount_paths(sidecar)
+        );
+    }
+
+    /// The pod spec must never carry the sandbox id as a proxy credential;
+    /// the supervisor resolves it in-pod after activation.
+    #[test]
+    fn sandbox_identity_argv_is_a_bare_flag_with_no_value() {
+        let params = SandboxPodParams {
+            upstream_proxy: UpstreamProxyPodParams {
+                https_proxy: Some("http://egress.openshell.svc:3128"),
+                auth_sandbox_identity: true,
+                ..UpstreamProxyPodParams::default()
+            },
+            ..SandboxPodParams::default()
+        };
+        let args = upstream_proxy_cli_args(&params);
+        let flag_index = args
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-auth-sandbox-identity")
+            .expect("flag should be rendered");
+        assert_eq!(
+            flag_index,
+            args.len() - 1,
+            "the flag takes no value: {args:?}"
+        );
     }
 }

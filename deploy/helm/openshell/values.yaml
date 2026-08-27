@@ -324,6 +324,15 @@ server:
     # resolves the name itself, so sandbox SSRF/allowed_ips validation no
     # longer binds the connection.
     connectByHostname: false
+    # -- Identify each sandbox to the proxy by sending its sandbox id as the
+    # Proxy-Authorization Basic username, with an empty password, so the proxy
+    # can attribute and ACL egress per sandbox. The username is an identifier,
+    # not a secret: the supervisor builds the header on the upstream hop, so a
+    # workload cannot forge it, but anything with direct network access to the
+    # proxy can — the proxy must not treat it as authorization on its own.
+    # Mutually exclusive with authSecretName. A sandbox whose identity is
+    # unresolved refuses to start rather than egressing unattributed.
+    authSandboxIdentity: false
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:

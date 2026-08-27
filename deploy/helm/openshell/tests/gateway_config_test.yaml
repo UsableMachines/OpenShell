@@ -561,7 +561,7 @@ tests:
     template: templates/gateway-config.yaml
     asserts:
       - failedTemplate:
-          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, and connectByHostname require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'
+          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, connectByHostname, and authSandboxIdentity require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'
 
   - it: fails rendering when only a credential secret is configured
     set:
@@ -570,4 +570,37 @@ tests:
     template: templates/gateway-config.yaml
     asserts:
       - failedTemplate:
-          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, and connectByHostname require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'
+          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, connectByHostname, and authSandboxIdentity require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'
+
+  - it: renders per-sandbox proxy attribution when authSandboxIdentity is set
+    set:
+      server.upstreamProxy.url: "http://openshell-egress.openshell.svc:3128"
+      server.upstreamProxy.authSandboxIdentity: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_sandbox_identity\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_allow_insecure'
+
+  - it: omits per-sandbox proxy attribution by default
+    set:
+      server.upstreamProxy.url: "http://openshell-egress.openshell.svc:3128"
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_sandbox_identity'
+
+  - it: fails rendering when sandbox attribution has no proxy URL
+    set:
+      server.upstreamProxy.authSandboxIdentity: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: 'server.upstreamProxy: noProxy, authSecretName, connectByHostname, and authSandboxIdentity require server.upstreamProxy.url; the gateway rejects them without it rather than dialing directly'

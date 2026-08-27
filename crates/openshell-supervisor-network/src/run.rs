@@ -316,6 +316,7 @@ pub async fn run_networking(
             activity_tx,
             engine_ready_rx,
             upstream_proxy_args,
+            sandbox_id,
         )
         .await?;
         Some(proxy_handle)

@@ -202,6 +202,7 @@ impl ProxyHandle {
         activity_tx: Option<ActivitySender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        sandbox_id: Option<&str>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -256,7 +257,7 @@ impl ProxyHandle {
         // from silently degrading to direct dialing or unauthenticated proxy
         // access.
         let upstream_proxy: Arc<Option<UpstreamProxyConfig>> = Arc::new(
-            UpstreamProxyConfig::from_args(upstream_proxy_args).map_err(|err| {
+            UpstreamProxyConfig::from_args(upstream_proxy_args, sandbox_id).map_err(|err| {
                 let event =
                     openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                         .severity(SeverityId::High)

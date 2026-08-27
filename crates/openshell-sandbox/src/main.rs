@@ -246,6 +246,13 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Identify this sandbox to the corporate proxy by sending its resolved
+    /// sandbox id as the `Proxy-Authorization: Basic` username, with an empty
+    /// password. Mutually exclusive with `--upstream-proxy-auth-file`; fatal
+    /// if the sandbox identity is unresolved.
+    #[arg(long)]
+    upstream_proxy_auth_sandbox_identity: bool,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -709,6 +716,7 @@ fn main() -> Result<()> {
             proxy_auth_file: args.upstream_proxy_auth_file,
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+            proxy_auth_sandbox_identity: args.upstream_proxy_auth_sandbox_identity,
         };
 
         run_sandbox(

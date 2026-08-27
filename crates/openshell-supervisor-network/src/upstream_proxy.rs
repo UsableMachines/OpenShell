@@ -321,6 +321,9 @@ pub struct UpstreamProxyArgs {
     pub proxy_auth_allow_insecure: bool,
     /// Send the destination hostname in CONNECT instead of a validated IP.
     pub proxy_connect_by_hostname: bool,
+    /// Identify the sandbox to the corporate proxy by sending its resolved
+    /// sandbox id as the `Proxy-Authorization: Basic` username.
+    pub proxy_auth_sandbox_identity: bool,
 }
 
 // Supervisor CLI flag names for the corporate-proxy settings, used as the
@@ -330,6 +333,7 @@ const ARG_NO_PROXY: &str = "--upstream-no-proxy";
 const ARG_PROXY_AUTH_FILE: &str = "--upstream-proxy-auth-file";
 const ARG_PROXY_AUTH_ALLOW_INSECURE: &str = "--upstream-proxy-auth-allow-insecure";
 const ARG_PROXY_CONNECT_BY_HOSTNAME: &str = "--upstream-proxy-connect-by-hostname";
+const ARG_PROXY_AUTH_SANDBOX_IDENTITY: &str = "--upstream-proxy-auth-sandbox-identity";
 
 impl UpstreamProxyConfig {
     /// Build the corporate proxy configuration from the driver-supplied
@@ -354,29 +358,40 @@ impl UpstreamProxyConfig {
     /// flag with no proxy configured. Failing closed prevents a
     /// misconfiguration from silently degrading to direct dialing or
     /// unauthenticated proxy access.
-    pub fn from_args(args: &UpstreamProxyArgs) -> Result<Option<Self>, String> {
+    pub fn from_args(
+        args: &UpstreamProxyArgs,
+        sandbox_id: Option<&str>,
+    ) -> Result<Option<Self>, String> {
         // Present the typed argv fields under their canonical identifiers so
         // the shared validation runs once. Booleans map to Some("true") /
         // None, so every pairing rule (auth file needs the acknowledgement,
         // no auxiliary setting without a proxy) applies unchanged.
-        Self::from_lookup(|name| {
-            if name == ARG_HTTPS_PROXY {
-                args.https_proxy.clone()
-            } else if name == ARG_NO_PROXY {
-                args.no_proxy.clone()
-            } else if name == ARG_PROXY_AUTH_FILE {
-                args.proxy_auth_file.clone()
-            } else if name == ARG_PROXY_AUTH_ALLOW_INSECURE {
-                args.proxy_auth_allow_insecure.then(|| "true".to_string())
-            } else if name == ARG_PROXY_CONNECT_BY_HOSTNAME {
-                args.proxy_connect_by_hostname.then(|| "true".to_string())
-            } else {
-                None
-            }
-        })
+        Self::from_lookup(
+            |name| {
+                if name == ARG_HTTPS_PROXY {
+                    args.https_proxy.clone()
+                } else if name == ARG_NO_PROXY {
+                    args.no_proxy.clone()
+                } else if name == ARG_PROXY_AUTH_FILE {
+                    args.proxy_auth_file.clone()
+                } else if name == ARG_PROXY_AUTH_ALLOW_INSECURE {
+                    args.proxy_auth_allow_insecure.then(|| "true".to_string())
+                } else if name == ARG_PROXY_CONNECT_BY_HOSTNAME {
+                    args.proxy_connect_by_hostname.then(|| "true".to_string())
+                } else if name == ARG_PROXY_AUTH_SANDBOX_IDENTITY {
+                    args.proxy_auth_sandbox_identity.then(|| "true".to_string())
+                } else {
+                    None
+                }
+            },
+            sandbox_id,
+        )
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+        sandbox_id: Option<&str>,
+    ) -> Result<Option<Self>, String> {
         // A missing setting means "not configured". A present-but-empty value
         // is a misconfiguration (the driver never emits one), so it is fatal
         // rather than silently downgrading the boundary to direct dialing or
@@ -396,6 +411,7 @@ impl UpstreamProxyConfig {
         let auth_file = var(ARG_PROXY_AUTH_FILE)?;
         let auth_allow_insecure = var(ARG_PROXY_AUTH_ALLOW_INSECURE)?;
         let connect_by_hostname_raw = var(ARG_PROXY_CONNECT_BY_HOSTNAME)?;
+        let auth_sandbox_identity_raw = var(ARG_PROXY_AUTH_SANDBOX_IDENTITY)?;
         let no_proxy_list = var(ARG_NO_PROXY)?;
         let Some(mut https) = https else {
             // Auxiliary proxy settings without a proxy mean the operator
@@ -405,6 +421,7 @@ impl UpstreamProxyConfig {
                 (ARG_PROXY_AUTH_FILE, &auth_file),
                 (ARG_PROXY_AUTH_ALLOW_INSECURE, &auth_allow_insecure),
                 (ARG_PROXY_CONNECT_BY_HOSTNAME, &connect_by_hostname_raw),
+                (ARG_PROXY_AUTH_SANDBOX_IDENTITY, &auth_sandbox_identity_raw),
                 (ARG_NO_PROXY, &no_proxy_list),
             ] {
                 if value.is_some() {
@@ -455,6 +472,27 @@ impl UpstreamProxyConfig {
             ));
         }
 
+        // Sandbox-identity attribution. Only the exact opt-in value the
+        // driver writes is honored, matching the other boolean flags.
+        let auth_sandbox_identity = match auth_sandbox_identity_raw.as_deref().map(str::trim) {
+            None => false,
+            Some("true") => true,
+            Some(_) => {
+                return Err(format!(
+                    "{ARG_PROXY_AUTH_SANDBOX_IDENTITY} must be 'true' when set"
+                ));
+            }
+        };
+        // One request carries one Proxy-Authorization header, so the two
+        // credential sources cannot both apply. Refuse rather than silently
+        // letting one win.
+        if auth_sandbox_identity && auth_file.is_some() {
+            return Err(format!(
+                "{ARG_PROXY_AUTH_SANDBOX_IDENTITY} and {ARG_PROXY_AUTH_FILE} are mutually \
+                 exclusive; a request carries a single Proxy-Authorization header"
+            ));
+        }
+
         // Load proxy credentials from the configured auth file, if any.
         // The file is delivered through a root-only secret mount so the
         // credentials never appear in the environment or container metadata.
@@ -463,6 +501,34 @@ impl UpstreamProxyConfig {
                 openshell_core::driver_utils::read_upstream_proxy_credential_file(&path)?;
             let header = basic_auth_header(&credential).map_err(|err| {
                 format!("invalid credential in upstream proxy auth file '{path}': {err}")
+            })?;
+            https.proxy_authorization = Some(header);
+        }
+
+        // Sandbox identity travels in the Basic username with an empty
+        // password. The username is an *identifier*, not a secret: it lets
+        // the proxy attribute and ACL egress per sandbox, and because the
+        // supervisor constructs the header on the upstream hop, a workload
+        // cannot forge or alter it. Anything with direct network access to
+        // the proxy can, so the proxy must not treat the value as
+        // authorization on its own.
+        //
+        // Fail closed when the identity has not been resolved: an
+        // unattributable connection is worse than no connection, and sending
+        // an anonymous credential would silently defeat a proxy ACL keyed on
+        // the username.
+        if auth_sandbox_identity {
+            let id = sandbox_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "{ARG_PROXY_AUTH_SANDBOX_IDENTITY} is set but the sandbox identity is \
+                         unresolved; refusing to send an unattributed credential"
+                    )
+                })?;
+            let header = basic_auth_header(&format!("{id}:")).map_err(|err| {
+                format!("sandbox id is not usable as a proxy credential username: {err}")
             })?;
             https.proxy_authorization = Some(header);
         }
@@ -880,16 +946,29 @@ mod tests {
         ARG_HTTPS_PROXY as HTTPS_PROXY, ARG_NO_PROXY as NO_PROXY,
         ARG_PROXY_AUTH_ALLOW_INSECURE as PROXY_AUTH_ALLOW_INSECURE,
         ARG_PROXY_AUTH_FILE as PROXY_AUTH_FILE,
+        ARG_PROXY_AUTH_SANDBOX_IDENTITY as PROXY_AUTH_SANDBOX_IDENTITY,
         ARG_PROXY_CONNECT_BY_HOSTNAME as PROXY_CONNECT_BY_HOSTNAME,
     };
 
+    const TEST_SANDBOX_ID: &str = "sbx-01JQ8Z9K4M7N2P";
+
     fn config_from(pairs: &[(&str, &str)]) -> Result<Option<UpstreamProxyConfig>, String> {
-        UpstreamProxyConfig::from_lookup(|name| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| (*v).to_string())
-        })
+        config_from_with_identity(pairs, Some(TEST_SANDBOX_ID))
+    }
+
+    fn config_from_with_identity(
+        pairs: &[(&str, &str)],
+        sandbox_id: Option<&str>,
+    ) -> Result<Option<UpstreamProxyConfig>, String> {
+        UpstreamProxyConfig::from_lookup(
+            |name| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_string())
+            },
+            sandbox_id,
+        )
     }
 
     /// Shorthand for tests exercising a configuration that must load.
@@ -912,13 +991,15 @@ mod tests {
             proxy_connect_by_hostname: true,
             ..UpstreamProxyArgs::default()
         };
-        let cfg = UpstreamProxyConfig::from_args(&args).unwrap().unwrap();
+        let cfg = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID))
+            .unwrap()
+            .unwrap();
         assert!(cfg.connect_by_hostname());
         assert!(bypasses(&cfg, "kubernetes.default.svc.cluster.local"));
 
         // No proxy URL means no configuration.
         assert!(
-            UpstreamProxyConfig::from_args(&UpstreamProxyArgs::default())
+            UpstreamProxyConfig::from_args(&UpstreamProxyArgs::default(), Some(TEST_SANDBOX_ID))
                 .unwrap()
                 .is_none()
         );
@@ -933,7 +1014,7 @@ mod tests {
             proxy_auth_file: Some("/etc/openshell/auth/upstream-proxy".to_string()),
             ..UpstreamProxyArgs::default()
         };
-        let err = UpstreamProxyConfig::from_args(&args).unwrap_err();
+        let err = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID)).unwrap_err();
         assert!(err.contains(PROXY_AUTH_ALLOW_INSECURE), "{err}");
 
         // Auxiliary settings without a proxy are fatal.
@@ -941,7 +1022,7 @@ mod tests {
             proxy_connect_by_hostname: true,
             ..UpstreamProxyArgs::default()
         };
-        let err = UpstreamProxyConfig::from_args(&args).unwrap_err();
+        let err = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID)).unwrap_err();
         assert!(err.contains("no upstream proxy"), "{err}");
     }
 
@@ -1873,5 +1954,170 @@ mod tests {
         let err = config_from(&[(PROXY_CONNECT_BY_HOSTNAME, "true")]).unwrap_err();
         assert!(err.contains(PROXY_CONNECT_BY_HOSTNAME), "{err}");
         assert!(err.contains("no upstream proxy"), "{err}");
+    }
+
+    // -- sandbox-identity attribution --
+
+    fn expected_identity_header(id: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{id}:"))
+        )
+    }
+
+    #[test]
+    fn sandbox_identity_sends_the_sandbox_id_as_the_basic_username() {
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert_eq!(
+            ep.proxy_authorization.as_deref(),
+            Some(expected_identity_header(TEST_SANDBOX_ID).as_str())
+        );
+    }
+
+    /// The password half is empty by design: the id identifies the sandbox,
+    /// it does not authenticate it.
+    #[test]
+    fn sandbox_identity_leaves_the_password_empty() {
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        let encoded = ep
+            .proxy_authorization
+            .as_deref()
+            .unwrap()
+            .strip_prefix("Basic ")
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            format!("{TEST_SANDBOX_ID}:")
+        );
+    }
+
+    #[test]
+    fn no_sandbox_identity_flag_sends_no_credential() {
+        let cfg = config_ok(&[(HTTPS_PROXY, "http://proxy:8080")]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert!(ep.proxy_authorization.is_none());
+    }
+
+    /// An unattributable connection is worse than no connection: a proxy ACL
+    /// keyed on the username would be silently defeated by an anonymous
+    /// credential.
+    #[test]
+    fn sandbox_identity_fails_closed_when_the_identity_is_unresolved() {
+        for id in [None, Some(""), Some("   ")] {
+            let err = config_from_with_identity(
+                &[
+                    (HTTPS_PROXY, "http://proxy:8080"),
+                    (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+                ],
+                id,
+            )
+            .unwrap_err();
+            assert!(err.contains(PROXY_AUTH_SANDBOX_IDENTITY), "{id:?}: {err}");
+            assert!(err.contains("unresolved"), "{id:?}: {err}");
+        }
+    }
+
+    /// A request carries a single `Proxy-Authorization` header, so the two
+    /// credential sources cannot both apply.
+    #[test]
+    fn sandbox_identity_and_auth_file_are_mutually_exclusive() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"user:secret\n").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let err = config_from(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_FILE, &path),
+            (PROXY_AUTH_ALLOW_INSECURE, "true"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_identity_honors_only_the_exact_opt_in_value() {
+        for value in ["1", "yes", "True", "false", ""] {
+            assert!(
+                config_from(&[
+                    (HTTPS_PROXY, "http://proxy:8080"),
+                    (PROXY_AUTH_SANDBOX_IDENTITY, value),
+                ])
+                .is_err(),
+                "{value:?} must not enable sandbox identity"
+            );
+        }
+    }
+
+    /// Like every other auxiliary setting: present without a proxy means the
+    /// operator believed a boundary was in effect.
+    #[test]
+    fn sandbox_identity_without_a_proxy_is_fatal() {
+        let err = config_from(&[(PROXY_AUTH_SANDBOX_IDENTITY, "true")]).unwrap_err();
+        assert!(err.contains("no upstream proxy"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_identity_is_hidden_from_debug_and_summary() {
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ]);
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(TEST_SANDBOX_ID), "{debug}");
+        assert!(!cfg.summary().contains(TEST_SANDBOX_ID));
+    }
+
+    #[test]
+    fn from_args_threads_the_sandbox_identity_flag() {
+        let args = UpstreamProxyArgs {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_auth_sandbox_identity: true,
+            ..UpstreamProxyArgs::default()
+        };
+        let cfg = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID))
+            .unwrap()
+            .unwrap();
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert_eq!(
+            ep.proxy_authorization.as_deref(),
+            Some(expected_identity_header(TEST_SANDBOX_ID).as_str())
+        );
+
+        // Same argv, no resolved identity: fatal rather than unattributed.
+        assert!(UpstreamProxyConfig::from_args(&args, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn sandbox_identity_reaches_the_proxy_in_the_connect_request() {
+        let (addr, handle) = fake_proxy("HTTP/1.1 200 Connection established\r\n\r\n").await;
+        let endpoint = endpoint_for(addr, Some(&expected_identity_header(TEST_SANDBOX_ID)));
+        let stream = connect_via(
+            &endpoint,
+            "api.example.com",
+            443,
+            ConnectTarget::Ip("93.184.216.34".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        drop(stream);
+        let request = handle.await.unwrap();
+        assert!(
+            request.contains(&format!(
+                "Proxy-Authorization: {}\r\n",
+                expected_identity_header(TEST_SANDBOX_ID)
+            )),
+            "{request}"
+        );
     }
 }

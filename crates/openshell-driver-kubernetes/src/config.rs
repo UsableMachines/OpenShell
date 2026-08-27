@@ -407,6 +407,21 @@ pub struct KubernetesComputeConfig {
     /// and the proxy's own ACLs become the effective egress control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Identify each sandbox to the corporate proxy by sending its sandbox id
+    /// as the `Proxy-Authorization: Basic` username, with an empty password.
+    ///
+    /// This lets the proxy attribute and ACL egress per sandbox. The username
+    /// is an identifier, not a secret: the supervisor constructs the header on
+    /// the upstream hop, so a workload cannot forge or alter it, but anything
+    /// with direct network access to the proxy can. The proxy must therefore
+    /// not treat the value as authorization on its own.
+    ///
+    /// Mutually exclusive with the credential file/secret — one request
+    /// carries a single `Proxy-Authorization` header. Fail-closed: a sandbox
+    /// whose identity is unresolved refuses to start rather than egressing
+    /// unattributed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_auth_sandbox_identity: Option<bool>,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -467,6 +482,7 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_secret_name: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_auth_sandbox_identity: None,
         }
     }
 }
@@ -567,7 +583,9 @@ impl KubernetesComputeConfig {
                         .to_string(),
                 );
             }
-        } else if self.proxy_auth_allow_insecure.is_some() {
+        } else if self.proxy_auth_sandbox_identity != Some(true)
+            && self.proxy_auth_allow_insecure.is_some()
+        {
             // The acknowledgement without credentials means the operator
             // believed a credential secret was configured; surface the
             // mismatch.
@@ -580,6 +598,38 @@ impl KubernetesComputeConfig {
         if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
             return Err(
                 "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            );
+        }
+
+        if self.proxy_auth_sandbox_identity == Some(true) {
+            if self.https_proxy.is_none() {
+                return Err(
+                    "proxy_auth_sandbox_identity is set but no https_proxy is configured"
+                        .to_string(),
+                );
+            }
+            // One request carries one Proxy-Authorization header, so the two
+            // credential sources cannot both apply.
+            if self.proxy_auth_secret_name.is_some() {
+                return Err(
+                    "proxy_auth_sandbox_identity and proxy_auth_secret_name are mutually \
+                     exclusive; a request carries a single Proxy-Authorization header"
+                        .to_string(),
+                );
+            }
+            // The sandbox id is an identifier, not a secret, so it needs no
+            // cleartext acknowledgement; accepting one here would imply a
+            // credential is being sent.
+            if self.proxy_auth_allow_insecure.is_some() {
+                return Err(
+                    "proxy_auth_allow_insecure does not apply to proxy_auth_sandbox_identity: \
+                     the sandbox id is an identifier, not a credential"
+                        .to_string(),
+                );
+            }
+        } else if self.proxy_auth_sandbox_identity.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_auth_sandbox_identity is set but no https_proxy is configured".to_string(),
             );
         }
 
@@ -1322,5 +1372,66 @@ mod tests {
         assert_eq!(cfg.proxy_auth_allow_insecure, Some(true));
         assert_eq!(cfg.proxy_connect_by_hostname, Some(true));
         cfg.validate_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_sandbox_identity_with_a_proxy() {
+        let mut cfg = proxy_cfg(Some("http://egress.openshell.svc:3128"));
+        cfg.proxy_auth_sandbox_identity = Some(true);
+        cfg.validate_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_sandbox_identity_without_a_proxy() {
+        for value in [Some(true), Some(false)] {
+            let cfg = KubernetesComputeConfig {
+                proxy_auth_sandbox_identity: value,
+                ..KubernetesComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(err.contains("proxy_auth_sandbox_identity"), "{err}");
+            assert!(err.contains("https_proxy"), "{err}");
+        }
+    }
+
+    /// A request carries a single `Proxy-Authorization` header, so the two
+    /// credential sources cannot both apply.
+    #[test]
+    fn validate_proxy_config_rejects_sandbox_identity_with_a_credential_secret() {
+        let mut cfg = proxy_cfg(Some("http://egress.openshell.svc:3128"));
+        cfg.proxy_auth_secret_name = Some("proxy-auth".to_string());
+        cfg.proxy_auth_allow_insecure = Some(true);
+        cfg.proxy_auth_sandbox_identity = Some(true);
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    /// The sandbox id is an identifier, not a secret. Accepting the
+    /// cleartext-credential acknowledgement alongside it would tell the
+    /// operator a credential is being sent when none is.
+    #[test]
+    fn validate_proxy_config_rejects_the_cleartext_acknowledgement_with_sandbox_identity() {
+        let mut cfg = proxy_cfg(Some("http://egress.openshell.svc:3128"));
+        cfg.proxy_auth_sandbox_identity = Some(true);
+        cfg.proxy_auth_allow_insecure = Some(true);
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.contains("identifier, not a credential"), "{err}");
+    }
+
+    #[test]
+    fn serde_reads_the_sandbox_identity_setting() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
+            "https_proxy": "http://egress.openshell.svc:3128",
+            "proxy_auth_sandbox_identity": true,
+        }))
+        .unwrap();
+        assert_eq!(cfg.proxy_auth_sandbox_identity, Some(true));
+        cfg.validate_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn serde_default_leaves_sandbox_identity_unset() {
+        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.proxy_auth_sandbox_identity, None);
     }
 }
