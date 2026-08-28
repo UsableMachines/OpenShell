@@ -1241,20 +1241,33 @@ mod tests {
             .unwrap();
     }
 
-    /// The supervisor only chains through `http://` forward proxies, so
-    /// rejecting other schemes here turns a per-sandbox startup failure into
-    /// a gateway startup failure the operator sees immediately.
+    /// The supervisor chains through `http://` and `https://` forward proxies
+    /// only, so rejecting other schemes here turns a per-sandbox startup
+    /// failure into a gateway startup failure the operator sees immediately.
     #[test]
     fn validate_proxy_config_rejects_unsupported_schemes() {
         for url in [
-            "https://proxy.corp.example:8443",
             "socks5://proxy.corp.example:1080",
+            "ftp://proxy.corp.example:21",
         ] {
             assert!(
                 proxy_cfg(Some(url)).validate_proxy_config().is_err(),
                 "{url} must be rejected"
             );
         }
+    }
+
+    /// An https:// proxy authenticates itself to the supervisor and encrypts
+    /// the CONNECT hop. Rejecting it here would make the gateway refuse a
+    /// configuration the supervisor accepts, which is the disagreement this
+    /// shared validation exists to prevent.
+    #[test]
+    fn validate_proxy_config_accepts_an_https_proxy() {
+        assert!(
+            proxy_cfg(Some("https://proxy.corp.example:8443"))
+                .validate_proxy_config()
+                .is_ok()
+        );
     }
 
     #[test]

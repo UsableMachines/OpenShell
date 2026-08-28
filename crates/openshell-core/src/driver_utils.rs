@@ -103,6 +103,11 @@ pub struct UpstreamProxyAddr {
     pub host: String,
     /// Proxy TCP port (always explicit in the accepted URL grammar).
     pub port: u16,
+    /// `https://`: the hop to the proxy is itself TLS, so the CONNECT request
+    /// and any credential on it are encrypted, and the proxy authenticates
+    /// itself before the client will speak to it. `http://` leaves both in the
+    /// clear and lets anything answering on the address take the tunnel.
+    pub tls: bool,
 }
 
 /// Why an upstream proxy URL was rejected by [`parse_upstream_proxy_url`].
@@ -157,11 +162,14 @@ pub enum UpstreamProxyUrlError {
 
 /// Parse and validate a corporate upstream-proxy URL.
 ///
-/// The accepted grammar is exactly `http://host:port`: the scheme and the
-/// port must both be explicit, only `http://` proxies are accepted, and
-/// inline userinfo is rejected. The URL must address the proxy only: a path
-/// (other than a bare trailing `/`), query, or fragment is rejected rather
-/// than silently discarded.
+/// The accepted grammar is exactly `http://host:port` or `https://host:port`:
+/// the scheme and the port must both be explicit, and inline userinfo is
+/// rejected. `https://` makes the hop to the proxy itself TLS, which is what
+/// lets a client authenticate the proxy rather than trusting whatever answers
+/// on the address, and keeps the CONNECT request off the wire in the clear.
+///
+/// The URL must address the proxy only: a path (other than a bare trailing
+/// `/`), query, or fragment is rejected rather than silently discarded.
 ///
 /// # Errors
 ///
@@ -177,11 +185,15 @@ pub fn parse_upstream_proxy_url(raw: &str) -> Result<UpstreamProxyAddr, Upstream
     }
     let parsed = url::Url::parse(trimmed).map_err(UpstreamProxyUrlError::Invalid)?;
 
-    if !parsed.scheme().eq_ignore_ascii_case("http") {
+    let tls = if parsed.scheme().eq_ignore_ascii_case("https") {
+        true
+    } else if parsed.scheme().eq_ignore_ascii_case("http") {
+        false
+    } else {
         return Err(UpstreamProxyUrlError::UnsupportedScheme(
             parsed.scheme().to_string(),
         ));
-    }
+    };
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(UpstreamProxyUrlError::InlineCredentials);
     }
@@ -210,13 +222,13 @@ pub fn parse_upstream_proxy_url(raw: &str) -> Result<UpstreamProxyAddr, Upstream
         return Err(UpstreamProxyUrlError::MissingPort);
     }
     // Explicit-port presence was verified above; `port()` is `None` only
-    // when the URL spells out the scheme default (`:80`), which the url crate
-    // normalizes away.
-    let port = parsed.port().unwrap_or(80);
+    // when the URL spells out the scheme default (`:80`, `:443`), which the url
+    // crate normalizes away.
+    let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
     if port == 0 {
         return Err(UpstreamProxyUrlError::ZeroPort);
     }
-    Ok(UpstreamProxyAddr { host, port })
+    Ok(UpstreamProxyAddr { host, port, tls })
 }
 
 /// Return `true` when the raw URL's authority carries an explicit `:port`.
@@ -526,13 +538,33 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_url_rejects_tls_and_socks_schemes() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+    fn upstream_proxy_url_rejects_non_http_schemes() {
+        for url in ["socks5://proxy:1080", "ftp://proxy:21"] {
             assert!(matches!(
                 parse_upstream_proxy_url(url),
                 Err(UpstreamProxyUrlError::UnsupportedScheme(_))
             ));
         }
+    }
+
+    #[test]
+    fn upstream_proxy_url_marks_https_as_tls() {
+        let addr = parse_upstream_proxy_url("https://proxy:3128").unwrap();
+        assert_eq!(addr.host, "proxy");
+        assert_eq!(addr.port, 3128);
+        assert!(addr.tls);
+
+        let plain = parse_upstream_proxy_url("http://proxy:3128").unwrap();
+        assert!(!plain.tls);
+    }
+
+    /// The url crate normalizes a scheme-default port away, so the https
+    /// default must not fall through to 80 and silently dial the wrong port.
+    #[test]
+    fn upstream_proxy_url_https_default_port_is_443() {
+        let addr = parse_upstream_proxy_url("https://proxy:443").unwrap();
+        assert_eq!(addr.port, 443);
+        assert!(addr.tls);
     }
 
     #[test]

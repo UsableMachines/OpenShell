@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn validate_proxy_config_rejects_non_http_schemes() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+        for url in ["socks5://proxy:1080", "ftp://proxy:21"] {
             let cfg = PodmanComputeConfig {
                 https_proxy: Some(url.to_string()),
                 ..PodmanComputeConfig::default()
