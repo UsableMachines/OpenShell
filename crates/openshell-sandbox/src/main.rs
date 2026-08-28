@@ -225,7 +225,10 @@ struct Args {
     // only as command-line arguments (no `env =`), because the driver
     // controls the supervisor's argv while a sandbox image could bake
     // matching `ENV` values.
-    /// Corporate forward proxy URL (`http://host:port`) for upstream TLS egress.
+    /// Corporate forward proxy URL (`http://host:port` or `https://host:port`)
+    /// for upstream TLS egress. `https://` authenticates the proxy to this
+    /// supervisor and encrypts the CONNECT hop; it requires
+    /// `--upstream-proxy-ca`.
     #[arg(long)]
     upstream_proxy: Option<String>,
 
@@ -253,6 +256,20 @@ struct Args {
     /// if the sandbox identity is unresolved.
     #[arg(long)]
     upstream_proxy_auth_sandbox_identity: bool,
+
+    /// PEM CA bundle the `https://` proxy's certificate is verified against.
+    /// Required with an `https://` proxy and rejected without one.
+    #[arg(long)]
+    upstream_proxy_ca: Option<String>,
+
+    /// PEM client certificate presented to the proxy, for a proxy that
+    /// authenticates its callers. Set together with the key.
+    #[arg(long)]
+    upstream_proxy_client_cert: Option<String>,
+
+    /// PEM private key for `--upstream-proxy-client-cert`.
+    #[arg(long)]
+    upstream_proxy_client_key: Option<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -717,6 +734,9 @@ fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
             proxy_auth_sandbox_identity: args.upstream_proxy_auth_sandbox_identity,
+            proxy_ca: args.upstream_proxy_ca,
+            proxy_client_cert: args.upstream_proxy_client_cert,
+            proxy_client_key: args.upstream_proxy_client_key,
         };
 
         run_sandbox(

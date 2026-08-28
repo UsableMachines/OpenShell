@@ -48,12 +48,17 @@
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tracing::debug;
 
 /// Upper bound on the corporate proxy's CONNECT response header block.
@@ -63,6 +68,19 @@ const MAX_CONNECT_RESPONSE_BYTES: usize = 8 * 1024;
 /// CONNECT handshake.
 const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// TLS for the hop to the proxy itself, distinct from the TLS that travels
+/// inside the tunnel.
+///
+/// Present only for an `https://` proxy. Its roots are the operator-supplied
+/// CA alone, never the system roots: the proxy is a named in-cluster service,
+/// and accepting any publicly-trusted certificate for that name would defeat
+/// the point of verifying it.
+#[derive(Clone)]
+struct ProxyTls {
+    config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+}
+
 /// A parsed corporate proxy endpoint.
 #[derive(Clone)]
 pub struct ProxyEndpoint {
@@ -71,6 +89,10 @@ pub struct ProxyEndpoint {
     /// Pre-computed `Basic <base64>` header value from the proxy auth file.
     /// Never logged.
     proxy_authorization: Option<String>,
+    /// `Some` when the proxy URL was `https://`: the proxy authenticates
+    /// itself before this client sends anything, and the CONNECT request and
+    /// any credential on it are encrypted in transit.
+    tls: Option<ProxyTls>,
 }
 
 impl ProxyEndpoint {
@@ -87,6 +109,7 @@ impl std::fmt::Debug for ProxyEndpoint {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("proxy_authorization", &self.proxy_authorization.is_some())
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -324,6 +347,15 @@ pub struct UpstreamProxyArgs {
     /// Identify the sandbox to the corporate proxy by sending its resolved
     /// sandbox id as the `Proxy-Authorization: Basic` username.
     pub proxy_auth_sandbox_identity: bool,
+    /// PEM CA bundle the proxy's own certificate is verified against.
+    /// Required for an `https://` proxy and rejected for an `http://` one.
+    pub proxy_ca: Option<String>,
+    /// PEM client certificate presented to the proxy, with its key below.
+    /// Optional: a proxy that authenticates its callers needs it, one that
+    /// only authenticates itself does not.
+    pub proxy_client_cert: Option<String>,
+    /// PEM private key for `proxy_client_cert`.
+    pub proxy_client_key: Option<String>,
 }
 
 // Supervisor CLI flag names for the corporate-proxy settings, used as the
@@ -334,6 +366,9 @@ const ARG_PROXY_AUTH_FILE: &str = "--upstream-proxy-auth-file";
 const ARG_PROXY_AUTH_ALLOW_INSECURE: &str = "--upstream-proxy-auth-allow-insecure";
 const ARG_PROXY_CONNECT_BY_HOSTNAME: &str = "--upstream-proxy-connect-by-hostname";
 const ARG_PROXY_AUTH_SANDBOX_IDENTITY: &str = "--upstream-proxy-auth-sandbox-identity";
+const ARG_PROXY_CA: &str = "--upstream-proxy-ca";
+const ARG_PROXY_CLIENT_CERT: &str = "--upstream-proxy-client-cert";
+const ARG_PROXY_CLIENT_KEY: &str = "--upstream-proxy-client-key";
 
 impl UpstreamProxyConfig {
     /// Build the corporate proxy configuration from the driver-supplied
@@ -380,6 +415,12 @@ impl UpstreamProxyConfig {
                     args.proxy_connect_by_hostname.then(|| "true".to_string())
                 } else if name == ARG_PROXY_AUTH_SANDBOX_IDENTITY {
                     args.proxy_auth_sandbox_identity.then(|| "true".to_string())
+                } else if name == ARG_PROXY_CA {
+                    args.proxy_ca.clone()
+                } else if name == ARG_PROXY_CLIENT_CERT {
+                    args.proxy_client_cert.clone()
+                } else if name == ARG_PROXY_CLIENT_KEY {
+                    args.proxy_client_key.clone()
                 } else {
                     None
                 }
@@ -412,8 +453,11 @@ impl UpstreamProxyConfig {
         let auth_allow_insecure = var(ARG_PROXY_AUTH_ALLOW_INSECURE)?;
         let connect_by_hostname_raw = var(ARG_PROXY_CONNECT_BY_HOSTNAME)?;
         let auth_sandbox_identity_raw = var(ARG_PROXY_AUTH_SANDBOX_IDENTITY)?;
+        let proxy_ca = var(ARG_PROXY_CA)?;
+        let proxy_client_cert = var(ARG_PROXY_CLIENT_CERT)?;
+        let proxy_client_key = var(ARG_PROXY_CLIENT_KEY)?;
         let no_proxy_list = var(ARG_NO_PROXY)?;
-        let Some(mut https) = https else {
+        let Some((mut https, requires_tls)) = https else {
             // Auxiliary proxy settings without a proxy mean the operator
             // believed a proxy boundary was in effect; refuse rather than
             // silently running with direct egress.
@@ -422,6 +466,9 @@ impl UpstreamProxyConfig {
                 (ARG_PROXY_AUTH_ALLOW_INSECURE, &auth_allow_insecure),
                 (ARG_PROXY_CONNECT_BY_HOSTNAME, &connect_by_hostname_raw),
                 (ARG_PROXY_AUTH_SANDBOX_IDENTITY, &auth_sandbox_identity_raw),
+                (ARG_PROXY_CA, &proxy_ca),
+                (ARG_PROXY_CLIENT_CERT, &proxy_client_cert),
+                (ARG_PROXY_CLIENT_KEY, &proxy_client_key),
                 (ARG_NO_PROXY, &no_proxy_list),
             ] {
                 if value.is_some() {
@@ -443,6 +490,43 @@ impl UpstreamProxyConfig {
                 ));
             }
         };
+
+        // Proxy-hop TLS. An https:// proxy without a CA would fall back to
+        // whatever roots happen to be present, and TLS material on an http://
+        // proxy would be silently ignored — both leave the operator believing
+        // the hop is authenticated when it is not, so both are fatal.
+        if requires_tls {
+            let Some(ca_path) = proxy_ca.as_deref() else {
+                return Err(format!(
+                    "{ARG_HTTPS_PROXY} is https:// but {ARG_PROXY_CA} is not set; refusing to \
+                     verify the proxy against unknown roots"
+                ));
+            };
+            if proxy_client_cert.is_some() != proxy_client_key.is_some() {
+                return Err(format!(
+                    "{ARG_PROXY_CLIENT_CERT} and {ARG_PROXY_CLIENT_KEY} must be set together"
+                ));
+            }
+            https.tls = Some(build_proxy_tls(
+                &https.host,
+                ca_path,
+                proxy_client_cert.as_deref(),
+                proxy_client_key.as_deref(),
+            )?);
+        } else {
+            for (name, value) in [
+                (ARG_PROXY_CA, &proxy_ca),
+                (ARG_PROXY_CLIENT_CERT, &proxy_client_cert),
+                (ARG_PROXY_CLIENT_KEY, &proxy_client_key),
+            ] {
+                if value.is_some() {
+                    return Err(format!(
+                        "{name} is set but {ARG_HTTPS_PROXY} is not https://; the proxy hop would \
+                         be unauthenticated cleartext"
+                    ));
+                }
+            }
+        }
 
         // Cleartext-credential acknowledgement. `Proxy-Authorization: Basic`
         // travels over plain TCP to the http:// proxy, so credentials are
@@ -596,13 +680,94 @@ impl UpstreamProxyConfig {
 /// Rejects unsupported schemes (TLS or SOCKS proxies), inline `user:pass@`
 /// credentials, and malformed addresses. The error names `var_name` so the
 /// operator can locate the offending setting.
-fn parse_proxy_url(raw: &str, var_name: &str) -> Result<ProxyEndpoint, String> {
+fn parse_proxy_url(raw: &str, var_name: &str) -> Result<(ProxyEndpoint, bool), String> {
     let addr = openshell_core::driver_utils::parse_upstream_proxy_url(raw)
         .map_err(|err| format!("{var_name} is invalid: {err}"))?;
-    Ok(ProxyEndpoint {
-        host: addr.host,
-        port: addr.port,
-        proxy_authorization: None,
+    let requires_tls = addr.tls;
+    Ok((
+        ProxyEndpoint {
+            host: addr.host,
+            port: addr.port,
+            proxy_authorization: None,
+            tls: None,
+        },
+        requires_tls,
+    ))
+}
+
+/// Build the TLS client configuration for the hop to the proxy.
+///
+/// Roots are the operator-supplied CA only. Adding the system roots would let
+/// any publicly-trusted certificate for the proxy's name terminate the hop,
+/// which is the impersonation this exists to prevent.
+fn build_proxy_tls(
+    host: &str,
+    ca_path: &str,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<ProxyTls, String> {
+    let ca_pem = std::fs::read(ca_path)
+        .map_err(|err| format!("{ARG_PROXY_CA} '{ca_path}' is unreadable: {err}"))?;
+    let mut roots = RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
+        let cert = cert.map_err(|err| format!("{ARG_PROXY_CA} '{ca_path}' is malformed: {err}"))?;
+        roots
+            .add(cert)
+            .map_err(|err| format!("{ARG_PROXY_CA} '{ca_path}' is not usable as a root: {err}"))?;
+        added += 1;
+    }
+    // An empty-but-readable bundle would otherwise build a config that trusts
+    // nothing and fails at the first connection instead of at startup.
+    if added == 0 {
+        return Err(format!(
+            "{ARG_PROXY_CA} '{ca_path}' contains no certificates"
+        ));
+    }
+
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let config = match (client_cert_path, client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(cert_path).map_err(|err| {
+                format!("{ARG_PROXY_CLIENT_CERT} '{cert_path}' is unreadable: {err}")
+            })?;
+            let chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+                .map_err(|err| {
+                    format!("{ARG_PROXY_CLIENT_CERT} '{cert_path}' is malformed: {err}")
+                })?;
+            if chain.is_empty() {
+                return Err(format!(
+                    "{ARG_PROXY_CLIENT_CERT} '{cert_path}' contains no certificates"
+                ));
+            }
+            let key_pem = std::fs::read(key_path).map_err(|err| {
+                format!("{ARG_PROXY_CLIENT_KEY} '{key_path}' is unreadable: {err}")
+            })?;
+            let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_slice())
+                .map_err(|err| format!("{ARG_PROXY_CLIENT_KEY} '{key_path}' is malformed: {err}"))?
+                .ok_or_else(|| {
+                    format!("{ARG_PROXY_CLIENT_KEY} '{key_path}' contains no private key")
+                })?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|err| format!("upstream proxy client certificate is unusable: {err}"))?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        // Guarded before this point; kept exhaustive rather than unreachable.
+        _ => {
+            return Err(format!(
+                "{ARG_PROXY_CLIENT_CERT} and {ARG_PROXY_CLIENT_KEY} must be set together"
+            ));
+        }
+    };
+
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|err| format!("{ARG_HTTPS_PROXY} host '{host}' is not a valid TLS name: {err}"))?;
+
+    Ok(ProxyTls {
+        config: Arc::new(config),
+        server_name,
     })
 }
 
@@ -639,9 +804,78 @@ fn basic_auth_header(credential: &str) -> Result<String, String> {
 /// stream and must reach the caller rather than being discarded; this
 /// wrapper yields them before reading from the socket again. Writes pass
 /// straight through.
+/// The socket the CONNECT handshake and the tunnel ride on: plain TCP to an
+/// `http://` proxy, TLS to an `https://` one.
+///
+/// An enum rather than a generic so [`PrefixedStream`] stays one concrete type
+/// for every caller downstream.
+#[derive(Debug)]
+enum ProxyTransport {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ProxyTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ProxyTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PrefixedStream {
-    inner: TcpStream,
+    inner: ProxyTransport,
     /// Bytes read past the CONNECT header terminator, replayed first.
     prefix: Vec<u8>,
     /// Read offset into `prefix`.
@@ -650,8 +884,7 @@ pub struct PrefixedStream {
 
 impl PrefixedStream {
     /// Wrap `inner`, replaying `prefix` before socket reads.
-    #[must_use]
-    pub fn new(inner: TcpStream, prefix: Vec<u8>) -> Self {
+    fn new(inner: ProxyTransport, prefix: Vec<u8>) -> Self {
         Self {
             inner,
             prefix,
@@ -662,7 +895,7 @@ impl PrefixedStream {
     /// Wrap a directly dialed stream with nothing to replay.
     #[must_use]
     pub fn without_prefix(inner: TcpStream) -> Self {
-        Self::new(inner, Vec::new())
+        Self::new(ProxyTransport::Plain(inner), Vec::new())
     }
 }
 
@@ -863,7 +1096,18 @@ async fn connect_via_inner(
     port: u16,
     target: ConnectTarget,
 ) -> std::io::Result<PrefixedStream> {
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    // Upgraded before the CONNECT request is written: the proxy proves who it
+    // is, and the request line and any credential on it are encrypted, rather
+    // than being handed to whatever answered on the address.
+    let mut stream = match &endpoint.tls {
+        None => ProxyTransport::Plain(tcp),
+        Some(tls) => {
+            let connector = TlsConnector::from(Arc::clone(&tls.config));
+            let session = connector.connect(tls.server_name.clone(), tcp).await?;
+            ProxyTransport::Tls(Box::new(session))
+        }
+    };
 
     let target = match target {
         ConnectTarget::Ip(IpAddr::V6(ip)) => format!("[{ip}]:{port}"),
@@ -1093,6 +1337,27 @@ mod tests {
         }
     }
 
+    /// A CA certificate in PEM, reusing the same generator the L7 tests use.
+    fn test_ca_pem() -> String {
+        use crate::l7::tls;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        tls::SandboxCa::generate().unwrap().cert_pem().to_string()
+    }
+
+    /// Returned rather than dropped: the file is deleted on drop, and the
+    /// caller passes its path into config parsing that reads it.
+    fn write_temp_pem(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        file
+    }
+
     // -- Fail-closed configuration validation --
     //
     // Present-but-invalid settings must be fatal, never silently treated
@@ -1100,12 +1365,77 @@ mod tests {
     // to direct dialing or unauthenticated proxy access.
 
     #[test]
-    fn tls_and_socks_proxies_are_fatal() {
-        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+    fn non_http_proxy_schemes_are_fatal() {
+        for url in ["socks5://proxy:1080", "ftp://proxy:21"] {
             let err = config_from(&[(HTTPS_PROXY, url)]).unwrap_err();
             assert!(err.contains(HTTPS_PROXY), "{err}");
             assert!(err.contains("scheme"), "{err}");
         }
+    }
+
+    /// Without a pinned CA the hop would fall back to whatever roots happen to
+    /// be present, so the operator would believe the proxy is authenticated
+    /// while any publicly-trusted certificate for that name could terminate it.
+    #[test]
+    fn an_https_proxy_without_a_ca_is_fatal() {
+        let err = config_from(&[(HTTPS_PROXY, "https://proxy:3128")]).unwrap_err();
+        assert!(err.contains(ARG_PROXY_CA), "{err}");
+    }
+
+    /// TLS material on an http:// proxy would be silently ignored, leaving the
+    /// hop unauthenticated cleartext while the argv says otherwise.
+    #[test]
+    fn proxy_tls_material_without_an_https_proxy_is_fatal() {
+        for arg in [ARG_PROXY_CA, ARG_PROXY_CLIENT_CERT, ARG_PROXY_CLIENT_KEY] {
+            let err = config_from(&[(HTTPS_PROXY, "http://proxy:3128"), (arg, "/tmp/x.pem")])
+                .unwrap_err();
+            assert!(err.contains(arg), "{err}");
+        }
+    }
+
+    /// Half a client identity cannot authenticate anything, and silently
+    /// dropping it would leave the proxy unable to tell this caller apart.
+    #[test]
+    fn a_partial_client_identity_is_fatal() {
+        let ca = write_temp_pem(&test_ca_pem());
+        let ca_path = ca.path().to_str().unwrap().to_string();
+        for arg in [ARG_PROXY_CLIENT_CERT, ARG_PROXY_CLIENT_KEY] {
+            let err = config_from(&[
+                (HTTPS_PROXY, "https://proxy:3128"),
+                (ARG_PROXY_CA, &ca_path),
+                (arg, "/tmp/x.pem"),
+            ])
+            .unwrap_err();
+            assert!(
+                err.contains(ARG_PROXY_CLIENT_CERT) && err.contains(ARG_PROXY_CLIENT_KEY),
+                "{err}"
+            );
+        }
+    }
+
+    /// A readable file with no certificate in it builds a config that trusts
+    /// nothing; failing at startup beats failing on the first CONNECT.
+    #[test]
+    fn an_empty_ca_bundle_is_fatal() {
+        let ca = write_temp_pem("not a certificate\n");
+        let err = config_from(&[
+            (HTTPS_PROXY, "https://proxy:3128"),
+            (ARG_PROXY_CA, ca.path().to_str().unwrap()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("no certificates"), "{err}");
+    }
+
+    #[test]
+    fn an_https_proxy_with_a_ca_configures_tls() {
+        let ca = write_temp_pem(&test_ca_pem());
+        let config = config_from(&[
+            (HTTPS_PROXY, "https://proxy:3128"),
+            (ARG_PROXY_CA, ca.path().to_str().unwrap()),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(config.https.tls.is_some());
     }
 
     #[test]
@@ -1541,6 +1871,78 @@ mod tests {
 
     // -- CONNECT handshake --
 
+    /// The whole point of an https:// proxy: the CONNECT rides inside TLS the
+    /// proxy authenticated itself for, rather than being handed to whatever
+    /// answered on the address.
+    #[tokio::test]
+    async fn connect_via_an_https_proxy_completes_inside_tls() {
+        use crate::l7::tls;
+
+        const PROXY_HOSTNAME: &str = "sandbox-egress.example.test";
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca = tls::SandboxCa::generate().unwrap();
+        let ca_file = write_temp_pem(ca.cert_pem());
+        let (addr, handle) = fake_tls_proxy(
+            ca,
+            PROXY_HOSTNAME,
+            "HTTP/1.1 200 Connection Established\r\n\r\n",
+        )
+        .await;
+
+        let proxy_tls =
+            build_proxy_tls(PROXY_HOSTNAME, ca_file.path().to_str().unwrap(), None, None).unwrap();
+        let mut endpoint = endpoint_for(addr, None);
+        endpoint.tls = Some(proxy_tls);
+
+        let target = "93.184.216.34".parse().unwrap();
+        connect_via(&endpoint, "example.com", 443, ConnectTarget::Ip(target))
+            .await
+            .expect("CONNECT through the TLS proxy should succeed");
+
+        let request = handle.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT 93.184.216.34:443"),
+            "{request}"
+        );
+    }
+
+    /// An impostor answering on the proxy's address must not get the tunnel:
+    /// it would egress from somewhere nobody chose while every layer below
+    /// reported success.
+    #[tokio::test]
+    async fn connect_via_an_https_proxy_refuses_an_untrusted_certificate() {
+        use crate::l7::tls;
+
+        const PROXY_HOSTNAME: &str = "sandbox-egress.example.test";
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // The proxy presents a leaf from one CA; the client pins a different
+        // one, which is what an impostor on the address looks like.
+        let served_by = tls::SandboxCa::generate().unwrap();
+        let pinned = tls::SandboxCa::generate().unwrap();
+        let ca_file = write_temp_pem(pinned.cert_pem());
+        let (addr, _handle) = fake_tls_proxy(
+            served_by,
+            PROXY_HOSTNAME,
+            "HTTP/1.1 200 Connection Established\r\n\r\n",
+        )
+        .await;
+
+        let proxy_tls =
+            build_proxy_tls(PROXY_HOSTNAME, ca_file.path().to_str().unwrap(), None, None).unwrap();
+        let mut endpoint = endpoint_for(addr, None);
+        endpoint.tls = Some(proxy_tls);
+
+        let target = "93.184.216.34".parse().unwrap();
+        let result = connect_via(&endpoint, "example.com", 443, ConnectTarget::Ip(target)).await;
+
+        assert!(
+            result.is_err(),
+            "a certificate outside the pinned CA must not yield a tunnel"
+        );
+    }
+
     async fn fake_proxy(response: &'static str) -> (SocketAddr, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1553,11 +1955,41 @@ mod tests {
         (addr, handle)
     }
 
+    /// A proxy that terminates TLS with a leaf signed by `ca`, then answers
+    /// one CONNECT. Stands in for the egress service.
+    async fn fake_tls_proxy(
+        ca: crate::l7::tls::SandboxCa,
+        hostname: &'static str,
+        response: &'static str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>) {
+        use crate::l7::tls;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(tls::ProxyTlsState::new(
+            tls::CertCache::new(ca),
+            tls::build_upstream_client_config(""),
+        ));
+        let handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let Ok(mut server) = tls::tls_terminate_client(socket, &state, hostname).await else {
+                // A client that refused the certificate never sends a request.
+                return String::new();
+            };
+            let request = read_request(&mut server).await;
+            server.write_all(response.as_bytes()).await.unwrap();
+
+            request
+        });
+        (addr, handle)
+    }
+
     fn endpoint_for(addr: SocketAddr, auth: Option<&str>) -> ProxyEndpoint {
         ProxyEndpoint {
             host: addr.ip().to_string(),
             port: addr.port(),
             proxy_authorization: auth.map(str::to_string),
+            tls: None,
         }
     }
 
@@ -1588,7 +2020,7 @@ mod tests {
     }
 
     /// Read one request's header block from a fake-proxy socket.
-    async fn read_request(socket: &mut TcpStream) -> String {
+    async fn read_request<S: AsyncRead + AsyncWrite + Unpin>(socket: &mut S) -> String {
         let mut buf = vec![0u8; 4096];
         let mut used = 0;
         loop {
@@ -1867,7 +2299,8 @@ mod tests {
         let dialed = connect.await.unwrap();
 
         accepted.write_all(b" from-socket").await.unwrap();
-        let mut stream = PrefixedStream::new(dialed, b"from-prefix".to_vec());
+        let mut stream =
+            PrefixedStream::new(ProxyTransport::Plain(dialed), b"from-prefix".to_vec());
         let mut out = vec![0u8; "from-prefix from-socket".len()];
         stream.read_exact(&mut out).await.unwrap();
         assert_eq!(out, b"from-prefix from-socket");
