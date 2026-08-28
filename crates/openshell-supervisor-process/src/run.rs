@@ -107,7 +107,7 @@ pub async fn run_process(
     // tasks. By this point the orchestrator has finished privileged startup
     // helpers (network namespace setup, nftables probes via run_networking),
     // and the SSH listener and entrypoint child have not been exposed yet.
-    crate::sandbox::apply_supervisor_startup_hardening()?;
+    crate::sandbox::apply_supervisor_startup_hardening(policy.allow_nested_container_runtime)?;
 
     // Spawn the bypass detection monitor. It tails dmesg for nftables LOG
     // entries fired by rules installed on the workload's network namespace
@@ -600,6 +600,7 @@ mod tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            allow_nested_container_runtime: false,
         }
     }
 

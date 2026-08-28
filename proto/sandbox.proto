@@ -31,6 +31,20 @@ message SandboxPolicy {
   // policy-local names. At most 10 configs are accepted, and at most 10 stages
   // can be selected per request.
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
+  // Opt-in "nested container runtime" sandbox class.
+  //
+  // When true, the seccomp filter permits the syscalls an unprivileged,
+  // in-userns container runtime (e.g. rootless dockerd / runc) needs to start:
+  // user-namespace creation (CLONE_NEWUSER via unshare/clone/clone3) and the
+  // mount family (mount/fsopen/.../move_mount/open_tree), plus setns and
+  // pivot_root/umount2. This is a headline relaxation of the sandbox's escape
+  // protections and MUST default to false: every default sandbox keeps the
+  // full filter. Only an explicitly-provisioned eval class sets it. See the
+  // Stage-3 research doc in the mono repo for what this does and does not
+  // enable (it is necessary but not sufficient to run multi-uid images such as
+  // postgres, which additionally require a uid-0 + capability pod posture that
+  // this seccomp field does not grant).
+  bool allow_nested_container_runtime = 7;
 }
 
 // Filesystem access policy.

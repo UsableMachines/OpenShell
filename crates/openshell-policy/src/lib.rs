@@ -789,6 +789,9 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         }),
         network_policies,
         network_middlewares,
+        // Nested container-runtime class is derived from policy YAML defaults;
+        // not surfaced through this raw-file path, so it stays off here.
+        allow_nested_container_runtime: false,
     })
 }
 
@@ -1081,6 +1084,8 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         }),
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
+        // The restrictive default keeps every sandbox-escape protection.
+        allow_nested_container_runtime: false,
     }
 }
 
@@ -2358,6 +2363,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            allow_nested_container_runtime: false,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2808,6 +2814,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            allow_nested_container_runtime: false,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2824,6 +2831,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            allow_nested_container_runtime: false,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2903,6 +2911,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            allow_nested_container_runtime: false,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }

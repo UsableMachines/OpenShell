@@ -1724,6 +1724,7 @@ mod baseline_tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            allow_nested_container_runtime: false,
         };
 
         enrich_sandbox_baseline_paths(&mut policy);
@@ -1893,6 +1894,7 @@ async fn load_policy(
             },
             landlock: config.landlock,
             process: config.process,
+            allow_nested_container_runtime: false,
         };
         enrich_sandbox_baseline_paths(&mut policy);
         // File mode has no operator-registered middleware to connect.
@@ -3142,6 +3144,7 @@ mod tests {
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
+            allow_nested_container_runtime: false,
         }
     }
 

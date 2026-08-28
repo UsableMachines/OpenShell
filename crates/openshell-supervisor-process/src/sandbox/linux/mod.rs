@@ -58,8 +58,12 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
 }
 
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
-pub fn apply_supervisor_prelude() -> Result<()> {
-    seccomp::apply_supervisor_prelude()
+///
+/// `allow_nested` opts this supervisor into the nested container-runtime class,
+/// which omits the mount-family block from the prelude so the workload children
+/// forked from this supervisor can mount (they inherit the prelude filter).
+pub fn apply_supervisor_prelude(allow_nested: bool) -> Result<()> {
+    seccomp::apply_supervisor_prelude(allow_nested)
 }
 
 /// Legacy single-phase apply. Kept for backward compatibility.

@@ -1550,6 +1550,7 @@ mod tests {
             network: NetworkPolicy::default(),
             landlock: LandlockPolicy::default(),
             process,
+            allow_nested_container_runtime: false,
         }
     }
 
@@ -1991,6 +1992,7 @@ mod tests {
                 run_as_user,
                 run_as_group,
             },
+            allow_nested_container_runtime: false,
         }
     }
 

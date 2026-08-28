@@ -18,6 +18,14 @@ pub struct SandboxPolicy {
     pub network: NetworkPolicy,
     pub landlock: LandlockPolicy,
     pub process: ProcessPolicy,
+
+    /// Opt-in "nested container runtime" sandbox class.
+    ///
+    /// When true, the seccomp filter permits the user-namespace and mount
+    /// syscalls an unprivileged in-userns container runtime needs to start
+    /// (see [`crate::proto`] `SandboxPolicy.allow_nested_container_runtime`).
+    /// Defaults to false so every default sandbox keeps the full filter.
+    pub allow_nested_container_runtime: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +124,7 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
             network,
             landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
+            allow_nested_container_runtime: proto.allow_nested_container_runtime,
         })
     }
 }

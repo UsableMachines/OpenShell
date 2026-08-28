@@ -503,6 +503,7 @@ mod tests {
                 compatibility: LandlockCompatibility::HardRequirement,
             },
             process: ProcessPolicy::default(),
+            allow_nested_container_runtime: false,
         }
     }
 

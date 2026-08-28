@@ -43,15 +43,22 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
 }
 
 /// Apply seccomp hardening for the long-lived supervisor process itself.
+///
+/// `allow_nested` opts into the nested container-runtime sandbox class (see
+/// [`openshell_core::policy::SandboxPolicy::allow_nested_container_runtime`]),
+/// which relaxes the prelude's mount-family block so workload children can run
+/// an unprivileged in-userns container runtime. Defaults to the fully hardened
+/// prelude for every other sandbox.
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
-pub fn apply_supervisor_startup_hardening() -> Result<()> {
+pub fn apply_supervisor_startup_hardening(allow_nested: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        linux::apply_supervisor_prelude()
+        linux::apply_supervisor_prelude(allow_nested)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = allow_nested;
         Ok(())
     }
 }

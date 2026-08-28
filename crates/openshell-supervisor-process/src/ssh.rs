@@ -1667,6 +1667,7 @@ mod tests {
                 run_as_user: Some("1000".into()),
                 run_as_group: None,
             },
+            allow_nested_container_runtime: false,
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "1000");
@@ -1688,6 +1689,7 @@ mod tests {
                 run_as_user: Some("sandbox".into()),
                 run_as_group: None,
             },
+            allow_nested_container_runtime: false,
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
@@ -1709,6 +1711,7 @@ mod tests {
                 run_as_user: Some(String::new()),
                 run_as_group: None,
             },
+            allow_nested_container_runtime: false,
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
@@ -1729,6 +1732,7 @@ mod tests {
                 run_as_user: None,
                 run_as_group: None,
             },
+            allow_nested_container_runtime: false,
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
@@ -1749,6 +1753,7 @@ mod tests {
                 run_as_user: Some("1000660000".into()),
                 run_as_group: None,
             },
+            allow_nested_container_runtime: false,
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "1000660000");
@@ -1778,6 +1783,7 @@ mod tests {
                 run_as_user: None,
                 run_as_group: None,
             },
+            allow_nested_container_runtime: false,
         };
 
         // Skip if running as root: drop_privileges would try to switch to
@@ -1808,6 +1814,7 @@ mod tests {
                             run_as_user: None,
                             run_as_group: None,
                         },
+                        allow_nested_container_runtime: false,
                     },
                     None,
                 )
