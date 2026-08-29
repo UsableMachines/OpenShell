@@ -62,8 +62,8 @@ use libc::SYS_kexec_file_load;
 /// filter across all supervisor threads via TSYNC. It intentionally blocks
 /// only the privileged escape primitives that the long-lived supervisor no
 /// longer needs once bootstrap is complete.
-pub fn apply_supervisor_prelude() -> Result<()> {
-    let filter = build_supervisor_prelude_filter()?;
+pub fn apply_supervisor_prelude(allow_nested: bool) -> Result<()> {
+    let filter = build_supervisor_prelude_filter(allow_nested)?;
     set_no_new_privs()?;
     apply_filter_all_threads(&filter).into_diagnostic()?;
     Ok(())
@@ -71,40 +71,67 @@ pub fn apply_supervisor_prelude() -> Result<()> {
 
 pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
-    let main_filter = build_filter(allow_inet)?;
-    let clone3_filter = build_clone3_filter()?;
+    // Opt-in "nested container runtime" class: permit the user-namespace and
+    // mount syscalls a rootless in-userns container runtime needs. False for
+    // every default sandbox, so the default filter is byte-for-byte unchanged.
+    let allow_nested = policy.allow_nested_container_runtime;
+    let main_filter = build_filter(allow_inet, allow_nested)?;
 
     set_no_new_privs()?;
-    apply_runtime_filters(&main_filter, &clone3_filter)?;
+
+    if allow_nested {
+        // The nested-runtime class must let clone3 through unfiltered so
+        // runtimes that call clone3(CLONE_NEWUSER) directly (runc, glibc >=
+        // 2.34) can create user namespaces. The default class still forces the
+        // clone3->ENOSYS fallback so CLONE_NEWUSER can be filtered on clone.
+        apply_filter(main_filter.as_ref()).into_diagnostic()?;
+    } else {
+        let clone3_filter = build_clone3_filter()?;
+        apply_runtime_filters(&main_filter, &clone3_filter)?;
+    }
 
     Ok(())
 }
 
-fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
-    let rules = build_filter_rules(allow_inet)?;
+fn build_filter(allow_inet: bool, allow_nested: bool) -> Result<seccompiler::BpfProgram> {
+    let rules = build_filter_rules(allow_inet, allow_nested)?;
     compile_filter(rules, SeccompAction::Errno(libc::EPERM as u32))
 }
 
-fn build_supervisor_prelude_filter() -> Result<seccompiler::BpfProgram> {
+fn build_supervisor_prelude_filter(allow_nested: bool) -> Result<seccompiler::BpfProgram> {
     compile_filter(
-        build_supervisor_prelude_rules(),
+        build_supervisor_prelude_rules(allow_nested),
         SeccompAction::Errno(libc::EPERM as u32),
     )
 }
 
-fn build_supervisor_prelude_rules() -> BTreeMap<i64, Vec<SeccompRule>> {
+fn build_supervisor_prelude_rules(allow_nested: bool) -> BTreeMap<i64, Vec<SeccompRule>> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
+    // The mount family is blocked here on the long-lived supervisor, and the
+    // workload children it forks inherit this filter — so for the nested
+    // container-runtime class the mount block must be omitted from the prelude
+    // too, not just from the per-workload filter (a seccomp filter can only add
+    // restrictions, never lift an ancestor's). The default class keeps it.
+    if !allow_nested {
+        for syscall in [
+            libc::SYS_mount,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_fspick,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
+            libc::SYS_pivot_root,
+            libc::SYS_umount2,
+        ] {
+            rules.entry(syscall).or_default();
+        }
+    }
+
+    // These stay blocked for every class: none are needed by a container
+    // runtime, and they are kernel-exploit / module-load primitives.
     for syscall in [
-        libc::SYS_mount,
-        libc::SYS_fsopen,
-        libc::SYS_fsconfig,
-        libc::SYS_fsmount,
-        libc::SYS_fspick,
-        libc::SYS_move_mount,
-        libc::SYS_open_tree,
-        libc::SYS_pivot_root,
-        libc::SYS_umount2,
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
         libc::SYS_userfaultfd,
@@ -181,7 +208,10 @@ fn apply_runtime_filters(
     Ok(())
 }
 
-fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+fn build_filter_rules(
+    allow_inet: bool,
+    allow_nested: bool,
+) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // --- Socket domain blocks ---
@@ -233,24 +263,39 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     rules.entry(libc::SYS_pidfd_send_signal).or_default();
     // Async I/O subsystem with extensive CVE history.
     rules.entry(libc::SYS_io_uring_setup).or_default();
-    // Filesystem mount could subvert Landlock or overlay writable paths.
-    rules.entry(libc::SYS_mount).or_default();
-    // New mount API syscalls (Linux 5.2+) bypass the SYS_mount block entirely.
-    rules.entry(libc::SYS_fsopen).or_default();
-    rules.entry(libc::SYS_fsconfig).or_default();
-    rules.entry(libc::SYS_fsmount).or_default();
-    rules.entry(libc::SYS_fspick).or_default();
-    rules.entry(libc::SYS_move_mount).or_default();
-    rules.entry(libc::SYS_open_tree).or_default();
-    // Namespace manipulation — setns enters existing namespaces, pivot_root/umount2
-    // change the filesystem root. The supervisor calls setns before seccomp is applied,
-    // so blocking it here is safe.
-    rules.entry(libc::SYS_setns).or_default();
-    rules.entry(libc::SYS_umount2).or_default();
-    rules.entry(libc::SYS_pivot_root).or_default();
+
+    // --- Mount / namespace family ---
+    //
+    // These are the escape primitives an in-userns container runtime (rootless
+    // dockerd, runc) genuinely needs: mounting overlay/proc/tmpfs for each
+    // container, entering namespaces (setns, e.g. `docker exec`), and swapping
+    // the container root (pivot_root). They are blocked for every DEFAULT
+    // sandbox and permitted ONLY for the opt-in nested-runtime class. The
+    // relaxation is contained by the rest of the sandbox: capabilities are
+    // dropped, the process runs in the sandbox network namespace behind the
+    // egress proxy, and (for the DEFAULT class) `no_new_privs` + a single-uid
+    // map still bound what a userns can do.
+    if !allow_nested {
+        // Filesystem mount could subvert Landlock or overlay writable paths.
+        rules.entry(libc::SYS_mount).or_default();
+        // New mount API syscalls (Linux 5.2+) bypass the SYS_mount block entirely.
+        rules.entry(libc::SYS_fsopen).or_default();
+        rules.entry(libc::SYS_fsconfig).or_default();
+        rules.entry(libc::SYS_fsmount).or_default();
+        rules.entry(libc::SYS_fspick).or_default();
+        rules.entry(libc::SYS_move_mount).or_default();
+        rules.entry(libc::SYS_open_tree).or_default();
+        // Namespace manipulation — setns enters existing namespaces, pivot_root/umount2
+        // change the filesystem root. The supervisor calls setns before seccomp is applied,
+        // so blocking it here is safe.
+        rules.entry(libc::SYS_setns).or_default();
+        rules.entry(libc::SYS_umount2).or_default();
+        rules.entry(libc::SYS_pivot_root).or_default();
+    }
+
     // Kernel exploit primitives: userfaultfd enables race-condition exploitation (multiple
     // CVEs), perf_event_open enables Spectre-class side channels. Both blocked by Docker's
-    // default seccomp profile.
+    // default seccomp profile. Kept blocked for every class.
     rules.entry(libc::SYS_userfaultfd).or_default();
     rules.entry(libc::SYS_perf_event_open).or_default();
 
@@ -264,22 +309,28 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
         libc::AT_EMPTY_PATH as u64,
     )?;
 
-    // unshare with CLONE_NEWUSER allows creating user namespaces to escalate privileges.
-    add_masked_arg_rule(
-        &mut rules,
-        libc::SYS_unshare,
-        0, // flags argument
-        libc::CLONE_NEWUSER as u64,
-    )?;
+    // CLONE_NEWUSER creates a user namespace. Blocked (on both unshare and
+    // clone, plus clone3 via ENOSYS in apply()) for every DEFAULT sandbox; the
+    // nested-runtime class permits it so a rootless runtime can build the
+    // container's userns.
+    if !allow_nested {
+        // unshare with CLONE_NEWUSER allows creating user namespaces to escalate privileges.
+        add_masked_arg_rule(
+            &mut rules,
+            libc::SYS_unshare,
+            0, // flags argument
+            libc::CLONE_NEWUSER as u64,
+        )?;
 
-    // clone with CLONE_NEWUSER achieves the same as unshare via a different syscall.
-    add_masked_arg_rule(
-        &mut rules,
-        libc::SYS_clone,
-        0, // flags argument
-        libc::CLONE_NEWUSER as u64,
-    )?;
-    // clone3 is handled by a separate filter — see build_clone3_filter().
+        // clone with CLONE_NEWUSER achieves the same as unshare via a different syscall.
+        add_masked_arg_rule(
+            &mut rules,
+            libc::SYS_clone,
+            0, // flags argument
+            libc::CLONE_NEWUSER as u64,
+        )?;
+        // clone3 is handled by a separate filter — see build_clone3_filter().
+    }
 
     // seccomp(SECCOMP_SET_MODE_FILTER) would let sandboxed code replace the active filter.
     let condition = SeccompCondition::new(
@@ -379,22 +430,22 @@ mod tests {
 
     #[test]
     fn build_filter_proxy_mode_compiles() {
-        let filter = build_filter(true);
-        assert!(filter.is_ok(), "build_filter(true) should succeed");
+        let filter = build_filter(true, false);
+        assert!(filter.is_ok(), "build_filter(true, false) should succeed");
     }
 
     #[test]
     fn build_filter_block_mode_compiles() {
-        let filter = build_filter(false);
-        assert!(filter.is_ok(), "build_filter(false) should succeed");
+        let filter = build_filter(false, false);
+        assert!(filter.is_ok(), "build_filter(false, false) should succeed");
     }
 
     #[test]
     fn build_supervisor_prelude_filter_compiles() {
-        let filter = build_supervisor_prelude_filter();
+        let filter = build_supervisor_prelude_filter(false);
         assert!(
             filter.is_ok(),
-            "build_supervisor_prelude_filter() should succeed"
+            "build_supervisor_prelude_filter(false) should succeed"
         );
     }
 
@@ -417,7 +468,7 @@ mod tests {
     #[test]
     fn unconditional_blocks_present_in_filter() {
         // Build a real filter and verify all unconditional blocks are present.
-        let filter_rules = build_filter_rules(true).unwrap();
+        let filter_rules = build_filter_rules(true, false).unwrap();
 
         // Unconditional blocks have an empty Vec (no conditions = always match).
         let expected = [
@@ -460,7 +511,7 @@ mod tests {
     fn conditional_blocks_have_rules() {
         // Build a real filter and verify the conditional syscalls have rule entries
         // (non-empty Vec means conditional match).
-        let filter_rules = build_filter_rules(true).unwrap();
+        let filter_rules = build_filter_rules(true, false).unwrap();
 
         for syscall in [
             libc::SYS_execveat,
@@ -485,7 +536,7 @@ mod tests {
         // AF_NETLINK+non-ROUTE filter), but it must NOT be an unconditional block
         // (empty Vec). An empty Vec would block ALL socket() calls, including
         // socket(AF_NETLINK, *, NETLINK_ROUTE=0) which getifaddrs(3) needs.
-        let filter_rules = build_filter_rules(true).unwrap();
+        let filter_rules = build_filter_rules(true, false).unwrap();
 
         assert!(
             filter_rules.contains_key(&libc::SYS_socket),
@@ -502,7 +553,7 @@ mod tests {
 
     #[test]
     fn supervisor_prelude_blocks_expected_syscalls() {
-        let filter_rules = build_supervisor_prelude_rules();
+        let filter_rules = build_supervisor_prelude_rules(false);
 
         for syscall in [
             libc::SYS_mount,
@@ -536,7 +587,7 @@ mod tests {
 
     #[test]
     fn supervisor_prelude_keeps_required_setup_syscalls_available() {
-        let filter_rules = build_supervisor_prelude_rules();
+        let filter_rules = build_supervisor_prelude_rules(false);
 
         for syscall in [
             libc::SYS_setns,
@@ -560,11 +611,122 @@ mod tests {
     #[test]
     fn clone3_not_in_main_filter() {
         // clone3 must NOT be in the main filter; it has its own ENOSYS filter.
-        let filter_rules = build_filter_rules(true).unwrap();
+        let filter_rules = build_filter_rules(true, false).unwrap();
         assert!(
             !filter_rules.contains_key(&libc::SYS_clone3),
             "clone3 should not be in the main filter — it uses a separate ENOSYS filter"
         );
+    }
+
+    // --- Nested container-runtime class (opt-in) ---
+    //
+    // The syscalls the opt-in class relaxes. If any of these ever needs to move
+    // between "relaxed" and "kept", it must be a deliberate, reviewed change.
+    const NESTED_RELAXED_SYSCALLS: &[i64] = &[
+        libc::SYS_mount,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_setns,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_unshare, // CLONE_NEWUSER conditional
+        libc::SYS_clone,   // CLONE_NEWUSER conditional
+    ];
+
+    #[test]
+    fn default_class_blocks_all_nested_relaxed_syscalls() {
+        // Q4: the DEFAULT sandbox (allow_nested = false) keeps every one of the
+        // syscalls the opt-in class relaxes. This is the "default is unchanged"
+        // guard — it must never regress when the opt-in path is edited.
+        let rules = build_filter_rules(true, false).unwrap();
+        for &syscall in NESTED_RELAXED_SYSCALLS {
+            assert!(
+                rules.contains_key(&syscall),
+                "default sandbox must still block syscall {syscall}"
+            );
+        }
+        // And the prelude default keeps the mount family.
+        let prelude = build_supervisor_prelude_rules(false);
+        for syscall in [libc::SYS_mount, libc::SYS_pivot_root, libc::SYS_umount2] {
+            assert!(
+                prelude.contains_key(&syscall),
+                "default supervisor prelude must still block syscall {syscall}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_class_relaxes_only_userns_and_mount() {
+        // The opt-in class drops exactly the namespace/mount syscalls...
+        let rules = build_filter_rules(true, true).unwrap();
+        for &syscall in NESTED_RELAXED_SYSCALLS {
+            assert!(
+                !rules.contains_key(&syscall),
+                "nested-runtime class must NOT block syscall {syscall}"
+            );
+        }
+        // ...and keeps every other sandbox-escape protection blocked.
+        for syscall in [
+            libc::SYS_memfd_create,
+            libc::SYS_ptrace,
+            libc::SYS_bpf,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+            libc::SYS_pidfd_open,
+            libc::SYS_pidfd_getfd,
+            libc::SYS_pidfd_send_signal,
+            libc::SYS_io_uring_setup,
+            libc::SYS_userfaultfd,
+            libc::SYS_perf_event_open,
+            libc::SYS_execveat,
+            libc::SYS_seccomp,
+        ] {
+            assert!(
+                rules.contains_key(&syscall),
+                "nested-runtime class must still block syscall {syscall}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_class_prelude_relaxes_mount_but_keeps_kernel_primitives() {
+        let prelude = build_supervisor_prelude_rules(true);
+        for syscall in [
+            libc::SYS_mount,
+            libc::SYS_fsopen,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
+            libc::SYS_pivot_root,
+            libc::SYS_umount2,
+        ] {
+            assert!(
+                !prelude.contains_key(&syscall),
+                "nested-runtime prelude must NOT block mount-family syscall {syscall}"
+            );
+        }
+        for syscall in [
+            libc::SYS_bpf,
+            libc::SYS_perf_event_open,
+            libc::SYS_userfaultfd,
+            libc::SYS_init_module,
+            libc::SYS_kexec_load,
+        ] {
+            assert!(
+                prelude.contains_key(&syscall),
+                "nested-runtime prelude must still block kernel primitive {syscall}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_and_default_filters_both_compile() {
+        assert!(build_filter(true, true).is_ok());
+        assert!(build_filter(false, true).is_ok());
+        assert!(build_supervisor_prelude_filter(true).is_ok());
     }
 
     // --- Behavioral tests ---
@@ -623,37 +785,37 @@ mod tests {
 
     #[test]
     fn behavioral_memfd_create_blocked() {
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         unsafe { assert_blocked_in_child(&filter, libc::SYS_memfd_create, libc::EPERM) };
     }
 
     #[test]
     fn behavioral_ptrace_blocked() {
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         unsafe { assert_blocked_in_child(&filter, libc::SYS_ptrace, libc::EPERM) };
     }
 
     #[test]
     fn behavioral_process_vm_writev_blocked() {
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         unsafe { assert_blocked_in_child(&filter, libc::SYS_process_vm_writev, libc::EPERM) };
     }
 
     #[test]
     fn behavioral_userfaultfd_blocked() {
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         unsafe { assert_blocked_in_child(&filter, libc::SYS_userfaultfd, libc::EPERM) };
     }
 
     #[test]
     fn behavioral_perf_event_open_blocked() {
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         unsafe { assert_blocked_in_child(&filter, libc::SYS_perf_event_open, libc::EPERM) };
     }
 
     #[test]
     fn behavioral_setns_blocked() {
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         unsafe { assert_blocked_in_child(&filter, libc::SYS_setns, libc::EPERM) };
     }
 
@@ -663,7 +825,7 @@ mod tests {
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe {
-                if let Err(err) = apply_supervisor_prelude() {
+                if let Err(err) = apply_supervisor_prelude(false) {
                     let msg = format!("failed to install supervisor prelude: {err}\n");
                     libc::write(2, msg.as_ptr().cast(), msg.len());
                     libc::_exit(1);
@@ -701,7 +863,7 @@ mod tests {
     fn behavioral_clone3_returns_enosys() {
         // clone3 uses a separate filter that returns ENOSYS (not EPERM) so
         // glibc falls back to clone.
-        let main_filter = build_filter(true).unwrap();
+        let main_filter = build_filter(true, false).unwrap();
         let clone3_filter = build_clone3_filter().unwrap();
         // Apply in the same order as apply(): clone3 filter first, main filter second.
         let pid = unsafe { libc::fork() };
@@ -730,7 +892,7 @@ mod tests {
 
     #[test]
     fn behavioral_third_filter_install_blocked_after_startup() {
-        let main_filter = build_filter(true).unwrap();
+        let main_filter = build_filter(true, false).unwrap();
         let clone3_filter = build_clone3_filter().unwrap();
         let third_filter = build_clone3_filter().unwrap();
 
@@ -772,7 +934,7 @@ mod tests {
     fn behavioral_netlink_route_allowed() {
         // socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE=0) must succeed (not blocked).
         // This is the call getifaddrs(3) makes on Linux to enumerate interfaces.
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -807,7 +969,7 @@ mod tests {
         // socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG=4) must be blocked.
         // NETLINK_SOCK_DIAG is representative of non-ROUTE netlink protocols
         // that have no legitimate use inside the sandbox.
-        let filter = build_filter(true).unwrap();
+        let filter = build_filter(true, false).unwrap();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
