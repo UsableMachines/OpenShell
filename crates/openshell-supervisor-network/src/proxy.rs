@@ -1764,6 +1764,7 @@ async fn handle_tcp_connection(
             agent_proposals,
             trusted_host_gateway,
             provider_credentials,
+            upstream_proxy,
             secret_resolver,
             dynamic_credentials,
             denial_tx.as_ref(),
@@ -4826,6 +4827,7 @@ async fn handle_forward_proxy(
     agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     provider_credentials: Option<ProviderCredentialState>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
         Arc<
@@ -4850,6 +4852,10 @@ async fn handle_forward_proxy(
     let raw_host = host;
     let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
+    // Absolute form, trailing dot intact. `proxy_connect_by_hostname` sends
+    // the name to the proxy, where the dot is significant; the CONNECT path
+    // pairs the two the same way.
+    let raw_host_lc = raw_host.to_ascii_lowercase();
 
     if host_lc == POLICY_LOCAL_HOST {
         if scheme != "http" || port != 80 {
@@ -5927,12 +5933,26 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
-    // Plain-HTTP requests dial the destination directly: only TLS (CONNECT)
-    // tunnels chain through the corporate proxy, since plain-HTTP forwarding
-    // would need absolute-form requests rather than a CONNECT tunnel. Dial
-    // only after every local authorization and transformation step so a
-    // rejected WebSocket preflight cannot contact the destination.
-    let dial_result = connector.connect().await;
+    // Connect upstream, through the corporate proxy when one applies to this
+    // destination. Chaining plain HTTP does not need the proxy to forward
+    // absolute-form requests: the tunnel it opens for CONNECT carries any
+    // bytes, so the origin-form request rewritten above travels down it
+    // exactly as it would down a direct socket. `NO_PROXY` is evaluated per
+    // destination, so cluster-internal HTTP keeps dialling directly.
+    //
+    // Policy, SSRF validation and the rewrite all run before this point and
+    // cannot tell which dial follows, so a proxied request is evaluated
+    // exactly as a direct one is. Dial only after every local authorization
+    // and transformation step so a rejected WebSocket preflight cannot
+    // contact the destination.
+    let dial_result = dial_upstream(
+        &upstream_proxy,
+        &host_lc,
+        &raw_host_lc,
+        port,
+        connector.addrs(),
+    )
+    .await;
     let mut upstream = match dial_result {
         Ok(s) => s,
         Err(e) => {
@@ -6643,6 +6663,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 None,
+                Arc::new(None),
                 None,
                 None,
                 None,
@@ -6776,6 +6797,7 @@ network_policies:
                 AgentProposals::default(),
                 Arc::new(None),
                 None,
+                Arc::new(None),
                 None,
                 None,
                 None,
