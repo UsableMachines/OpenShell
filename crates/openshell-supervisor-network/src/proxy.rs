@@ -894,6 +894,7 @@ async fn handle_tcp_connection(
             policy_local_ctx,
             agent_proposals,
             trusted_host_gateway,
+            upstream_proxy,
             secret_resolver,
             dynamic_credentials,
             denial_tx.as_ref(),
@@ -3804,6 +3805,7 @@ async fn handle_forward_proxy(
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
         Arc<
@@ -4842,11 +4844,20 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    // 6. Connect upstream. Plain-HTTP requests always dial the destination
-    //    directly: only TLS (CONNECT) tunnels chain through the corporate
-    //    proxy, since plain-HTTP forwarding would need absolute-form requests
-    //    rather than a CONNECT tunnel.
-    let dial_result = TcpStream::connect(addrs.as_slice()).await;
+    // 6. Connect upstream, through the corporate proxy when one is configured
+    //    for this destination. Chaining plain HTTP does not require the proxy
+    //    to forward absolute-form requests: the tunnel it opens for CONNECT
+    //    carries any bytes, so the origin-form request rewritten above goes
+    //    down it exactly as it would down a direct socket. Both dials are
+    //    already the same shape here, which is what lets this be the one line
+    //    that differs between them.
+    //
+    //    Everything above still applies unchanged -- policy, SSRF validation
+    //    and the rewrite run before this point and do not know which dial
+    //    follows, so a proxied request is evaluated exactly as a direct one
+    //    is. `NO_PROXY` decides per destination, so a workload's traffic to
+    //    the cluster keeps dialling directly.
+    let dial_result = dial_upstream(&upstream_proxy, &host_lc, port, &addrs).await;
     let mut upstream = match dial_result {
         Ok(s) => s,
         Err(e) => {
