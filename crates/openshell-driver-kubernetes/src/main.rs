@@ -13,8 +13,8 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    KubernetesSidecarConfig, ManagedSshIngressConfig, ProvisioningMode,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -172,6 +172,30 @@ struct Args {
     #[arg(long, env = "OPENSHELL_K8S_APP_ARMOR_PROFILE")]
     app_armor_profile: Option<AppArmorProfile>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_PROVISIONING_MODE",
+        default_value = "direct"
+    )]
+    provisioning_mode: ProvisioningMode,
+
+    #[arg(long, env = "OPENSHELL_K8S_CLAIM_TEMPLATE_NAME")]
+    claim_template_name: Option<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_CLAIM_WARM_POOL_NAME",
+        default_value = "default"
+    )]
+    claim_warm_pool_name: String,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_CLAIM_SHUTDOWN_POLICY",
+        default_value = "DeleteForeground"
+    )]
+    claim_shutdown_policy: String,
+
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
     /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
@@ -272,6 +296,10 @@ async fn main() -> Result<()> {
             proxy_auth_secret_key: args.proxy_auth_secret_key,
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
+            provisioning_mode: args.provisioning_mode,
+            claim_template_name: args.claim_template_name.unwrap_or_default(),
+            claim_warm_pool_name: args.claim_warm_pool_name,
+            claim_shutdown_policy: args.claim_shutdown_policy,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

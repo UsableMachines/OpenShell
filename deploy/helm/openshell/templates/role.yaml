@@ -43,4 +43,18 @@ rules:
       - pods
     verbs:
       - get
+
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+      - sandboxclaims/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
 {{- end }}

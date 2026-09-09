@@ -7,7 +7,8 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
+    ProvisioningMode, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    is_dns_1123_label,
     managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -67,6 +68,8 @@ pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
 
 const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
+const CLAIM_OWNER_API_VERSION: &str = "extensions.agents.x-k8s.io/v1alpha1";
+const CLAIM_UID_LABEL: &str = "agents.x-k8s.io/claim-uid";
 const AGENT_SANDBOX_TRACE_CONTEXT_ANNOTATION: &str = "opentelemetry.io/trace-context";
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +123,10 @@ const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
+
+const CLAIM_GROUP: &str = "extensions.agents.x-k8s.io";
+const CLAIM_VERSION: &str = "v1alpha1";
+const CLAIM_KIND: &str = "SandboxClaim";
 const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
 const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
 const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
@@ -279,12 +286,15 @@ impl From<&KubernetesDriverVolumeMountConfig> for VolumeMount {
     }
 }
 
+const BIND_VOLUME_NAME: &str = "openshell-bind";
+const BIND_MOUNT_PATH: &str = "/var/run/openshell-bind";
 const CLIENT_TLS_VOLUME_NAME: &str = "openshell-client-tls";
 const UPSTREAM_PROXY_AUTH_VOLUME_NAME: &str = "openshell-upstream-proxy-auth";
 const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
 const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
 
 const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
+    BIND_VOLUME_NAME,
     CLIENT_TLS_VOLUME_NAME,
     UPSTREAM_PROXY_AUTH_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
@@ -420,6 +430,12 @@ fn kubernetes_driver_volume_mount_to_k8s(
 ) -> serde_json::Value {
     serde_json::to_value(VolumeMount::from(mount)).expect("VolumeMount serializes to JSON")
 }
+
+// Pod-level identity annotations. Both carry the same keys as the corresponding
+// sandbox labels; they are named separately because the Downward API projection
+// and the gateway bootstrap read them off the Pod, not off the Sandbox CR.
+const POD_SANDBOX_ID_ANNOTATION: &str = LABEL_SANDBOX_ID;
+const POD_SANDBOX_NAME_ANNOTATION: &str = LABEL_SANDBOX_NAME;
 
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
@@ -1286,6 +1302,93 @@ impl KubernetesComputeDriver {
         }
     }
 
+    fn claim_watch_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.watch_client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn claim_api(&self) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn is_claim_mode(&self) -> bool {
+        self.config.provisioning_mode == ProvisioningMode::Claim
+    }
+
+    fn validate_claim_mode_config(&self) -> Result<(), String> {
+        if self.config.claim_template_name.trim().is_empty() {
+            return Err(
+                "claim provisioning mode requires config.claim_template_name to be set".to_string(),
+            );
+        }
+        if self.config.claim_warm_pool_name.trim().is_empty() {
+            return Err(
+                "claim provisioning mode requires config.claim_warm_pool_name to be set"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_claim_mode_sandbox(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.validate_claim_mode_config()?;
+
+        let Some(spec) = sandbox.spec.as_ref() else {
+            return Ok(());
+        };
+
+        if driver_gpu_requirements(spec.resource_requirements.as_ref()).is_some() {
+            return Err(
+                "claim provisioning mode does not support gpu sandboxes; operator-managed warm pools must own GPU pool shape"
+                    .to_string(),
+            );
+        }
+
+        let Some(template) = spec.template.as_ref() else {
+            return Ok(());
+        };
+
+        if !template.image.is_empty() && template.image != self.config.default_image {
+            return Err(
+                "claim provisioning mode does not support per-sandbox template.image overrides beyond the configured default_image; operator-managed SandboxTemplate must own the image"
+                    .to_string(),
+            );
+        }
+        if !template.agent_socket_path.is_empty() {
+            return Err(
+                "claim provisioning mode does not support per-sandbox agent_socket_path"
+                    .to_string(),
+            );
+        }
+        if template.resources.is_some() {
+            return Err(
+                "claim provisioning mode does not support per-sandbox template.resources; operator-managed SandboxTemplate must own resource sizing"
+                    .to_string(),
+            );
+        }
+        if template
+            .platform_config
+            .as_ref()
+            .is_some_and(|cfg| !cfg.fields.is_empty())
+        {
+            return Err(
+                "claim provisioning mode does not support per-sandbox template.platform_config; operator-managed SandboxTemplate must own pod/runtime configuration"
+                    .to_string(),
+            );
+        }
+        if warm_pool_claim_env_is_unsafe(Some(spec)) {
+            return Err(
+                "claim provisioning mode with a warm pool does not support per-request environment injection; move startup env to the SandboxTemplate and use Pod metadata / Downward API for bind-specific identity"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
         let nodes: Api<Node> = Api::all(self.client.clone());
         let node_list = nodes.list(&ListParams::default()).await?;
@@ -1298,6 +1401,13 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        if self.is_claim_mode() {
+            self.validate_claim_mode_sandbox(sandbox)
+                .map_err(tonic::Status::failed_precondition)?;
+            validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
+            return Ok(());
+        }
+
         let _ = self
             .validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
@@ -1333,6 +1443,49 @@ impl KubernetesComputeDriver {
             workspace_mode = %self.config.workspace_mode,
             "Fetching sandbox from Kubernetes"
         );
+
+        if self.is_claim_mode() {
+            info!(
+                sandbox_id = %sandbox_id,
+                namespace = %self.config.namespace,
+                "Fetching sandbox claim from Kubernetes"
+            );
+
+            // Claims are named after the sandbox name, but callers identify
+            // sandboxes by UUID, so select on the id label the claim carries
+            // instead of fetching by object name.
+            let api = self.claim_api();
+            let selector = self.sandbox_lookup_selector(sandbox_id);
+            let lp = ListParams::default().labels(&selector);
+            return match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&lp)).await {
+                Ok(Ok(list)) => list.items.into_iter().next().map_or_else(
+                    || {
+                        debug!(sandbox_id = %sandbox_id, "Sandbox claim not found in Kubernetes");
+                        Ok(None)
+                    },
+                    |obj| claim_from_object(&self.config.namespace, obj).map(Some),
+                ),
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "Failed to fetch sandbox claim from Kubernetes"
+                    );
+                    Err(err.to_string())
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out fetching sandbox claim from Kubernetes"
+                    );
+                    Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+        }
 
         let agent_sandbox_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
@@ -1381,6 +1534,51 @@ impl KubernetesComputeDriver {
             workspace_mode = %self.config.workspace_mode,
             "Listing sandboxes from Kubernetes"
         );
+
+        if self.is_claim_mode() {
+            info!(
+                namespace = %self.config.namespace,
+                "Listing sandbox claims from Kubernetes"
+            );
+
+            let api = self.claim_api();
+            let selector = self.openshell_sandbox_selector();
+            let lp = ListParams::default().labels(&selector);
+            return match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&lp)).await {
+                Ok(Ok(list)) => {
+                    let mut sandboxes = list
+                        .items
+                        .into_iter()
+                        .map(|obj| claim_from_object(&self.config.namespace, obj))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    sandboxes.sort_by(|left, right| {
+                        left.name
+                            .cmp(&right.name)
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    Ok(sandboxes)
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        namespace = %self.config.namespace,
+                        error = %err,
+                        "Failed to list sandbox claims from Kubernetes"
+                    );
+                    Err(err.to_string())
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        namespace = %self.config.namespace,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out listing sandbox claims from Kubernetes"
+                    );
+                    Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+        }
 
         let agent_sandbox_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
@@ -1460,6 +1658,69 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     async fn create_sandbox_inner(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        if self.is_claim_mode() {
+            let name = sandbox.name.as_str();
+            info!(
+                sandbox_id = %sandbox.id,
+                sandbox_name = %name,
+                namespace = %self.config.namespace,
+                "Creating sandbox claim in Kubernetes"
+            );
+
+            self.validate_claim_mode_sandbox(sandbox)
+                .map_err(KubernetesDriverError::Precondition)?;
+
+            let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+            let resource = ApiResource::from_gvk(&gvk);
+            let kube_name = self.config.kube_resource_name(&sandbox.workspace, name);
+            let mut obj = DynamicObject::new(&kube_name, &resource);
+            obj.metadata = ObjectMeta {
+                name: Some(kube_name),
+                namespace: Some(self.config.namespace.clone()),
+                labels: Some(sandbox_labels(sandbox, Some(&self.config.gateway_id))),
+                ..Default::default()
+            };
+            obj.data = claim_to_k8s_spec(sandbox, &self.config);
+            let api = self.claim_api();
+
+            return match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.create(&PostParams::default(), &obj),
+            )
+            .await
+            {
+                Ok(Ok(_result)) => {
+                    info!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %name,
+                        "Sandbox claim created in Kubernetes successfully"
+                    );
+                    Ok(())
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %name,
+                        error = %err,
+                        "Failed to create sandbox claim in Kubernetes"
+                    );
+                    Err(KubernetesDriverError::from_kube(err))
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        sandbox_name = %name,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out creating sandbox claim in Kubernetes"
+                    );
+                    Err(KubernetesDriverError::Message(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    )))
+                }
+            };
+        }
+
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -1812,6 +2073,95 @@ impl KubernetesComputeDriver {
     }
 
     async fn delete_sandbox_inner(&self, sandbox_id: &str) -> Result<bool, String> {
+        if self.is_claim_mode() {
+            info!(
+                sandbox_id = %sandbox_id,
+                namespace = %self.config.namespace,
+                "Deleting sandbox claim from Kubernetes"
+            );
+
+            // Mirrors the direct-mode delete below: resolve the claim by id label,
+            // then delete by object name guarded on uid/resourceVersion.
+            let api = self.claim_api();
+            let selector = self.sandbox_lookup_selector(sandbox_id);
+            let lp = ListParams::default().labels(&selector);
+            let (claim_name, preconditions) = match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.list(&lp),
+            )
+            .await
+            {
+                Ok(Ok(list)) => {
+                    if let Some(obj) = list.items.into_iter().next() {
+                        match obj.metadata.name {
+                            Some(name) => (
+                                name,
+                                Preconditions {
+                                    uid: obj.metadata.uid,
+                                    resource_version: obj.metadata.resource_version,
+                                },
+                            ),
+                            None => return Ok(false),
+                        }
+                    } else {
+                        debug!(sandbox_id = %sandbox_id, "Sandbox claim not found in Kubernetes (already deleted)");
+                        return Ok(false);
+                    }
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "Failed to list sandbox claim for deletion from Kubernetes"
+                    );
+                    return Err(err.to_string());
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out listing sandbox claim for deletion from Kubernetes"
+                    );
+                    return Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ));
+                }
+            };
+
+            let dp = DeleteParams::default().preconditions(preconditions);
+            return match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(&claim_name, &dp)).await
+            {
+                Ok(Ok(_response)) => {
+                    info!(sandbox_id = %sandbox_id, "Sandbox claim deleted from Kubernetes");
+                    Ok(true)
+                }
+                Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                    debug!(sandbox_id = %sandbox_id, "Sandbox claim not found in Kubernetes (already deleted)");
+                    Ok(false)
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "Failed to delete sandbox claim from Kubernetes"
+                    );
+                    Err(err.to_string())
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out deleting sandbox claim from Kubernetes"
+                    );
+                    Err(format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ))
+                }
+            };
+        }
+
         info!(
             sandbox_id = %sandbox_id,
             workspace_mode = %self.config.workspace_mode,
@@ -1914,12 +2264,17 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, String> {
-        let agent_sandbox_api = self
-            .supported_sandbox_api_for_lookup(self.client.clone())
-            .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
+        let list_result = if self.is_claim_mode() {
+            tokio::time::timeout(KUBE_API_TIMEOUT, self.claim_api().list(&lp)).await
+        } else {
+            let agent_sandbox_api = self
+                .supported_sandbox_api_for_lookup(self.client.clone())
+                .await?;
+            tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await
+        };
+        match list_result {
             Ok(Ok(list)) => Ok(!list.items.is_empty()),
             Ok(Err(err)) => Err(err.to_string()),
             Err(_elapsed) => Err(format!(
@@ -1932,11 +2287,84 @@ impl KubernetesComputeDriver {
     // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
+        if self.is_claim_mode() {
+            return Ok(self.watch_sandbox_claims());
+        }
         if self.config.is_multi_namespace() {
             self.watch_sandboxes_cluster_wide().await
         } else {
             self.watch_sandboxes_single_namespace().await
         }
+    }
+
+    /// Claim-mode watch. Claims live in the gateway namespace only, so this has
+    /// no cluster-wide variant; status changes arrive on the claim CR itself
+    /// rather than on the Sandbox the operator adopts behind it.
+    fn watch_sandbox_claims(&self) -> WatchStream {
+        let namespace = self.config.namespace.clone();
+        let claim_api = self.claim_watch_api();
+        let watcher_config = watcher::Config::default().labels(&self.openshell_sandbox_selector());
+        let mut claim_stream = recovering_watcher_stream(
+            watcher::watcher(claim_api, watcher_config),
+            "sandbox-claim-resource",
+        )
+        .boxed();
+        let (tx, rx) = mpsc::channel(256);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = claim_stream.next() => match event {
+                        Some(Event::Apply(obj) | Event::InitApply(obj)) => {
+                            match claim_from_object(&namespace, obj) {
+                                Ok(sandbox) => {
+                                    let event = WatchSandboxesEvent {
+                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                        )),
+                                    };
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(err) => {
+                                    if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Event::Delete(obj)) => match sandbox_id_from_object(&obj) {
+                            Ok(sandbox_id) => {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                        WatchSandboxesDeletedEvent { sandbox_id }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                if tx.send(Err(KubernetesDriverError::Message(err))).await.is_err() {
+                                    break;
+                                }
+                            }
+                        },
+                        Some(Event::Init | Event::InitDone) => {}
+                        None => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "sandbox claim watcher stream ended unexpectedly".to_string()
+                            ))).await;
+                            break;
+                        }
+                    },
+                    () = tx.closed() => break,
+                }
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 
     async fn watch_sandboxes_single_namespace(&self) -> Result<WatchStream, String> {
@@ -2458,19 +2886,92 @@ fn validate_sandbox_owner_identity(
     sandbox_id: &str,
     sandbox: &DynamicObject,
 ) -> Result<(), tonic::Status> {
-    let uid_matches = sandbox.metadata.uid.as_deref() == Some(owner.uid.as_str());
-    let sandbox_id_matches = sandbox
-        .metadata
-        .labels
-        .as_ref()
+    let denied =
+        || tonic::Status::permission_denied("pod identity does not match its Sandbox owner");
+
+    let actual_uid = sandbox.metadata.uid.as_deref().unwrap_or_default();
+    if actual_uid != owner.uid {
+        warn!(
+            sandbox_owner = %owner.name,
+            owner_uid = %owner.uid,
+            actual_uid = %actual_uid,
+            "pod Sandbox ownerReference UID does not match live Sandbox CR"
+        );
+        return Err(denied());
+    }
+
+    let labels = sandbox.metadata.labels.as_ref();
+    let actual_sandbox_id = labels
         .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
-        .is_some_and(|actual| actual == sandbox_id);
-    if uid_matches && sandbox_id_matches {
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !actual_sandbox_id.is_empty() {
+        if actual_sandbox_id != sandbox_id {
+            warn!(
+                sandbox_owner = %owner.name,
+                owner_uid = %owner.uid,
+                pod_sandbox_id = %sandbox_id,
+                cr_sandbox_id = %actual_sandbox_id,
+                "pod sandbox annotation does not match owning Sandbox CR label"
+            );
+            return Err(denied());
+        }
         return Ok(());
     }
-    Err(tonic::Status::permission_denied(
-        "pod identity does not match its Sandbox owner",
-    ))
+
+    // Warm-pool claim path. A pod bound from a warm pool has no
+    // `openshell.ai/sandbox-id` label on its Sandbox CR, so there is nothing to
+    // cross-check the pod's sandbox id against. Prove instead that the CR is a
+    // genuine, internally consistent claim-owned object: its claim-uid label
+    // must match the UID of its own controlling SandboxClaim. The pod's sandbox
+    // id stays authoritative because the driver stamps it once at pod create
+    // and the gateway's RBAC grants `get` but not `patch` on pods.
+    let actual_claim_uid = labels
+        .and_then(|labels| labels.get(CLAIM_UID_LABEL))
+        .map(String::as_str)
+        .unwrap_or_default();
+    if !actual_claim_uid.is_empty() {
+        let expected_claim_uid = sandbox
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|owner_ref| {
+                owner_ref.kind == CLAIM_KIND
+                    && owner_ref.api_version == CLAIM_OWNER_API_VERSION
+                    && owner_ref.controller == Some(true)
+            })
+            .map(|owner_ref| owner_ref.uid.as_str())
+            .unwrap_or_default();
+        if expected_claim_uid.is_empty() {
+            warn!(
+                sandbox_owner = %owner.name,
+                owner_uid = %owner.uid,
+                claim_uid = %actual_claim_uid,
+                "owning Sandbox CR has claim-uid label but no controlling SandboxClaim ownerReference"
+            );
+            return Err(denied());
+        }
+        if actual_claim_uid != expected_claim_uid {
+            warn!(
+                sandbox_owner = %owner.name,
+                owner_uid = %owner.uid,
+                claim_uid = %actual_claim_uid,
+                expected_claim_uid = %expected_claim_uid,
+                "pod Sandbox claim-uid label does not match owning SandboxClaim UID"
+            );
+            return Err(denied());
+        }
+        return Ok(());
+    }
+
+    warn!(
+        sandbox_owner = %owner.name,
+        owner_uid = %owner.uid,
+        "owning Sandbox CR is missing both sandbox-id and claim-uid labels"
+    );
+    Err(denied())
 }
 
 fn accepts_auth_namespace(
@@ -2546,6 +3047,68 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<(String, S
             workspace,
         },
     ))
+}
+
+fn claim_status_from_object(obj: &DynamicObject) -> SandboxStatus {
+    let claim_name = obj.metadata.name.clone().unwrap_or_default();
+    let status_obj = obj.data.get("status").and_then(|status| status.as_object());
+
+    let conditions = status_obj
+        .and_then(|status| status.get("conditions"))
+        .and_then(|val| val.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(condition_from_value)
+                .map(|mut condition| {
+                    if condition.r#type == "Ready"
+                        && condition.status.eq_ignore_ascii_case("false")
+                        && condition.reason.eq_ignore_ascii_case("SandboxNotReady")
+                    {
+                        condition.reason = "DependenciesNotReady".to_string();
+                    }
+                    condition
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    SandboxStatus {
+        sandbox_name: claim_name,
+        instance_id: String::new(),
+        agent_fd: String::new(),
+        sandbox_fd: String::new(),
+        conditions,
+        deleting: obj.metadata.deletion_timestamp.is_some(),
+    }
+}
+
+fn claim_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
+    let id = sandbox_id_from_object(&obj)?;
+    let kube_name = obj.metadata.name.clone().unwrap_or_default();
+    let Some(name) = annotation_or_label(&obj, LABEL_SANDBOX_NAME) else {
+        warn!(object = %kube_name, "openshell-managed sandbox claim missing name");
+        return Err(format!("object {kube_name} missing sandbox name"));
+    };
+    let Some(workspace) = annotation_or_label(&obj, LABEL_SANDBOX_WORKSPACE) else {
+        warn!(object = %kube_name, "openshell-managed sandbox claim missing workspace");
+        return Err(format!("object {kube_name} missing sandbox workspace"));
+    };
+    let namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| namespace.to_string());
+    let status = Some(claim_status_from_object(&obj));
+
+    Ok(Sandbox {
+        id,
+        name,
+        workspace,
+        namespace,
+        spec: None,
+        status,
+    })
 }
 
 fn update_indexes(
@@ -3656,6 +4219,64 @@ fn kubernetes_driver_config_for_spec(
     Ok(config)
 }
 
+fn warm_pool_claim_env_is_unsafe(spec: Option<&SandboxSpec>) -> bool {
+    let env = spec_pod_env(spec);
+    !env.is_empty()
+}
+
+fn claim_to_k8s_spec(sandbox: &Sandbox, config: &KubernetesComputeConfig) -> serde_json::Value {
+    let spec = sandbox.spec.as_ref();
+    let template = spec.and_then(|s| s.template.as_ref());
+
+    let mut labels = sandbox_labels(sandbox, Some(&config.gateway_id));
+    if let Some(template) = template {
+        for (key, value) in &template.labels {
+            labels.insert(key.clone(), value.clone());
+        }
+    }
+
+    let mut annotations = BTreeMap::new();
+    annotations.insert(POD_SANDBOX_ID_ANNOTATION.to_string(), sandbox.id.clone());
+    annotations.insert(
+        POD_SANDBOX_NAME_ANNOTATION.to_string(),
+        sandbox.name.clone(),
+    );
+
+    let mut additional_pod_metadata = serde_json::Map::new();
+    if !labels.is_empty() {
+        additional_pod_metadata.insert("labels".to_string(), serde_json::json!(labels));
+    }
+    if !annotations.is_empty() {
+        additional_pod_metadata.insert("annotations".to_string(), serde_json::json!(annotations));
+    }
+
+    let mut claim_spec = serde_json::Map::new();
+    claim_spec.insert(
+        "sandboxTemplateRef".to_string(),
+        serde_json::json!({"name": config.claim_template_name}),
+    );
+    claim_spec.insert(
+        "warmpool".to_string(),
+        serde_json::json!(config.claim_warm_pool_name),
+    );
+    if !additional_pod_metadata.is_empty() {
+        claim_spec.insert(
+            "additionalPodMetadata".to_string(),
+            serde_json::Value::Object(additional_pod_metadata),
+        );
+    }
+    if !config.claim_shutdown_policy.trim().is_empty() {
+        claim_spec.insert(
+            "lifecycle".to_string(),
+            serde_json::json!({"shutdownPolicy": config.claim_shutdown_policy}),
+        );
+    }
+
+    serde_json::Value::Object(
+        std::iter::once(("spec".to_string(), serde_json::Value::Object(claim_spec))).collect(),
+    )
+}
+
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
@@ -3801,12 +4422,12 @@ fn sandbox_template_to_k8s_with_validated_config(
     if !pod_labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::Value::Object(pod_labels));
     }
-    // Carry the sandbox UUID as a pod annotation so the gateway can resolve
-    // a projected SA token claim (pod name + uid) back to a sandbox identity
-    // when the supervisor calls `IssueSandboxToken` at startup. The gateway
-    // also verifies the pod's controlling Sandbox ownerReference against the
-    // live CR before accepting this annotation. Its K8s Role does NOT grant
-    // `patch pods`, so this annotation is effectively immutable post-create.
+    // Carry the sandbox identity on pod annotations so both the gateway bootstrap
+    // path and any warm-pool bind-discovery projection can recover the adopted
+    // sandbox without requiring Pod-side K8s watch permissions. The gateway
+    // verifies the pod's controlling Sandbox ownerReference against the live CR
+    // before accepting the id annotation. Its K8s Role does NOT grant
+    // `patch pods`, so these annotations are effectively immutable post-create.
     let mut pod_annotations = platform_config_struct(template, "annotations")
         .and_then(|v| match v {
             serde_json::Value::Object(map) => Some(map),
@@ -3815,8 +4436,14 @@ fn sandbox_template_to_k8s_with_validated_config(
         .unwrap_or_default();
     if !params.sandbox_id.is_empty() {
         pod_annotations.insert(
-            LABEL_SANDBOX_ID.to_string(),
+            POD_SANDBOX_ID_ANNOTATION.to_string(),
             serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if !params.sandbox_name.is_empty() {
+        pod_annotations.insert(
+            POD_SANDBOX_NAME_ANNOTATION.to_string(),
+            serde_json::Value::String(params.sandbox_name.to_string()),
         );
     }
     if !pod_annotations.is_empty() {
@@ -3977,6 +4604,11 @@ fn sandbox_template_to_k8s_with_validated_config(
             .iter()
             .map(kubernetes_driver_volume_mount_to_k8s),
     );
+    volume_mounts.push(serde_json::json!({
+        "name": BIND_VOLUME_NAME,
+        "mountPath": BIND_MOUNT_PATH,
+        "readOnly": true,
+    }));
     container.insert(
         "volumeMounts".to_string(),
         serde_json::Value::Array(volume_mounts),
@@ -4072,6 +4704,25 @@ fn sandbox_template_to_k8s_with_validated_config(
             .iter()
             .map(kubernetes_driver_volume_to_k8s),
     );
+    volumes.push(serde_json::json!({
+        "name": BIND_VOLUME_NAME,
+        "downwardAPI": {
+            "items": [
+                {
+                    "path": "sandbox-id",
+                    "fieldRef": {
+                        "fieldPath": format!("metadata.annotations['{POD_SANDBOX_ID_ANNOTATION}']")
+                    }
+                },
+                {
+                    "path": "sandbox-name",
+                    "fieldRef": {
+                        "fieldPath": format!("metadata.annotations['{POD_SANDBOX_NAME_ANNOTATION}']")
+                    }
+                }
+            ]
+        }
+    }));
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
@@ -4405,6 +5056,20 @@ fn apply_required_env(
             socket_path,
         );
     }
+
+    // Bind-discovery files projected from Pod annotations. Warm-pool templates
+    // can expose these files even before sandbox identity is present in the
+    // startup env, letting the supervisor wait for adoption without K8s watch RBAC.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::BIND_SANDBOX_ID_FILE,
+        &format!("{BIND_MOUNT_PATH}/sandbox-id"),
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::BIND_SANDBOX_NAME_FILE,
+        &format!("{BIND_MOUNT_PATH}/sandbox-name"),
+    );
 }
 
 fn provider_spiffe_socket_path<'a>(params: &'a SandboxPodParams<'a>) -> Option<&'a str> {
@@ -6925,6 +7590,82 @@ mod tests {
         assert!(err.to_string().contains("proxy_uid"));
     }
 
+    #[test]
+    fn bind_discovery_env_vars_match_projection_mount_path() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "0.0.0.0:2222",
+            false,
+            None,
+        );
+
+        let get_env = |name: &str| -> Option<String> {
+            env.iter()
+                .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+                .and_then(|e| e.get("value").and_then(|v| v.as_str()).map(String::from))
+        };
+
+        let bind_id = get_env(openshell_core::sandbox_env::BIND_SANDBOX_ID_FILE)
+            .expect("OPENSHELL_BIND_SANDBOX_ID_FILE must be set");
+        let bind_name = get_env(openshell_core::sandbox_env::BIND_SANDBOX_NAME_FILE)
+            .expect("OPENSHELL_BIND_SANDBOX_NAME_FILE must be set");
+
+        assert_eq!(bind_id, format!("{BIND_MOUNT_PATH}/sandbox-id"));
+        assert_eq!(bind_name, format!("{BIND_MOUNT_PATH}/sandbox-name"));
+    }
+
+    #[test]
+    fn sandbox_template_projects_bind_metadata_via_downward_api() {
+        let pod_template = {
+            let params = SandboxPodParams {
+                sandbox_id: "sandbox-1",
+                sandbox_name: "my-sandbox",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert!(mounts.iter().any(|mount| {
+            mount["name"] == BIND_VOLUME_NAME
+                && mount["mountPath"] == BIND_MOUNT_PATH
+                && mount["readOnly"] == true
+        }));
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        let bind_volume = volumes
+            .iter()
+            .find(|volume| volume["name"] == BIND_VOLUME_NAME)
+            .expect("openshell-bind volume should exist");
+        let items = bind_volume["downwardAPI"]["items"]
+            .as_array()
+            .expect("downwardAPI items should exist");
+        assert!(items.iter().any(|item| {
+            item["path"] == "sandbox-id"
+                && item["fieldRef"]["fieldPath"]
+                    == format!("metadata.annotations['{POD_SANDBOX_ID_ANNOTATION}']")
+        }));
+        assert!(items.iter().any(|item| {
+            item["path"] == "sandbox-name"
+                && item["fieldRef"]["fieldPath"]
+                    == format!("metadata.annotations['{POD_SANDBOX_NAME_ANNOTATION}']")
+        }));
+    }
+
     /// Regression test: TLS mount path must match env var paths.
     /// The volume is mounted at a specific path and the env vars must point to
     /// files within that same path, otherwise the sandbox will fail to start
@@ -8785,4 +9526,90 @@ mod tests {
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
     }
+    #[test]
+    fn claim_from_object_reads_logical_name_from_label() {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("alpha--work", &resource);
+        obj.metadata = ObjectMeta {
+            name: Some("alpha--work".to_string()),
+            namespace: Some("default".to_string()),
+            labels: Some(BTreeMap::from([
+                (LABEL_SANDBOX_ID.to_string(), "uuid-123".to_string()),
+                (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                (LABEL_SANDBOX_WORKSPACE.to_string(), "alpha".to_string()),
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let sandbox = claim_from_object("default", obj).unwrap();
+        assert_eq!(sandbox.name, "work");
+        assert_eq!(sandbox.workspace, "alpha");
+        assert_eq!(sandbox.id, "uuid-123");
+    }
+
+    #[test]
+    fn claim_status_from_object_rewrites_sandbox_not_ready_to_dependencies_not_ready() {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("claim-a", &resource);
+        obj.metadata = ObjectMeta {
+            name: Some("claim-a".to_string()),
+            ..Default::default()
+        };
+        obj.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "SandboxNotReady",
+                    "message": "Sandbox is not ready",
+                    "lastTransitionTime": "2026-06-11T00:00:00Z"
+                }]
+            }
+        });
+
+        let status = claim_status_from_object(&obj);
+        assert_eq!(status.sandbox_name, "claim-a");
+        assert_eq!(status.instance_id, "");
+        assert_eq!(status.conditions.len(), 1);
+
+        let ready = &status.conditions[0];
+        assert_eq!(ready.r#type, "Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "DependenciesNotReady");
+        assert_eq!(ready.message, "Sandbox is not ready");
+    }
+
+    #[test]
+    fn claim_status_from_object_preserves_other_ready_false_reasons() {
+        let gvk = GroupVersionKind::gvk(CLAIM_GROUP, CLAIM_VERSION, CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("claim-b", &resource);
+        obj.metadata = ObjectMeta {
+            name: Some("claim-b".to_string()),
+            ..Default::default()
+        };
+        obj.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "ImagePullBackOff",
+                    "message": "Failed to pull image",
+                    "lastTransitionTime": "2026-06-11T00:00:00Z"
+                }]
+            }
+        });
+
+        let status = claim_status_from_object(&obj);
+        let ready = &status.conditions[0];
+        assert_eq!(ready.reason, "ImagePullBackOff");
+        assert_eq!(ready.message, "Failed to pull image");
+    }
+
 }

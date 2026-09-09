@@ -42,6 +42,10 @@ owner references, or using the configured sandbox ServiceAccount. Treat adding
 a namespace to the operator allowlist as granting this trust; the allowlist is
 not a tenant isolation boundary.
 
+Sandbox resource names are workspace-qualified as `{workspace}--{sandbox-name}`
+to avoid collisions between workspaces. The combined name must be no more than
+63 characters, as required by Kubernetes DNS-1123 labels.
+
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to
