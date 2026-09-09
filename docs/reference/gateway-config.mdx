@@ -521,6 +521,25 @@ topology                       = "combined"
 # Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
 # so its ACL becomes part of the egress boundary for proxied connections.
 # proxy_connect_by_hostname    = true
+# Identify each sandbox to the proxy by sending its sandbox id as the
+# Proxy-Authorization Basic username with an empty password, so the proxy can
+# attribute and ACL egress per sandbox. The username is an identifier, not a
+# secret: the supervisor builds the header on the upstream hop, so a workload
+# cannot forge or alter it, but anything with direct network access to the
+# proxy can — the proxy must not treat the value as authorization on its own.
+# Mutually exclusive with proxy_auth_secret_name, and it needs no cleartext
+# acknowledgement because no credential is sent — setting one alongside it is
+# rejected. Fail-closed: a sandbox whose identity is unresolved refuses to
+# start rather than egressing unattributed.
+# proxy_auth_sandbox_identity  = true
+# Client certificate presented on the TLS hop to an https:// proxy that
+# authenticates its callers with mutual TLS. Names an existing
+# kubernetes.io/tls Secret in the sandbox namespace; the supervisor reads
+# `tls.crt` and `tls.key` from a mount only the network supervisor container
+# sees. Requires an https:// proxy URL — there is no TLS hop to present it on
+# otherwise — and `topology = "sidecar"`, for the same fsGroup reason as the
+# credential Secret.
+# proxy_client_cert_secret_name = "corporate-proxy-client"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -761,6 +780,18 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# Identify each sandbox to the proxy by sending its sandbox id as the
+# Proxy-Authorization Basic username with an empty password, so the proxy can
+# attribute and ACL egress per sandbox. The username is an identifier, not a
+# secret: the supervisor builds the header on the upstream hop, so a workload
+# cannot forge or alter it, but anything with direct network access to the
+# proxy can — the proxy must not treat the value as authorization on its own.
+# Mutually exclusive with proxy_auth_file (a request carries one
+# Proxy-Authorization header), and it needs no cleartext acknowledgement
+# because no credential is sent — setting one alongside it is rejected.
+# Fail-closed: a sandbox whose identity is unresolved refuses to start rather
+# than egressing unattributed.
+# proxy_auth_sandbox_identity = true
 ```
 
 ### MicroVM

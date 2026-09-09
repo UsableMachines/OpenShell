@@ -51,6 +51,25 @@
 //!   answer that passed SSRF/`allowed_ips` validation. The
 //!   `--upstream-proxy-connect-by-hostname` opt-in sends the hostname
 //!   instead, for proxies whose ACLs filter on hostnames.
+//! - `--upstream-proxy-auth-sandbox-identity` sends the resolved sandbox id as
+//!   the `Proxy-Authorization: Basic` username with an empty password, so the
+//!   proxy can attribute and ACL egress per sandbox instead of seeing every
+//!   sandbox in the deployment as one client. The username is an identifier,
+//!   not a secret; the supervisor builds the header on the upstream hop, so a
+//!   workload cannot forge or alter its own attribution, but anything with
+//!   direct network access to the proxy can, so the proxy must not treat the
+//!   value as authorization on its own. It is mutually exclusive with the
+//!   auth file (one request carries a single `Proxy-Authorization` header),
+//!   and because nothing confidential is sent it does not require — and in
+//!   fact rejects — the cleartext-credential acknowledgement, whose text
+//!   would be false here. An unresolved sandbox identity is fatal rather than
+//!   egressing unattributed, which would silently defeat a proxy ACL keyed on
+//!   the username.
+//! - `--upstream-proxy-client-cert` / `--upstream-proxy-client-key` present a
+//!   client certificate on the TLS hop to an `https://` proxy that
+//!   authenticates its callers. Half an identity, or either one against an
+//!   `http://` proxy (where it would be silently ignored while the argv
+//!   claims the hop is authenticated), is fatal at startup.
 //! - The operator `NO_PROXY` list decides which destinations bypass the
 //!   corporate proxy and keep dialing directly (cluster-internal services,
 //!   host gateway, etc.). Loopback destinations always bypass the proxy.
@@ -343,6 +362,16 @@ pub struct UpstreamProxyArgs {
     pub proxy_auth_allow_insecure: bool,
     /// Send the destination hostname in CONNECT instead of a validated IP.
     pub proxy_connect_by_hostname: bool,
+    /// Identify the sandbox to the corporate proxy by sending its resolved
+    /// sandbox id as the `Proxy-Authorization: Basic` username.
+    pub proxy_auth_sandbox_identity: bool,
+    /// Path to a PEM client certificate presented to the proxy, for a proxy
+    /// that authenticates its callers. Set together with the key. Only
+    /// meaningful for an `https://` proxy: there is no TLS hop to present it
+    /// on otherwise.
+    pub proxy_client_cert: Option<String>,
+    /// Path to the PEM private key for `proxy_client_cert`.
+    pub proxy_client_key: Option<String>,
     /// Path to a PEM bundle of extra CAs trusted for the corporate proxy: the
     /// TLS handshake with an `https://` proxy and, because TLS-intercepting
     /// proxies re-sign tunneled server certificates with the same CA, the
@@ -359,6 +388,9 @@ const ARG_PROXY_AUTH_FILE: &str = "--upstream-proxy-auth-file";
 const ARG_PROXY_AUTH_ALLOW_INSECURE: &str = "--upstream-proxy-auth-allow-insecure";
 const ARG_PROXY_CONNECT_BY_HOSTNAME: &str = "--upstream-proxy-connect-by-hostname";
 pub(crate) const ARG_PROXY_CA_BUNDLE: &str = "--upstream-proxy-ca-bundle";
+const ARG_PROXY_AUTH_SANDBOX_IDENTITY: &str = "--upstream-proxy-auth-sandbox-identity";
+const ARG_PROXY_CLIENT_CERT: &str = "--upstream-proxy-client-cert";
+const ARG_PROXY_CLIENT_KEY: &str = "--upstream-proxy-client-key";
 
 impl UpstreamProxyConfig {
     /// Build the corporate proxy configuration from the driver-supplied
@@ -380,34 +412,52 @@ impl UpstreamProxyConfig {
     /// auth file that is set but unreadable or holds a malformed credential,
     /// an auth file without the cleartext-credential acknowledgement, or an
     /// auth file / `NO_PROXY` list / acknowledgement / connect-by-hostname
-    /// flag with no proxy configured. Failing closed prevents a
+    /// flag with no proxy configured, a sandbox-identity opt-in whose sandbox
+    /// id is unresolved or which is combined with the auth file, or client
+    /// TLS material that is half-specified or paired with an `http://` proxy.
+    /// Failing closed prevents a
     /// misconfiguration from silently degrading to direct dialing or
     /// unauthenticated proxy access.
-    pub fn from_args(args: &UpstreamProxyArgs) -> Result<Option<Self>, String> {
+    pub fn from_args(
+        args: &UpstreamProxyArgs,
+        sandbox_id: Option<&str>,
+    ) -> Result<Option<Self>, String> {
         // Present the typed argv fields under their canonical identifiers so
         // the shared validation runs once. Booleans map to Some("true") /
         // None, so every pairing rule (auth file needs the acknowledgement,
         // no auxiliary setting without a proxy) applies unchanged.
-        Self::from_lookup(|name| {
-            if name == ARG_HTTPS_PROXY {
-                args.https_proxy.clone()
-            } else if name == ARG_NO_PROXY {
-                args.no_proxy.clone()
-            } else if name == ARG_PROXY_AUTH_FILE {
-                args.proxy_auth_file.clone()
-            } else if name == ARG_PROXY_AUTH_ALLOW_INSECURE {
-                args.proxy_auth_allow_insecure.then(|| "true".to_string())
-            } else if name == ARG_PROXY_CONNECT_BY_HOSTNAME {
-                args.proxy_connect_by_hostname.then(|| "true".to_string())
-            } else if name == ARG_PROXY_CA_BUNDLE {
-                args.proxy_ca_bundle.clone()
-            } else {
-                None
-            }
-        })
+        Self::from_lookup(
+            |name| {
+                if name == ARG_HTTPS_PROXY {
+                    args.https_proxy.clone()
+                } else if name == ARG_NO_PROXY {
+                    args.no_proxy.clone()
+                } else if name == ARG_PROXY_AUTH_FILE {
+                    args.proxy_auth_file.clone()
+                } else if name == ARG_PROXY_AUTH_ALLOW_INSECURE {
+                    args.proxy_auth_allow_insecure.then(|| "true".to_string())
+                } else if name == ARG_PROXY_CONNECT_BY_HOSTNAME {
+                    args.proxy_connect_by_hostname.then(|| "true".to_string())
+                } else if name == ARG_PROXY_CA_BUNDLE {
+                    args.proxy_ca_bundle.clone()
+                } else if name == ARG_PROXY_AUTH_SANDBOX_IDENTITY {
+                    args.proxy_auth_sandbox_identity.then(|| "true".to_string())
+                } else if name == ARG_PROXY_CLIENT_CERT {
+                    args.proxy_client_cert.clone()
+                } else if name == ARG_PROXY_CLIENT_KEY {
+                    args.proxy_client_key.clone()
+                } else {
+                    None
+                }
+            },
+            sandbox_id,
+        )
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+        sandbox_id: Option<&str>,
+    ) -> Result<Option<Self>, String> {
         // A missing setting means "not configured". A present-but-empty value
         // is a misconfiguration (the driver never emits one), so it is fatal
         // rather than silently downgrading the boundary to direct dialing or
@@ -429,6 +479,9 @@ impl UpstreamProxyConfig {
         let connect_by_hostname_raw = var(ARG_PROXY_CONNECT_BY_HOSTNAME)?;
         let no_proxy_list = var(ARG_NO_PROXY)?;
         let ca_bundle = var(ARG_PROXY_CA_BUNDLE)?;
+        let auth_sandbox_identity_raw = var(ARG_PROXY_AUTH_SANDBOX_IDENTITY)?;
+        let client_cert = var(ARG_PROXY_CLIENT_CERT)?;
+        let client_key = var(ARG_PROXY_CLIENT_KEY)?;
         let Some((mut https, secure)) = https else {
             // Auxiliary proxy settings without a proxy mean the operator
             // believed a proxy boundary was in effect; refuse rather than
@@ -439,6 +492,9 @@ impl UpstreamProxyConfig {
                 (ARG_PROXY_CONNECT_BY_HOSTNAME, &connect_by_hostname_raw),
                 (ARG_NO_PROXY, &no_proxy_list),
                 (ARG_PROXY_CA_BUNDLE, &ca_bundle),
+                (ARG_PROXY_AUTH_SANDBOX_IDENTITY, &auth_sandbox_identity_raw),
+                (ARG_PROXY_CLIENT_CERT, &client_cert),
+                (ARG_PROXY_CLIENT_KEY, &client_key),
             ] {
                 if value.is_some() {
                     return Err(format!("{name} is set but no upstream proxy is configured"));
@@ -487,6 +543,33 @@ impl UpstreamProxyConfig {
             ));
         }
 
+        // Sandbox-identity attribution. Only the exact opt-in value the
+        // driver writes is honored, matching the other boolean flags.
+        let auth_sandbox_identity = match auth_sandbox_identity_raw.as_deref().map(str::trim) {
+            None => false,
+            Some("true") => true,
+            Some(_) => {
+                return Err(format!(
+                    "{ARG_PROXY_AUTH_SANDBOX_IDENTITY} must be 'true' when set"
+                ));
+            }
+        };
+        // One request carries one Proxy-Authorization header, so the two
+        // credential sources cannot both apply. Refuse rather than silently
+        // letting one win.
+        //
+        // The cleartext-credential acknowledgement is rejected alongside
+        // identity mode by the pairing rule above: nothing confidential is
+        // sent here — the username is an identifier, not a secret — so the
+        // acknowledgement's text would be false, and it is only accepted
+        // together with an auth file, which identity mode forbids.
+        if auth_sandbox_identity && auth_file.is_some() {
+            return Err(format!(
+                "{ARG_PROXY_AUTH_SANDBOX_IDENTITY} and {ARG_PROXY_AUTH_FILE} are mutually \
+                 exclusive; a request carries a single Proxy-Authorization header"
+            ));
+        }
+
         // Load proxy credentials from the configured auth file, if any.
         // The file is delivered through a root-only secret mount so the
         // credentials never appear in the environment or container metadata.
@@ -499,23 +582,88 @@ impl UpstreamProxyConfig {
             https.proxy_authorization = Some(header);
         }
 
+        // Sandbox identity travels in the Basic username with an empty
+        // password. The username is an *identifier*, not a secret: it lets
+        // the proxy attribute and ACL egress per sandbox, and because the
+        // supervisor constructs the header on the upstream hop, a workload
+        // cannot forge or alter it. Anything with direct network access to
+        // the proxy can, so the proxy must not treat the value as
+        // authorization on its own.
+        //
+        // Fail closed when the identity has not been resolved: an
+        // unattributable connection is worse than no connection, and sending
+        // an anonymous credential would silently defeat a proxy ACL keyed on
+        // the username.
+        if auth_sandbox_identity {
+            let id = sandbox_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "{ARG_PROXY_AUTH_SANDBOX_IDENTITY} is set but the sandbox identity is \
+                         unresolved; refusing to send an unattributed credential"
+                    )
+                })?;
+            let header = basic_auth_header(&format!("{id}:")).map_err(|err| {
+                format!("sandbox id is not usable as a proxy credential username: {err}")
+            })?;
+            https.proxy_authorization = Some(header);
+        }
+
         // Wrap the proxy connection in TLS for an `https://` proxy. The
         // corporate CA bundle (also folded into the sandbox trust bundle by
         // `run.rs`) is trusted alongside the built-in and system roots; a bare
         // `https://` proxy with no bundle verifies against those roots only.
+        //
+        // A client certificate is presented when the proxy authenticates its
+        // callers with mutual TLS. Half an identity cannot authenticate
+        // anything, and silently dropping it would leave the proxy unable to
+        // tell this caller apart, so an unpaired half is fatal.
         if secure {
             let corporate_pem = ca_bundle
                 .as_deref()
                 .map(|path| read_proxy_ca_bundle(path, ARG_PROXY_CA_BUNDLE))
                 .transpose()?;
-            https.tls = Some(build_proxy_tls_config(corporate_pem.as_deref()));
-        } else if let Some(path) = ca_bundle.as_deref() {
-            // An `http://` proxy is dialed in plaintext, so the CA bundle is
-            // not used for the proxy connection itself. It is still validated
-            // fail-closed here (and folded into the sandbox trust bundle by
-            // `run.rs`) for the TLS-intercepting-proxy case, where a proxy
-            // reached over plain HTTP re-signs tunneled upstream certificates.
-            read_proxy_ca_bundle(path, ARG_PROXY_CA_BUNDLE)?;
+            if client_cert.is_some() != client_key.is_some() {
+                return Err(format!(
+                    "{ARG_PROXY_CLIENT_CERT} and {ARG_PROXY_CLIENT_KEY} must be set together"
+                ));
+            }
+            let client_identity = match (client_cert.as_deref(), client_key.as_deref()) {
+                (Some(cert_path), Some(key_path)) => {
+                    Some(read_proxy_client_identity(cert_path, key_path)?)
+                }
+                _ => None,
+            };
+            https.tls = Some(build_proxy_tls_config(
+                corporate_pem.as_deref(),
+                client_identity,
+            )?);
+        } else {
+            // TLS material against an `http://` proxy would be silently
+            // ignored while the argv claims the hop is authenticated, so it
+            // is fatal. The CA bundle is the exception below: a
+            // TLS-intercepting proxy reached over plain HTTP still re-signs
+            // tunneled upstream certificates with it.
+            for (name, value) in [
+                (ARG_PROXY_CLIENT_CERT, &client_cert),
+                (ARG_PROXY_CLIENT_KEY, &client_key),
+            ] {
+                if value.is_some() {
+                    return Err(format!(
+                        "{name} is set but {ARG_HTTPS_PROXY} is not https://; the proxy hop \
+                         would be unauthenticated cleartext"
+                    ));
+                }
+            }
+            if let Some(path) = ca_bundle.as_deref() {
+                // An `http://` proxy is dialed in plaintext, so the CA bundle is
+                // not used for the proxy connection itself. It is still validated
+                // fail-closed here (and folded into the sandbox trust bundle by
+                // `run.rs`) for the TLS-intercepting-proxy case, where a proxy
+                // reached over plain HTTP re-signs tunneled upstream certificates.
+                read_proxy_ca_bundle(path, ARG_PROXY_CA_BUNDLE)?;
+            }
         }
 
         Ok(Some(Self {
@@ -627,7 +775,20 @@ pub(crate) fn read_proxy_ca_bundle(path: &str, var_name: &str) -> Result<String,
 /// Reuses [`build_upstream_client_config`](crate::l7::tls::build_upstream_client_config),
 /// which already folds the built-in and passed-in roots, so the proxy-listener
 /// trust store matches the L7 upstream store exactly.
-fn build_proxy_tls_config(corporate_ca_pem: Option<&str>) -> Arc<ClientConfig> {
+/// An optional `client_identity` is presented to a proxy that authenticates
+/// its callers with mutual TLS. It is scoped to the proxy hop: the L7
+/// upstream store is built separately and never carries it, so the identity
+/// is not offered to arbitrary destinations.
+///
+/// # Errors
+///
+/// Returns an error when the client certificate and key do not form a usable
+/// identity, so a mutual-TLS misconfiguration is fatal at startup rather than
+/// on the first CONNECT.
+fn build_proxy_tls_config(
+    corporate_ca_pem: Option<&str>,
+    client_identity: Option<crate::l7::tls::ClientIdentity>,
+) -> Result<Arc<ClientConfig>, String> {
     let mut bundle = crate::l7::tls::read_system_ca_bundle();
     if let Some(pem) = corporate_ca_pem {
         if !bundle.is_empty() && !bundle.ends_with('\n') {
@@ -635,8 +796,42 @@ fn build_proxy_tls_config(corporate_ca_pem: Option<&str>) -> Arc<ClientConfig> {
         }
         bundle.push_str(pem);
     }
-    crate::l7::tls::build_upstream_client_config(&bundle)
-        .expect("corporate proxy TLS config must be valid")
+    crate::l7::tls::build_upstream_client_config_with_client_auth(&bundle, client_identity)
+        .map_err(|err| format!("upstream proxy client certificate is unusable: {err}"))
+}
+
+/// Read the PEM client certificate chain and private key presented to an
+/// `https://` corporate proxy that authenticates its callers.
+///
+/// Fail-closed like the rest of the operator-owned proxy configuration: the
+/// operator explicitly pointed at these files, so an unreadable, malformed,
+/// or empty one is a fatal startup error rather than a silent fall-back to an
+/// anonymous TLS hop the proxy would then reject on every connection.
+fn read_proxy_client_identity(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<crate::l7::tls::ClientIdentity, String> {
+    let cert_pem = std::fs::read(cert_path)
+        .map_err(|err| format!("{ARG_PROXY_CLIENT_CERT} '{cert_path}' is unreadable: {err}"))?;
+    let cert_chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<rustls::pki_types::CertificateDer<'static>>, _>>()
+        .map_err(|err| format!("{ARG_PROXY_CLIENT_CERT} '{cert_path}' is malformed: {err}"))?;
+    if cert_chain.is_empty() {
+        return Err(format!(
+            "{ARG_PROXY_CLIENT_CERT} '{cert_path}' contains no certificates"
+        ));
+    }
+
+    let key_pem = std::fs::read(key_path)
+        .map_err(|err| format!("{ARG_PROXY_CLIENT_KEY} '{key_path}' is unreadable: {err}"))?;
+    let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|err| format!("{ARG_PROXY_CLIENT_KEY} '{key_path}' is malformed: {err}"))?
+        .ok_or_else(|| format!("{ARG_PROXY_CLIENT_KEY} '{key_path}' contains no private key"))?;
+
+    Ok(crate::l7::tls::ClientIdentity {
+        cert_chain,
+        private_key,
+    })
 }
 
 /// Build a `Proxy-Authorization: Basic <base64>` header value from a raw
@@ -1111,17 +1306,32 @@ mod tests {
     use super::{
         ARG_HTTPS_PROXY as HTTPS_PROXY, ARG_NO_PROXY as NO_PROXY,
         ARG_PROXY_AUTH_ALLOW_INSECURE as PROXY_AUTH_ALLOW_INSECURE,
-        ARG_PROXY_AUTH_FILE as PROXY_AUTH_FILE, ARG_PROXY_CA_BUNDLE as PROXY_CA_BUNDLE,
+        ARG_PROXY_AUTH_FILE as PROXY_AUTH_FILE,
+        ARG_PROXY_AUTH_SANDBOX_IDENTITY as PROXY_AUTH_SANDBOX_IDENTITY,
+        ARG_PROXY_CA_BUNDLE as PROXY_CA_BUNDLE, ARG_PROXY_CLIENT_CERT as PROXY_CLIENT_CERT,
+        ARG_PROXY_CLIENT_KEY as PROXY_CLIENT_KEY,
         ARG_PROXY_CONNECT_BY_HOSTNAME as PROXY_CONNECT_BY_HOSTNAME,
     };
 
+    const TEST_SANDBOX_ID: &str = "sbx-01JQ8Z9K4M7N2P";
+
     fn config_from(pairs: &[(&str, &str)]) -> Result<Option<UpstreamProxyConfig>, String> {
-        UpstreamProxyConfig::from_lookup(|name| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| (*v).to_string())
-        })
+        config_from_with_identity(pairs, Some(TEST_SANDBOX_ID))
+    }
+
+    fn config_from_with_identity(
+        pairs: &[(&str, &str)],
+        sandbox_id: Option<&str>,
+    ) -> Result<Option<UpstreamProxyConfig>, String> {
+        UpstreamProxyConfig::from_lookup(
+            |name| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_string())
+            },
+            sandbox_id,
+        )
     }
 
     /// Shorthand for tests exercising a configuration that must load.
@@ -1144,13 +1354,15 @@ mod tests {
             proxy_connect_by_hostname: true,
             ..UpstreamProxyArgs::default()
         };
-        let cfg = UpstreamProxyConfig::from_args(&args).unwrap().unwrap();
+        let cfg = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID))
+            .unwrap()
+            .unwrap();
         assert!(cfg.connect_by_hostname());
         assert!(bypasses(&cfg, "kubernetes.default.svc.cluster.local"));
 
         // No proxy URL means no configuration.
         assert!(
-            UpstreamProxyConfig::from_args(&UpstreamProxyArgs::default())
+            UpstreamProxyConfig::from_args(&UpstreamProxyArgs::default(), Some(TEST_SANDBOX_ID))
                 .unwrap()
                 .is_none()
         );
@@ -1165,7 +1377,7 @@ mod tests {
             proxy_auth_file: Some("/etc/openshell/auth/upstream-proxy".to_string()),
             ..UpstreamProxyArgs::default()
         };
-        let err = UpstreamProxyConfig::from_args(&args).unwrap_err();
+        let err = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID)).unwrap_err();
         assert!(err.contains(PROXY_AUTH_ALLOW_INSECURE), "{err}");
 
         // Auxiliary settings without a proxy are fatal.
@@ -1173,7 +1385,7 @@ mod tests {
             proxy_connect_by_hostname: true,
             ..UpstreamProxyArgs::default()
         };
-        let err = UpstreamProxyConfig::from_args(&args).unwrap_err();
+        let err = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID)).unwrap_err();
         assert!(err.contains("no upstream proxy"), "{err}");
     }
 
@@ -2311,6 +2523,388 @@ mod tests {
             err.to_string()
                 .contains("TLS handshake with upstream proxy"),
             "{err}"
+        );
+    }
+
+    // -- sandbox-identity attribution --
+
+    fn expected_identity_header(id: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{id}:"))
+        )
+    }
+
+    #[test]
+    fn sandbox_identity_sends_the_sandbox_id_as_the_basic_username() {
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert_eq!(
+            ep.proxy_authorization.as_deref(),
+            Some(expected_identity_header(TEST_SANDBOX_ID).as_str())
+        );
+    }
+
+    /// The password half is empty by design: the id identifies the sandbox,
+    /// it does not authenticate it.
+    #[test]
+    fn sandbox_identity_leaves_the_password_empty() {
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        let encoded = ep
+            .proxy_authorization
+            .as_deref()
+            .unwrap()
+            .strip_prefix("Basic ")
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            format!("{TEST_SANDBOX_ID}:")
+        );
+    }
+
+    #[test]
+    fn no_sandbox_identity_flag_sends_no_credential() {
+        let cfg = config_ok(&[(HTTPS_PROXY, "http://proxy:8080")]);
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert!(ep.proxy_authorization.is_none());
+    }
+
+    /// An unattributable connection is worse than no connection: a proxy ACL
+    /// keyed on the username would be silently defeated by an anonymous
+    /// credential.
+    #[test]
+    fn sandbox_identity_fails_closed_when_the_identity_is_unresolved() {
+        for id in [None, Some(""), Some("   ")] {
+            let err = config_from_with_identity(
+                &[
+                    (HTTPS_PROXY, "http://proxy:8080"),
+                    (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+                ],
+                id,
+            )
+            .unwrap_err();
+            assert!(err.contains(PROXY_AUTH_SANDBOX_IDENTITY), "{id:?}: {err}");
+            assert!(err.contains("unresolved"), "{id:?}: {err}");
+        }
+    }
+
+    /// A request carries a single `Proxy-Authorization` header, so the two
+    /// credential sources cannot both apply.
+    #[test]
+    fn sandbox_identity_and_auth_file_are_mutually_exclusive() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"user:secret\n").unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let err = config_from(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_FILE, &path),
+            (PROXY_AUTH_ALLOW_INSECURE, "true"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    /// The sandbox id is an identifier, not a secret, so the
+    /// cleartext-credential acknowledgement does not apply: its text would be
+    /// false here. Identity mode forbids the auth file the acknowledgement
+    /// belongs to, so the pairing rule rejects the combination.
+    #[test]
+    fn sandbox_identity_rejects_the_cleartext_acknowledgement() {
+        let err = config_from(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+            (PROXY_AUTH_ALLOW_INSECURE, "true"),
+        ])
+        .unwrap_err();
+        assert!(err.contains(PROXY_AUTH_ALLOW_INSECURE), "{err}");
+        assert!(err.contains(PROXY_AUTH_FILE), "{err}");
+    }
+
+    #[test]
+    fn sandbox_identity_honors_only_the_exact_opt_in_value() {
+        for value in ["1", "yes", "True", "false", ""] {
+            assert!(
+                config_from(&[
+                    (HTTPS_PROXY, "http://proxy:8080"),
+                    (PROXY_AUTH_SANDBOX_IDENTITY, value),
+                ])
+                .is_err(),
+                "{value:?} must not enable sandbox identity"
+            );
+        }
+    }
+
+    /// Like every other auxiliary setting: present without a proxy means the
+    /// operator believed a boundary was in effect.
+    #[test]
+    fn sandbox_identity_without_a_proxy_is_fatal() {
+        let err = config_from(&[(PROXY_AUTH_SANDBOX_IDENTITY, "true")]).unwrap_err();
+        assert!(err.contains("no upstream proxy"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_identity_is_hidden_from_debug_and_summary() {
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "http://proxy:8080"),
+            (PROXY_AUTH_SANDBOX_IDENTITY, "true"),
+        ]);
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(TEST_SANDBOX_ID), "{debug}");
+        assert!(!cfg.summary().contains(TEST_SANDBOX_ID));
+    }
+
+    #[test]
+    fn from_args_threads_the_sandbox_identity_flag() {
+        let args = UpstreamProxyArgs {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_auth_sandbox_identity: true,
+            ..UpstreamProxyArgs::default()
+        };
+        let cfg = UpstreamProxyConfig::from_args(&args, Some(TEST_SANDBOX_ID))
+            .unwrap()
+            .unwrap();
+        let ep = proxy_endpoint(&cfg, "example.com").unwrap();
+        assert_eq!(
+            ep.proxy_authorization.as_deref(),
+            Some(expected_identity_header(TEST_SANDBOX_ID).as_str())
+        );
+
+        // Same argv, no resolved identity: fatal rather than unattributed.
+        assert!(UpstreamProxyConfig::from_args(&args, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn sandbox_identity_reaches_the_proxy_in_the_connect_request() {
+        let (addr, handle) = fake_proxy("HTTP/1.1 200 Connection established\r\n\r\n").await;
+        let endpoint = endpoint_for(addr, Some(&expected_identity_header(TEST_SANDBOX_ID)));
+        let stream = connect_via(
+            &endpoint,
+            "api.example.com",
+            443,
+            ConnectTarget::Ip("93.184.216.34".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        drop(stream);
+        let request = handle.await.unwrap();
+        assert!(
+            request.contains(&format!(
+                "Proxy-Authorization: {}\r\n",
+                expected_identity_header(TEST_SANDBOX_ID)
+            )),
+            "{request}"
+        );
+    }
+
+    // -- client certificate on the proxy hop --
+
+    /// A CA, plus a leaf signed by it for `subject_alt_names`. Returned as
+    /// PEM so tests can write the files the configuration reads.
+    fn issue_client_identity() -> (String, String, String) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_params =
+            rcgen::CertificateParams::new(vec!["sandbox-client.example.test".to_string()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        (ca_cert.pem(), leaf_cert.pem(), leaf_key.serialize_pem())
+    }
+
+    fn write_temp_pem(contents: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), contents).unwrap();
+        file
+    }
+
+    /// TLS material on an `http://` proxy would be silently ignored, leaving
+    /// the hop unauthenticated cleartext while the argv says otherwise.
+    #[test]
+    fn client_tls_material_without_an_https_proxy_is_fatal() {
+        for arg in [PROXY_CLIENT_CERT, PROXY_CLIENT_KEY] {
+            let err = config_from(&[(HTTPS_PROXY, "http://proxy:3128"), (arg, "/tmp/x.pem")])
+                .unwrap_err();
+            assert!(err.contains(arg), "{err}");
+            assert!(err.contains("cleartext"), "{err}");
+        }
+    }
+
+    /// Half a client identity cannot authenticate anything, and silently
+    /// dropping it would leave the proxy unable to tell this caller apart.
+    #[test]
+    fn a_partial_client_identity_is_fatal() {
+        for arg in [PROXY_CLIENT_CERT, PROXY_CLIENT_KEY] {
+            let err = config_from(&[(HTTPS_PROXY, "https://proxy:3128"), (arg, "/tmp/x.pem")])
+                .unwrap_err();
+            assert!(
+                err.contains(PROXY_CLIENT_CERT) && err.contains(PROXY_CLIENT_KEY),
+                "{err}"
+            );
+        }
+    }
+
+    /// The operator pointed at these files, so an unusable one is fatal at
+    /// startup rather than on the first CONNECT.
+    #[test]
+    fn client_identity_files_are_validated_fail_closed() {
+        let (_ca_pem, cert_pem, key_pem) = issue_client_identity();
+        let cert = write_temp_pem(&cert_pem);
+        let key = write_temp_pem(&key_pem);
+        let cert_path = cert.path().to_str().unwrap().to_string();
+        let key_path = key.path().to_str().unwrap().to_string();
+
+        let junk = write_temp_pem("not a certificate\n");
+        let junk_path = junk.path().to_str().unwrap().to_string();
+
+        for (cert_arg, key_arg, needle) in [
+            (junk_path.as_str(), key_path.as_str(), "no certificates"),
+            (cert_path.as_str(), junk_path.as_str(), "no private key"),
+            ("/nonexistent/cert.pem", key_path.as_str(), "unreadable"),
+            (cert_path.as_str(), "/nonexistent/key.pem", "unreadable"),
+        ] {
+            let err = config_from(&[
+                (HTTPS_PROXY, "https://proxy:3128"),
+                (PROXY_CLIENT_CERT, cert_arg),
+                (PROXY_CLIENT_KEY, key_arg),
+            ])
+            .unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_client_identity_configures_the_proxy_hop_tls() {
+        let (_ca_pem, cert_pem, key_pem) = issue_client_identity();
+        let cert = write_temp_pem(&cert_pem);
+        let key = write_temp_pem(&key_pem);
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, "https://proxy:3128"),
+            (PROXY_CLIENT_CERT, cert.path().to_str().unwrap()),
+            (PROXY_CLIENT_KEY, key.path().to_str().unwrap()),
+        ]);
+        assert!(cfg.https.tls.is_some());
+    }
+
+    /// A fake `https://` proxy that requires and verifies a client
+    /// certificate, as a proxy configured with `RequireAndVerifyClientCert`
+    /// does. Returns its address, the task yielding the received CONNECT
+    /// request, and its own certificate PEM for use as the CA bundle.
+    async fn fake_mtls_proxy(
+        client_ca_pem: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_pem = cert.pem();
+
+        let mut client_roots = rustls::RootCertStore::empty();
+        for der in rustls_pemfile::certs(&mut client_ca_pem.as_bytes()) {
+            client_roots.add(der.unwrap()).unwrap();
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            // A client that presented no acceptable certificate never gets
+            // to send a request.
+            let Ok(mut tls) = acceptor.accept(socket).await else {
+                return String::new();
+            };
+            let mut buf = vec![0u8; 4096];
+            let mut used = 0;
+            loop {
+                let n = tls.read(&mut buf[used..]).await.unwrap();
+                used += n;
+                if n == 0 || buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..used]).into_owned()
+        });
+        (addr, handle, cert_pem)
+    }
+
+    /// End to end: a proxy that requires a client certificate completes the
+    /// CONNECT only because the supervisor presents one.
+    #[tokio::test]
+    async fn connect_via_an_mtls_proxy_presents_the_client_certificate() {
+        let (client_ca_pem, client_cert_pem, client_key_pem) = issue_client_identity();
+        let (addr, handle, proxy_cert_pem) = fake_mtls_proxy(&client_ca_pem).await;
+
+        let ca_file = write_temp_pem(&proxy_cert_pem);
+        let cert_file = write_temp_pem(&client_cert_pem);
+        let key_file = write_temp_pem(&client_key_pem);
+        let proxy_url = format!("https://{addr}");
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, proxy_url.as_str()),
+            (PROXY_CA_BUNDLE, ca_file.path().to_str().unwrap()),
+            (PROXY_CLIENT_CERT, cert_file.path().to_str().unwrap()),
+            (PROXY_CLIENT_KEY, key_file.path().to_str().unwrap()),
+        ]);
+
+        let stream = connect_via(&cfg.https, "api.example.com", 443, ConnectTarget::Hostname)
+            .await
+            .expect("CONNECT through the mutual-TLS proxy should succeed");
+        assert!(matches!(stream.inner, UpstreamStream::Tls(_)));
+        drop(stream);
+        let request = handle.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT api.example.com:443 HTTP/1.1\r\n"),
+            "{request}"
+        );
+    }
+
+    /// Without the client identity the same proxy rejects the handshake, so
+    /// the test above proves the certificate, not just the CA pinning.
+    #[tokio::test]
+    async fn connect_via_an_mtls_proxy_fails_without_a_client_certificate() {
+        let (client_ca_pem, _cert_pem, _key_pem) = issue_client_identity();
+        let (addr, _handle, proxy_cert_pem) = fake_mtls_proxy(&client_ca_pem).await;
+
+        let ca_file = write_temp_pem(&proxy_cert_pem);
+        let proxy_url = format!("https://{addr}");
+        let cfg = config_ok(&[
+            (HTTPS_PROXY, proxy_url.as_str()),
+            (PROXY_CA_BUNDLE, ca_file.path().to_str().unwrap()),
+        ]);
+
+        assert!(
+            connect_via(&cfg.https, "api.example.com", 443, ConnectTarget::Hostname)
+                .await
+                .is_err(),
+            "a proxy requiring a client certificate must not tunnel for an anonymous client"
         );
     }
 }

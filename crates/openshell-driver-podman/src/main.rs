@@ -151,6 +151,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
     sandbox_proxy_ca_bundle: Option<String>,
 
+    /// Identify each sandbox to the corporate proxy by sending its sandbox id
+    /// as the Proxy-Authorization Basic username. Attribution only: the value
+    /// is an identifier, not a credential, so the cleartext acknowledgement
+    /// does not apply and is rejected alongside it. Mutually exclusive with
+    /// `--sandbox-proxy-auth-file`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_SANDBOX_IDENTITY")]
+    sandbox_proxy_auth_sandbox_identity: Option<bool>,
+
     /// User namespace mode for sandbox containers (e.g. `auto`).
     /// When unset, containers use the default user namespace.
     #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
@@ -209,6 +217,7 @@ async fn main() -> Result<()> {
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
         proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+        proxy_auth_sandbox_identity: args.sandbox_proxy_auth_sandbox_identity,
         userns: args.userns,
         uidmap: args.uidmap,
         gidmap: args.gidmap,

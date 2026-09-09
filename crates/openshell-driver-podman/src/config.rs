@@ -191,6 +191,20 @@ pub struct PodmanComputeConfig {
     /// pointing the gateway host at the corporate resolver so validated-IP
     /// CONNECT works in split-horizon networks.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Identify each sandbox to the corporate proxy by sending its sandbox id
+    /// as the `Proxy-Authorization: Basic` username, with an empty password.
+    ///
+    /// This lets the proxy attribute and ACL egress per sandbox. The username
+    /// is an identifier, not a secret: the supervisor constructs the header on
+    /// the upstream hop, so a workload cannot forge or alter it, but anything
+    /// with direct network access to the proxy can. The proxy must therefore
+    /// not treat the value as authorization on its own.
+    ///
+    /// Mutually exclusive with the credential file — one request carries a
+    /// single `Proxy-Authorization` header. Fail-closed: a sandbox whose
+    /// identity is unresolved refuses to start rather than egressing
+    /// unattributed.
+    pub proxy_auth_sandbox_identity: Option<bool>,
     /// Path (on the gateway host) to a PEM CA bundle trusted for the corporate
     /// proxy.
     ///
@@ -381,12 +395,46 @@ impl PodmanComputeConfig {
                         .to_string(),
                 ));
             }
-        } else if self.proxy_auth_allow_insecure.is_some() {
+        } else if self.proxy_auth_sandbox_identity != Some(true)
+            && self.proxy_auth_allow_insecure.is_some()
+        {
             // The acknowledgement without credentials means the operator
             // believed an auth file was configured; surface the mismatch.
+            // Suppressed in sandbox-identity mode so the more specific
+            // "identifier, not a credential" rejection below reports instead.
             return Err(crate::client::PodmanApiError::InvalidInput(
                 "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
             ));
+        }
+
+        // Sandbox-identity attribution. Like every other auxiliary setting,
+        // present without a proxy means the operator believed a boundary was
+        // in effect.
+        if self.proxy_auth_sandbox_identity.is_some() && self.https_proxy.is_none() {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "proxy_auth_sandbox_identity is set but no https_proxy is configured".to_string(),
+            ));
+        }
+        if self.proxy_auth_sandbox_identity == Some(true) {
+            // One request carries one Proxy-Authorization header, so the two
+            // credential sources cannot both apply.
+            if self.proxy_auth_file.is_some() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_auth_sandbox_identity and proxy_auth_file are mutually exclusive; a \
+                     request carries a single Proxy-Authorization header"
+                        .to_string(),
+                ));
+            }
+            // The sandbox id is an identifier, not a secret, so it needs no
+            // cleartext acknowledgement; accepting one here would imply a
+            // credential is being sent.
+            if self.proxy_auth_allow_insecure.is_some() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_auth_allow_insecure does not apply to proxy_auth_sandbox_identity: \
+                     the sandbox id is an identifier, not a credential"
+                        .to_string(),
+                ));
+            }
         }
 
         // The CONNECT-target mode only means something relative to a proxy
@@ -553,6 +601,7 @@ impl Default for PodmanComputeConfig {
             proxy_auth_file: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_auth_sandbox_identity: None,
             proxy_ca_bundle: None,
             userns: None,
             uidmap: Vec::new(),
@@ -593,6 +642,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("proxy_auth_file", &self.proxy_auth_file.is_some())
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
+            .field(
+                "proxy_auth_sandbox_identity",
+                &self.proxy_auth_sandbox_identity,
+            )
             .field("proxy_ca_bundle", &self.proxy_ca_bundle)
             .field("userns", &self.userns)
             .field("uidmap", &self.uidmap)
@@ -1205,5 +1258,63 @@ mod tests {
         let cfg = PodmanComputeConfig::default();
         cfg.validate_userns_mappings()
             .expect("no userns and no maps should be accepted");
+    }
+
+    // -- sandbox-identity attribution --
+
+    #[test]
+    fn validate_proxy_config_accepts_sandbox_identity_with_a_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_auth_sandbox_identity: Some(true),
+            ..PodmanComputeConfig::default()
+        };
+        cfg.validate_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_sandbox_identity_without_a_proxy() {
+        for value in [Some(true), Some(false)] {
+            let cfg = PodmanComputeConfig {
+                proxy_auth_sandbox_identity: value,
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(
+                format!("{err:?}").contains("proxy_auth_sandbox_identity"),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// A request carries a single `Proxy-Authorization` header, so the two
+    /// credential sources cannot both apply.
+    #[test]
+    fn validate_proxy_config_rejects_sandbox_identity_with_an_auth_file() {
+        // Validation is path-shape only; the file is read at
+        // sandbox-create time, so no real file is needed here.
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            proxy_auth_sandbox_identity: Some(true),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(format!("{err:?}").contains("mutually exclusive"), "{err:?}");
+    }
+
+    /// The sandbox id is an identifier, not a secret, so the
+    /// cleartext-credential acknowledgement does not apply to it.
+    #[test]
+    fn validate_proxy_config_rejects_the_cleartext_acknowledgement_with_sandbox_identity() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_auth_sandbox_identity: Some(true),
+            proxy_auth_allow_insecure: Some(true),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(format!("{err:?}").contains("identifier, not a"), "{err:?}");
     }
 }

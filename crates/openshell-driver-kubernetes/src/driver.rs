@@ -8,8 +8,8 @@ use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
     ProvisioningMode, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
-    is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    is_dns_1123_label, managed_namespace, managed_namespace_prefix,
+    validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
@@ -290,6 +290,7 @@ const BIND_VOLUME_NAME: &str = "openshell-bind";
 const BIND_MOUNT_PATH: &str = "/var/run/openshell-bind";
 const CLIENT_TLS_VOLUME_NAME: &str = "openshell-client-tls";
 const UPSTREAM_PROXY_AUTH_VOLUME_NAME: &str = "openshell-upstream-proxy-auth";
+const UPSTREAM_PROXY_CLIENT_VOLUME_NAME: &str = "openshell-upstream-proxy-client";
 const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
 const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
 
@@ -297,6 +298,7 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     BIND_VOLUME_NAME,
     CLIENT_TLS_VOLUME_NAME,
     UPSTREAM_PROXY_AUTH_VOLUME_NAME,
+    UPSTREAM_PROXY_CLIENT_VOLUME_NAME,
     SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
     SUPERVISOR_VOLUME_NAME,
@@ -1798,6 +1800,8 @@ impl KubernetesComputeDriver {
             proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
             proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+            proxy_auth_sandbox_identity: self.config.proxy_auth_sandbox_identity == Some(true),
+            proxy_client_cert_secret_name: self.config.proxy_client_cert_secret_name.as_deref(),
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -3478,6 +3482,15 @@ fn apply_supervisor_sideload_with_params(
                 volume_mounts.push(upstream_proxy_auth_volume_mount());
             }
         }
+        if params.proxy_client_cert_secret_name.is_some() {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(upstream_proxy_client_volume_mount());
+            }
+        }
     }
 }
 
@@ -3522,7 +3535,32 @@ fn upstream_proxy_cli_args(params: &SandboxPodParams<'_>) -> Vec<String> {
     if params.proxy_connect_by_hostname {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
     }
+    // Attribution rather than authentication: the supervisor resolves the id
+    // itself, so nothing sandbox-controlled reaches the header, and the pod
+    // spec carries no credential — the flag takes no value.
+    if params.proxy_auth_sandbox_identity {
+        args.push("--upstream-proxy-auth-sandbox-identity".to_string());
+    }
+    if params.proxy_client_cert_secret_name.is_some() {
+        args.extend([
+            "--upstream-proxy-client-cert".to_string(),
+            openshell_core::container_paths::UPSTREAM_PROXY_CLIENT_CERT_MOUNT_PATH.to_string(),
+            "--upstream-proxy-client-key".to_string(),
+            openshell_core::container_paths::UPSTREAM_PROXY_CLIENT_KEY_MOUNT_PATH.to_string(),
+        ]);
+    }
     args
+}
+
+/// The client-certificate mount is a directory: kubelet projects `tls.crt`
+/// and `tls.key` from one TLS Secret, and both paths go on the supervisor's
+/// argv.
+fn upstream_proxy_client_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": UPSTREAM_PROXY_CLIENT_VOLUME_NAME,
+        "mountPath": openshell_core::container_paths::UPSTREAM_PROXY_CLIENT_DIR,
+        "readOnly": true,
+    })
 }
 
 fn upstream_proxy_auth_volume_mount() -> serde_json::Value {
@@ -3714,6 +3752,12 @@ fn supervisor_sidecar_container(
             .as_array_mut()
             .expect("volumeMounts is an array")
             .push(upstream_proxy_auth_volume_mount());
+    }
+    if params.proxy_client_cert_secret_name.is_some() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(upstream_proxy_client_volume_mount());
     }
     if let Some(profile) = params.app_armor_profile {
         container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
@@ -4112,6 +4156,12 @@ struct SandboxPodParams<'a> {
     proxy_auth_secret_key: Option<&'a str>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
+    /// Send the sandbox id as the Basic-auth username so the proxy can
+    /// attribute and ACL egress per sandbox.
+    proxy_auth_sandbox_identity: bool,
+    /// TLS Secret holding the client certificate presented to an `https://`
+    /// proxy that authenticates its callers.
+    proxy_client_cert_secret_name: Option<&'a str>,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
@@ -4153,6 +4203,8 @@ impl Default for SandboxPodParams<'_> {
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: false,
             proxy_connect_by_hostname: false,
+            proxy_auth_sandbox_identity: false,
+            proxy_client_cert_secret_name: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
@@ -4664,6 +4716,25 @@ fn sandbox_template_to_k8s_with_validated_config(
                     "key": secret_key,
                     "path": upstream_proxy_auth_file_name(),
                 }]
+            }
+        }));
+    }
+    if let Some(secret_name) = params.proxy_client_cert_secret_name {
+        // Same mount isolation as the credential volume: only the container
+        // running network supervision sees the private key.
+        let default_mode = match params.topology {
+            SupervisorTopology::Combined => 0o400,
+            SupervisorTopology::Sidecar => 0o440,
+        };
+        volumes.push(serde_json::json!({
+            "name": UPSTREAM_PROXY_CLIENT_VOLUME_NAME,
+            "secret": {
+                "secretName": secret_name,
+                "defaultMode": default_mode,
+                "items": [
+                    { "key": "tls.crt", "path": "tls.crt" },
+                    { "key": "tls.key", "path": "tls.key" },
+                ]
             }
         }));
     }
@@ -9296,6 +9367,180 @@ mod tests {
         assert_eq!(volume["secret"]["defaultMode"], 0o440);
     }
 
+    /// The pod spec must never carry the sandbox id as a proxy credential;
+    /// the supervisor resolves it in-pod after activation, so the flag takes
+    /// no value.
+    #[test]
+    fn sandbox_identity_argv_is_a_bare_flag_with_no_value() {
+        let params = SandboxPodParams {
+            https_proxy: Some("http://egress.openshell.svc:3128"),
+            proxy_auth_sandbox_identity: true,
+            ..SandboxPodParams::default()
+        };
+        let args = upstream_proxy_cli_args(&params);
+        assert_eq!(
+            args,
+            vec![
+                "--upstream-proxy",
+                "http://egress.openshell.svc:3128",
+                "--upstream-proxy-auth-sandbox-identity",
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_identity_flag_is_absent_by_default() {
+        let params = SandboxPodParams {
+            https_proxy: Some("http://egress.openshell.svc:3128"),
+            ..SandboxPodParams::default()
+        };
+        assert!(
+            !upstream_proxy_cli_args(&params)
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-auth-sandbox-identity")
+        );
+    }
+
+    /// Identity mode carries no secret, so the pod must gain no credential
+    /// volume — nothing to mount and nothing to leak.
+    #[test]
+    fn sandbox_identity_needs_no_credential_volume() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            https_proxy: Some("http://egress.openshell.svc:3128"),
+            proxy_auth_sandbox_identity: true,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let network = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert!(
+            network["command"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-auth-sandbox-identity")
+        );
+        assert!(
+            !pod["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| volume["name"] == UPSTREAM_PROXY_AUTH_VOLUME_NAME)
+        );
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(!agent["command"].as_array().unwrap().iter().any(|arg| {
+            arg.as_str()
+                .is_some_and(|arg| arg.starts_with("--upstream-"))
+        }));
+    }
+
+    /// The client certificate arrives from a TLS Secret and both halves go on
+    /// the supervisor's argv, so a proxy configured for mutual TLS gets an
+    /// identity it can verify.
+    #[test]
+    fn client_cert_secret_is_mounted_and_rendered_for_the_network_supervisor_only() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            https_proxy: Some("https://egress.openshell.svc:3128"),
+            proxy_client_cert_secret_name: Some("corporate-proxy-client"),
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        let network = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        let command = network["command"].as_array().unwrap();
+        let cert_index = command
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-client-cert")
+            .unwrap();
+        assert_eq!(
+            command[cert_index + 1],
+            openshell_core::container_paths::UPSTREAM_PROXY_CLIENT_CERT_MOUNT_PATH
+        );
+        let key_index = command
+            .iter()
+            .position(|arg| arg == "--upstream-proxy-client-key")
+            .unwrap();
+        assert_eq!(
+            command[key_index + 1],
+            openshell_core::container_paths::UPSTREAM_PROXY_CLIENT_KEY_MOUNT_PATH
+        );
+        assert!(
+            network["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == UPSTREAM_PROXY_CLIENT_VOLUME_NAME)
+        );
+
+        let volume = pod["spec"]["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == UPSTREAM_PROXY_CLIENT_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(volume["secret"]["secretName"], "corporate-proxy-client");
+        assert_eq!(volume["secret"]["items"][0]["key"], "tls.crt");
+        assert_eq!(volume["secret"]["items"][1]["key"], "tls.key");
+        assert_eq!(volume["secret"]["defaultMode"], 0o440);
+
+        // The private key stays out of the workload container.
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(
+            !agent["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == UPSTREAM_PROXY_CLIENT_VOLUME_NAME)
+        );
+    }
+
+    #[test]
+    fn client_cert_argv_and_volume_are_absent_by_default() {
+        let params = SandboxPodParams {
+            https_proxy: Some("https://egress.openshell.svc:3128"),
+            ..SandboxPodParams::default()
+        };
+        assert!(
+            !upstream_proxy_cli_args(&params)
+                .iter()
+                .any(|arg| arg.starts_with("--upstream-proxy-client-"))
+        );
+    }
+
     #[test]
     fn sandbox_lookup_selector_always_includes_gateway_id() {
         let sel = sandbox_lookup_selector_for("sb-123", "gw-42");
@@ -9611,5 +9856,4 @@ mod tests {
         assert_eq!(ready.reason, "ImagePullBackOff");
         assert_eq!(ready.message, "Failed to pull image");
     }
-
 }

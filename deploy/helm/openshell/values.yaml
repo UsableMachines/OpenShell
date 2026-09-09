@@ -78,6 +78,23 @@ upstreamProxy:
   authAllowInsecure: false
   # -- Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets.
   connectByHostname: false
+  # -- Identify each sandbox to the proxy by sending its sandbox id as the
+  # Proxy-Authorization Basic username, with an empty password, so the proxy
+  # can attribute and ACL egress per sandbox. The username is an identifier,
+  # not a secret: the supervisor builds the header on the upstream hop, so a
+  # workload cannot forge it, but anything with direct network access to the
+  # proxy can -- the proxy must not treat it as authorization on its own.
+  # Mutually exclusive with authSecret, and it rejects authAllowInsecure
+  # because no credential is sent. A sandbox whose identity is unresolved
+  # refuses to start rather than egressing unattributed.
+  authSandboxIdentity: false
+  clientCertSecret:
+    # -- Existing kubernetes.io/tls Secret in the sandbox namespace whose
+    # tls.crt / tls.key the supervisor presents on the TLS hop to a proxy that
+    # authenticates its callers with mutual TLS. Requires an https:// url and
+    # supervisor.topology "sidecar", which keeps the private-key mount out of
+    # the workload container.
+    name: ""
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

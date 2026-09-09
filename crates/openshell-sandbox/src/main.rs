@@ -254,6 +254,26 @@ struct Args {
     /// re-signed upstream certificates and the sandbox trust bundle.
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
+
+    /// Identify this sandbox to the corporate proxy by sending its resolved
+    /// sandbox id as the `Proxy-Authorization: Basic` username, with an empty
+    /// password. Attribution only: the value is an identifier, not a
+    /// credential, so the cleartext-credential acknowledgement does not apply
+    /// and is rejected alongside it. Mutually exclusive with
+    /// `--upstream-proxy-auth-file`; fatal if the sandbox identity is
+    /// unresolved.
+    #[arg(long)]
+    upstream_proxy_auth_sandbox_identity: bool,
+
+    /// PEM client certificate presented to the proxy, for a proxy that
+    /// authenticates its callers. Set together with the key, and only with an
+    /// `https://` proxy.
+    #[arg(long)]
+    upstream_proxy_client_cert: Option<String>,
+
+    /// PEM private key for `--upstream-proxy-client-cert`.
+    #[arg(long)]
+    upstream_proxy_client_key: Option<String>,
 }
 
 /// Internal one-shot command used by the privileged supervisor to validate an
@@ -790,6 +810,9 @@ fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
             proxy_ca_bundle: args.upstream_proxy_ca_bundle,
+            proxy_auth_sandbox_identity: args.upstream_proxy_auth_sandbox_identity,
+            proxy_client_cert: args.upstream_proxy_client_cert,
+            proxy_client_key: args.upstream_proxy_client_key,
         };
 
         run_sandbox(

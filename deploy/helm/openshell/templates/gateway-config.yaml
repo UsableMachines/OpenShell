@@ -179,6 +179,12 @@ data:
     {{- if .Values.upstreamProxy.connectByHostname }}
     proxy_connect_by_hostname    = true
     {{- end }}
+    {{- if .Values.upstreamProxy.authSandboxIdentity }}
+    proxy_auth_sandbox_identity  = true
+    {{- end }}
+    {{- if .Values.upstreamProxy.clientCertSecret.name }}
+    proxy_client_cert_secret_name = {{ .Values.upstreamProxy.clientCertSecret.name | quote }}
+    {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
     {{- end }}

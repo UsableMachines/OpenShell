@@ -13,8 +13,8 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, ProvisioningMode,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    KubernetesSidecarConfig, ManagedSshIngressConfig, ProvisioningMode, SupervisorSideloadMethod,
+    SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -166,6 +166,20 @@ struct Args {
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME", action = ArgAction::SetTrue)]
     proxy_connect_by_hostname: bool,
 
+    /// Identify each sandbox to the corporate proxy by sending its sandbox id
+    /// as the Proxy-Authorization Basic username. Attribution only: the value
+    /// is an identifier, not a credential, so the cleartext acknowledgement
+    /// does not apply and is rejected alongside it. Mutually exclusive with
+    /// `--proxy-auth-secret-name`.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_SANDBOX_IDENTITY", action = ArgAction::SetTrue)]
+    proxy_auth_sandbox_identity: bool,
+
+    /// Kubernetes TLS Secret (`tls.crt` / `tls.key`) holding the client
+    /// certificate presented to an https:// upstream proxy that authenticates
+    /// its callers.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CLIENT_CERT_SECRET_NAME")]
+    proxy_client_cert_secret_name: Option<String>,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -296,6 +310,8 @@ async fn main() -> Result<()> {
             proxy_auth_secret_key: args.proxy_auth_secret_key,
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
+            proxy_auth_sandbox_identity: args.proxy_auth_sandbox_identity.then_some(true),
+            proxy_client_cert_secret_name: args.proxy_client_cert_secret_name,
             provisioning_mode: args.provisioning_mode,
             claim_template_name: args.claim_template_name.unwrap_or_default(),
             claim_warm_pool_name: args.claim_warm_pool_name,

@@ -184,6 +184,53 @@ tests:
           path: data["gateway.toml"]
           pattern: 'proxy_connect_by_hostname\s*=\s*true'
 
+  - it: renders per-sandbox proxy attribution when authSandboxIdentity is set
+    template: templates/gateway-config.yaml
+    set:
+      upstreamProxy.url: http://openshell-egress.openshell.svc:3128
+      upstreamProxy.authSandboxIdentity: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_sandbox_identity\s*=\s*true'
+      # Identity mode carries no credential, so neither the Secret reference
+      # nor the cleartext acknowledgement may appear alongside it.
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_allow_insecure'
+
+  - it: omits per-sandbox proxy attribution by default
+    template: templates/gateway-config.yaml
+    set:
+      upstreamProxy.url: http://openshell-egress.openshell.svc:3128
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_sandbox_identity'
+
+  - it: renders the proxy client certificate Secret reference
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: sidecar
+      upstreamProxy.url: https://openshell-egress.openshell.svc:3128
+      upstreamProxy.clientCertSecret.name: corporate-proxy-client
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_client_cert_secret_name\s*=\s*"corporate-proxy-client"'
+
+  - it: omits the proxy client certificate Secret reference by default
+    template: templates/gateway-config.yaml
+    set:
+      upstreamProxy.url: https://openshell-egress.openshell.svc:3128
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_client_cert_secret_name'
+
   - it: uses the gateway built-in supervisor image by default
     template: templates/gateway-config.yaml
     asserts:

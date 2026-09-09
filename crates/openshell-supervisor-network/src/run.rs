@@ -447,6 +447,7 @@ pub async fn run_networking(
             activity_tx.clone(),
             engine_ready_rx,
             upstream_proxy_args,
+            sandbox_id,
         )
         .await?;
         Some(proxy_handle)
@@ -481,6 +482,7 @@ pub async fn run_networking(
             denial_tx,
             activity_tx,
             upstream_proxy_args,
+            sandbox_id,
             transparent_engine_ready_rx,
         )?;
         (Some(dns), Some(transparent))

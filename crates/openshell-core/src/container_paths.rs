@@ -48,6 +48,14 @@ pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-proxy";
+/// Directory holding the client certificate presented to an `https://`
+/// corporate proxy that authenticates its callers.
+///
+/// A separate directory from the credential mount: the two arrive from
+/// different Secrets, and two volumes cannot share one mount path.
+pub const UPSTREAM_PROXY_CLIENT_DIR: &str = "/etc/openshell/proxy-client";
+pub const UPSTREAM_PROXY_CLIENT_CERT_MOUNT_PATH: &str = "/etc/openshell/proxy-client/tls.crt";
+pub const UPSTREAM_PROXY_CLIENT_KEY_MOUNT_PATH: &str = "/etc/openshell/proxy-client/tls.key";
 pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
 pub const POLICY_ADVISOR_SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
 
@@ -114,6 +122,9 @@ mod tests {
             TLS_KEY_MOUNT_PATH,
             SANDBOX_TOKEN_MOUNT_PATH,
             UPSTREAM_PROXY_AUTH_MOUNT_PATH,
+            UPSTREAM_PROXY_CLIENT_DIR,
+            UPSTREAM_PROXY_CLIENT_CERT_MOUNT_PATH,
+            UPSTREAM_PROXY_CLIENT_KEY_MOUNT_PATH,
             CONTAINER_POLICY_PATH,
             POLICY_ADVISOR_SKILL_PATH,
             SSH_SOCKET_PATH,

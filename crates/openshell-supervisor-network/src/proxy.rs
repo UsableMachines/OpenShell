@@ -255,6 +255,7 @@ impl ProxyHandle {
         activity_tx: Option<ActivitySender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        sandbox_id: Option<&str>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -309,7 +310,7 @@ impl ProxyHandle {
         // from silently degrading to direct dialing or unauthenticated proxy
         // access.
         let upstream_proxy: Arc<Option<UpstreamProxyConfig>> = Arc::new(
-            UpstreamProxyConfig::from_args(upstream_proxy_args).map_err(|err| {
+            UpstreamProxyConfig::from_args(upstream_proxy_args, sandbox_id).map_err(|err| {
                 let event =
                     openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                         .severity(SeverityId::High)
@@ -506,10 +507,11 @@ impl TransparentTcpHandle {
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
         activity_tx: Option<ActivitySender>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        sandbox_id: Option<&str>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
         let upstream_proxy = Arc::new(
-            UpstreamProxyConfig::from_args(upstream_proxy_args)
+            UpstreamProxyConfig::from_args(upstream_proxy_args, sandbox_id)
                 .map_err(|error| miette::miette!(error))?,
         );
         let mut joins = Vec::with_capacity(listeners.len());
@@ -6889,11 +6891,14 @@ network_policies:
         });
 
         // Operator config: proxy set + connect-by-hostname opt-in.
-        let cfg = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
-            https_proxy: Some(format!("http://{proxy_addr}")),
-            proxy_connect_by_hostname: true,
-            ..Default::default()
-        })
+        let cfg = UpstreamProxyConfig::from_args(
+            &upstream_proxy::UpstreamProxyArgs {
+                https_proxy: Some(format!("http://{proxy_addr}")),
+                proxy_connect_by_hostname: true,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap();
 
         // host_lc = normalized (undotted), raw_host_lc = absolute (dotted).
@@ -7164,11 +7169,14 @@ network_policies:
                 .await
                 .unwrap();
         });
-        let config = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
-            https_proxy: Some(format!("http://{proxy_addr}")),
-            proxy_connect_by_hostname: true,
-            ..Default::default()
-        })
+        let config = UpstreamProxyConfig::from_args(
+            &upstream_proxy::UpstreamProxyArgs {
+                https_proxy: Some(format!("http://{proxy_addr}")),
+                proxy_connect_by_hostname: true,
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
         let approved = "203.0.113.27:6379".parse().unwrap();

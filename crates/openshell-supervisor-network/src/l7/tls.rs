@@ -207,9 +207,34 @@ pub async fn tls_connect_upstream(
 /// `system_ca_bundle` is ignored because the native store already reflects all
 /// operator-installed trust anchors.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(build_upstream_root_store(system_ca_bundle)?)
-        .with_no_client_auth();
+    build_upstream_client_config_with_client_auth(system_ca_bundle, None)
+}
+
+/// A client certificate chain and its private key, presented to the peer when
+/// the peer authenticates its callers.
+pub struct ClientIdentity {
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    pub private_key: PrivateKeyDer<'static>,
+}
+
+/// [`build_upstream_client_config`] with an optional client identity.
+///
+/// Used for the hop to an `https://` corporate proxy that authenticates its
+/// callers with mutual TLS. L7 upstream verification passes `None`: the
+/// identity belongs to the proxy hop alone and must not be presented to
+/// arbitrary destinations.
+pub fn build_upstream_client_config_with_client_auth(
+    system_ca_bundle: &str,
+    client_identity: Option<ClientIdentity>,
+) -> Result<Arc<ClientConfig>> {
+    let builder = ClientConfig::builder()
+        .with_root_certificates(build_upstream_root_store(system_ca_bundle)?);
+    let mut config = match client_identity {
+        Some(identity) => builder
+            .with_client_auth_cert(identity.cert_chain, identity.private_key)
+            .into_diagnostic()?,
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))

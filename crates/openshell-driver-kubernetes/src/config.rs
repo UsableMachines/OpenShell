@@ -380,6 +380,25 @@ pub struct KubernetesComputeConfig {
     /// Send hostnames rather than validated IPs in CONNECT requests. This is a
     /// last-resort compatibility mode for hostname-filtering proxy ACLs.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Identify each sandbox to the corporate proxy by sending its sandbox id
+    /// as the `Proxy-Authorization: Basic` username, with an empty password.
+    ///
+    /// This lets the proxy attribute and ACL egress per sandbox. The username
+    /// is an identifier, not a secret: the supervisor constructs the header on
+    /// the upstream hop, so a workload cannot forge or alter it, but anything
+    /// with direct network access to the proxy can. The proxy must therefore
+    /// not treat the value as authorization on its own.
+    ///
+    /// Mutually exclusive with the credential Secret — one request carries a
+    /// single `Proxy-Authorization` header. Fail-closed: a sandbox whose
+    /// identity is unresolved refuses to start rather than egressing
+    /// unattributed.
+    pub proxy_auth_sandbox_identity: Option<bool>,
+    /// Name of a Kubernetes TLS Secret holding the client certificate the
+    /// supervisor presents on the TLS hop to an `https://` proxy that
+    /// authenticates its callers. Read from the conventional `tls.crt` and
+    /// `tls.key` keys and mounted only in the network-supervising container.
+    pub proxy_client_cert_secret_name: Option<String>,
     /// How the driver provisions sandbox resources on Kubernetes.
     pub provisioning_mode: ProvisioningMode,
     /// Name of the Agent Sandbox `SandboxTemplate` to reference when
@@ -503,6 +522,8 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_auth_sandbox_identity: None,
+            proxy_client_cert_secret_name: None,
             provisioning_mode: ProvisioningMode::default(),
             claim_template_name: String::new(),
             claim_warm_pool_name: "default".to_string(),
@@ -581,7 +602,12 @@ impl KubernetesComputeConfig {
         let secret_key = self.proxy_auth_secret_key.as_deref();
         match (secret_name, secret_key) {
             (None, None) => {
-                if self.proxy_auth_allow_insecure == Some(true) {
+                // Suppressed in sandbox-identity mode so the more specific
+                // "identifier, not a credential" rejection below reports
+                // instead of this generic mismatch.
+                if self.proxy_auth_sandbox_identity != Some(true)
+                    && self.proxy_auth_allow_insecure == Some(true)
+                {
                     return Err("proxy_auth_allow_insecure is set but no proxy credential Secret is configured".to_string());
                 }
             }
@@ -648,6 +674,75 @@ impl KubernetesComputeConfig {
                 "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
             );
         }
+
+        // Sandbox-identity attribution. Like every other auxiliary setting,
+        // present without a proxy means the operator believed a boundary was
+        // in effect.
+        if self.proxy_auth_sandbox_identity.is_some() && self.https_proxy.is_none() {
+            return Err(
+                "proxy_auth_sandbox_identity is set but no https_proxy is configured".to_string(),
+            );
+        }
+        if self.proxy_auth_sandbox_identity == Some(true) {
+            // One request carries one Proxy-Authorization header, so the two
+            // credential sources cannot both apply.
+            if self.proxy_auth_secret_name.is_some() {
+                return Err(
+                    "proxy_auth_sandbox_identity and proxy_auth_secret_name are mutually \
+                     exclusive; a request carries a single Proxy-Authorization header"
+                        .to_string(),
+                );
+            }
+            // The sandbox id is an identifier, not a secret, so it needs no
+            // cleartext acknowledgement; accepting one here would imply a
+            // credential is being sent.
+            if self.proxy_auth_allow_insecure.is_some() {
+                return Err(
+                    "proxy_auth_allow_insecure does not apply to proxy_auth_sandbox_identity: \
+                     the sandbox id is an identifier, not a credential"
+                        .to_string(),
+                );
+            }
+        }
+
+        // Client certificate for a proxy that authenticates its callers.
+        // There is no TLS hop to present it on without an `https://` proxy,
+        // where the supervisor rejects it rather than letting the argv claim
+        // an authenticated hop that is plain cleartext.
+        if let Some(name) = self.proxy_client_cert_secret_name.as_deref() {
+            if name.trim().is_empty() {
+                return Err("proxy_client_cert_secret_name must not be empty when set".to_string());
+            }
+            if !is_dns1123_subdomain(name) {
+                return Err(
+                    "proxy_client_cert_secret_name must be a valid Kubernetes DNS-1123 subdomain"
+                        .to_string(),
+                );
+            }
+            let secure = self
+                .https_proxy
+                .as_deref()
+                .and_then(|url| parse_upstream_proxy_url(url).ok())
+                .is_some_and(|addr| addr.secure);
+            if !secure {
+                return Err(
+                    "proxy_client_cert_secret_name requires an https:// https_proxy; there is no \
+                     TLS hop to present a client certificate on otherwise"
+                        .to_string(),
+                );
+            }
+            // The private key is secret material, so it gets the same mount
+            // isolation as the credential Secret: combined topology shares the
+            // mount with the workload and fsGroup can make it readable by the
+            // sandbox user.
+            if self.topology == SupervisorTopology::Combined {
+                return Err(
+                    "proxy_client_cert_secret_name requires topology = \"sidecar\"; combined topology shares the client-key mount with the workload and fsGroup can make it readable by the sandbox user"
+                        .to_string(),
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -1942,5 +2037,143 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.provisioning_mode, ProvisioningMode::Claim);
+    }
+
+    // -- sandbox-identity attribution --
+
+    #[test]
+    fn upstream_proxy_config_accepts_sandbox_identity_with_a_proxy() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://egress.openshell.svc:3128".to_string()),
+            proxy_auth_sandbox_identity: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_upstream_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_sandbox_identity_without_a_proxy() {
+        for value in [Some(true), Some(false)] {
+            let cfg = KubernetesComputeConfig {
+                proxy_auth_sandbox_identity: value,
+                ..KubernetesComputeConfig::default()
+            };
+            let err = cfg.validate_upstream_proxy_config().unwrap_err();
+            assert!(err.contains("proxy_auth_sandbox_identity"), "{err}");
+            assert!(err.contains("https_proxy"), "{err}");
+        }
+    }
+
+    /// A request carries a single `Proxy-Authorization` header, so the two
+    /// credential sources cannot both apply.
+    #[test]
+    fn upstream_proxy_config_rejects_sandbox_identity_with_a_credential_secret() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Sidecar,
+            https_proxy: Some("http://egress.openshell.svc:3128".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            proxy_auth_sandbox_identity: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    /// The sandbox id is an identifier, not a secret. Accepting the
+    /// cleartext-credential acknowledgement alongside it would tell the
+    /// operator a credential is being sent when none is.
+    #[test]
+    fn upstream_proxy_config_rejects_the_cleartext_acknowledgement_with_sandbox_identity() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://egress.openshell.svc:3128".to_string()),
+            proxy_auth_sandbox_identity: Some(true),
+            proxy_auth_allow_insecure: Some(true),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("identifier, not a credential"), "{err}");
+    }
+
+    #[test]
+    fn toml_reads_the_sandbox_identity_setting() {
+        let cfg: KubernetesComputeConfig = toml::from_str(
+            r#"
+                https_proxy = "http://egress.openshell.svc:3128"
+                proxy_auth_sandbox_identity = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.proxy_auth_sandbox_identity, Some(true));
+        cfg.validate_upstream_proxy_config().unwrap();
+    }
+
+    #[test]
+    fn toml_default_leaves_sandbox_identity_unset() {
+        let cfg: KubernetesComputeConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.proxy_auth_sandbox_identity, None);
+        assert_eq!(cfg.proxy_client_cert_secret_name, None);
+    }
+
+    // -- client certificate on the proxy hop --
+
+    #[test]
+    fn upstream_proxy_config_accepts_a_client_cert_secret_with_an_https_proxy() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Sidecar,
+            https_proxy: Some("https://egress.openshell.svc:3128".to_string()),
+            proxy_client_cert_secret_name: Some("corporate-proxy-client".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_upstream_proxy_config().unwrap();
+    }
+
+    /// There is no TLS hop to present a client certificate on without an
+    /// `https://` proxy, and the supervisor rejects the pairing rather than
+    /// letting the argv claim an authenticated hop that is plain cleartext.
+    #[test]
+    fn upstream_proxy_config_rejects_a_client_cert_secret_without_an_https_proxy() {
+        for url in [None, Some("http://egress.openshell.svc:3128")] {
+            let cfg = KubernetesComputeConfig {
+                topology: SupervisorTopology::Sidecar,
+                https_proxy: url.map(str::to_string),
+                proxy_client_cert_secret_name: Some("corporate-proxy-client".to_string()),
+                ..KubernetesComputeConfig::default()
+            };
+            let err = cfg.validate_upstream_proxy_config().unwrap_err();
+            assert!(err.contains("https://"), "{url:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_an_invalid_client_cert_secret_name() {
+        for name in ["", "  ", "Not_A_Secret"] {
+            let cfg = KubernetesComputeConfig {
+                topology: SupervisorTopology::Sidecar,
+                https_proxy: Some("https://egress.openshell.svc:3128".to_string()),
+                proxy_client_cert_secret_name: Some(name.to_string()),
+                ..KubernetesComputeConfig::default()
+            };
+            let err = cfg.validate_upstream_proxy_config().unwrap_err();
+            assert!(
+                err.contains("proxy_client_cert_secret_name"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// The private key is secret material, so it gets the credential Secret's
+    /// mount isolation: combined topology shares the mount with the workload.
+    #[test]
+    fn upstream_proxy_config_rejects_a_client_cert_secret_in_combined_topology() {
+        let cfg = KubernetesComputeConfig {
+            topology: SupervisorTopology::Combined,
+            https_proxy: Some("https://egress.openshell.svc:3128".to_string()),
+            proxy_client_cert_secret_name: Some("corporate-proxy-client".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("sidecar"), "{err}");
     }
 }

@@ -465,6 +465,12 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
         args.push("--upstream-proxy-ca-bundle".to_string());
         args.push(PROXY_CA_MOUNT_PATH.to_string());
     }
+    // Attribution rather than authentication: the supervisor resolves the id
+    // itself, so nothing sandbox-controlled reaches the header, and the flag
+    // takes no value.
+    if config.proxy_auth_sandbox_identity == Some(true) {
+        args.push("--upstream-proxy-auth-sandbox-identity".to_string());
+    }
     args
 }
 
@@ -3350,6 +3356,33 @@ mod tests {
                     && m["type"].as_str() == Some("bind")
             ),
             "supervisor bind mount should not be present by default"
+        );
+    }
+
+    #[test]
+    fn container_spec_renders_the_sandbox_identity_flag() {
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+        config.proxy_auth_sandbox_identity = Some(true);
+        let args = upstream_proxy_cli_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "--upstream-proxy",
+                "http://proxy.corp.com:8080",
+                "--upstream-proxy-auth-sandbox-identity",
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_identity_flag_is_absent_by_default() {
+        let mut config = test_config();
+        config.https_proxy = Some("http://proxy.corp.com:8080".to_string());
+        assert!(
+            !upstream_proxy_cli_args(&config)
+                .iter()
+                .any(|arg| arg == "--upstream-proxy-auth-sandbox-identity")
         );
     }
 }
