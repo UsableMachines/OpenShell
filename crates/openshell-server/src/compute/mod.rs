@@ -15,6 +15,7 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::session_liveness::PeerSessions;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
@@ -1432,7 +1433,10 @@ impl ComputeRuntime {
     ) -> Option<Sandbox> {
         let sandbox_id = transition.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(transition);
-        let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
+        let session_connected = self
+            .supervisor_sessions
+            .session_connected_in_fleet(&sandbox_id)
+            .await;
         match self
             .store
             .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |sandbox| {
@@ -1884,7 +1888,10 @@ impl ComputeRuntime {
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
-                let session_connected = self.supervisor_sessions.has_session(sandbox_id);
+                let session_connected = self
+                    .supervisor_sessions
+                    .session_connected_in_fleet(sandbox_id)
+                    .await;
                 self.write_delete_recovery_with_retry(
                     sandbox_id,
                     deleting_resource_version,
@@ -2989,7 +2996,10 @@ impl ComputeRuntime {
         expected_resource_version: u64,
         existing_phase: SandboxPhase,
     ) -> Result<(), String> {
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let session_connected = self
+            .supervisor_sessions
+            .session_connected_in_fleet(&incoming.id)
+            .await;
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
@@ -3031,17 +3041,104 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true, Some(instance_id), false)
-            .await
+        // A connect only ever promotes to Ready, which no peer's session can
+        // contradict, so the peer rows do not enter into it.
+        self.set_supervisor_session_state(
+            sandbox_id,
+            true,
+            Some(instance_id),
+            false,
+            PeerSessions::None,
+        )
+        .await
     }
 
+    /// `peers` says what the liveness rows report about this sandbox once this
+    /// session has released its own record.
+    ///
+    /// It has to be passed in rather than read here. The phase is one row for
+    /// the whole fleet, while a session is one replica's, so the disconnecting
+    /// replica is not entitled to write "no session" on everybody's behalf;
+    /// only the session layer, which holds the liveness records, can say
+    /// whether it was the last one. Callers with no cross-replica liveness at
+    /// all pass [`PeerSessions::None`], which is the single-replica truth: the
+    /// only session was this one.
     pub async fn supervisor_session_disconnected(
         &self,
         sandbox_id: &str,
         terminal_delivery_finalized: bool,
+        peers: PeerSessions,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false, None, terminal_delivery_finalized)
+        self.set_supervisor_session_state(
+            sandbox_id,
+            false,
+            None,
+            terminal_delivery_finalized,
+            peers,
+        )
+        .await
+    }
+
+    /// Re-assert Ready for a sandbox whose supervisor session is live here.
+    ///
+    /// The session is the evidence, and it is this replica's own: the same
+    /// evidence the connect wrote Ready from, still true. Called on the
+    /// liveness renewal cadence so a demotion written by a peer — whose
+    /// lookup raced an expiry, or found a store that could not answer before
+    /// this ran — cannot hold a serving sandbox down for longer than that.
+    ///
+    /// Promotes from `Provisioning` only. Every other phase is a fact about
+    /// the sandbox's own lifecycle, owned by whoever drove the transition, and
+    /// a live session is not evidence against any of them.
+    pub async fn supervisor_session_still_ready(&self, sandbox_id: &str) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+
+        let Some(existing) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
             .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(());
+        };
+        if SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown)
+            != SandboxPhase::Provisioning
+        {
+            return Ok(());
+        }
+
+        let sandbox = match self
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox_id,
+                sandbox_resource_version(&existing),
+                |sandbox| {
+                    let sandbox_name = sandbox.object_name().to_string();
+                    ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+                    sandbox.set_phase(SandboxPhase::Ready as i32);
+                },
+            )
+            .await
+        {
+            Ok(sandbox) => sandbox,
+            // Somebody else wrote first. The next renewal re-reads and decides
+            // again, so there is nothing to resolve here.
+            Err(crate::persistence::PersistenceError::Conflict { .. }) => return Ok(()),
+            Err(crate::persistence::PersistenceError::Database(ref msg))
+                if msg.contains("not found") =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err.to_string()),
+        };
+
+        info!(
+            sandbox_id = %sandbox_id,
+            "supervisor session: re-asserted Ready for a sandbox this replica is serving"
+        );
+        self.sandbox_index.update_from_sandbox(&sandbox);
+        self.sandbox_watch_bus.notify(sandbox_id);
+        Ok(())
     }
 
     async fn set_supervisor_session_state(
@@ -3050,6 +3147,7 @@ impl ComputeRuntime {
         connected: bool,
         instance_id: Option<&str>,
         terminal_delivery_finalized: bool,
+        peers: PeerSessions,
     ) -> Result<(), String> {
         let guard = self.sync_lock.lock().await;
 
@@ -3082,6 +3180,31 @@ impl ComputeRuntime {
             return Ok(());
         }
         if !connected && current_phase != SandboxPhase::Ready {
+            return Ok(());
+        }
+        // A sandbox's supervisor holds a session to every replica in its
+        // subset, so one session ending is not the sandbox losing its
+        // supervisor — the peers' sessions are live and serving. Writing
+        // Provisioning here would report a serving sandbox as not-ready for
+        // the whole fleet, and callers gate admission on that phase: every
+        // exec would be refused until some replica's session reconnected.
+        // Draining one replica is an ordinary rollout, so that is the common
+        // case rather than a corner.
+        //
+        // Evidence of a peer suppresses the write, and so does the absence of
+        // an answer. A store that could not be asked says nothing about the
+        // other replicas, and writing "no supervisor" on the fleet's behalf
+        // from a failed read is a guess that refuses every caller until some
+        // session reconnects. Leaving the phase alone errs the other way — a
+        // sandbox may read Ready for a moment after its last supervisor went —
+        // and the relay answers that case in a round trip, from the
+        // connections rather than from a row.
+        if !connected && matches!(peers, PeerSessions::Serving | PeerSessions::Unknown) {
+            debug!(
+                sandbox_id = %sandbox_id,
+                peers = ?peers,
+                "supervisor session: disconnect is not this sandbox losing its supervisor; phase unchanged"
+            );
             return Ok(());
         }
         let expected_resource_version = sandbox_resource_version(&existing);
@@ -6035,7 +6158,7 @@ mod tests {
             .unwrap();
         assert_eq!(driver.delete_calls(), 0);
         runtime
-            .supervisor_session_disconnected("sb-1", true)
+            .supervisor_session_disconnected("sb-1", true, PeerSessions::None)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -8036,7 +8159,7 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         runtime
-            .supervisor_session_disconnected("sb-1", false)
+            .supervisor_session_disconnected("sb-1", false, PeerSessions::None)
             .await
             .unwrap();
 
@@ -9557,7 +9680,7 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
-            .supervisor_session_disconnected("sb-1", false)
+            .supervisor_session_disconnected("sb-1", false, PeerSessions::None)
             .await
             .unwrap();
 
@@ -9584,6 +9707,192 @@ mod tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
         assert_eq!(ready.message, "Supervisor session disconnected");
+    }
+
+    /// A supervisor holds a session to every replica in its subset, so one
+    /// session ending while a peer still owns the sandbox is a rollout, not a
+    /// sandbox losing its supervisor. Demoting here would report a serving
+    /// sandbox as not-ready fleet-wide and callers would refuse every exec.
+    #[tokio::test]
+    async fn supervisor_session_disconnected_keeps_a_sandbox_owned_elsewhere_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Supervisor session connected".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let before = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        runtime
+            .supervisor_session_disconnected("sb-1", false, PeerSessions::Serving)
+            .await
+            .unwrap();
+
+        let after = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        // Untouched rather than rewritten with the same phase: a no-op write
+        // would still bump the resource version and wake every watcher.
+        assert_eq!(after.resource_version, before.resource_version);
+        assert_eq!(after.payload, before.payload);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// A store that could not answer is not a report that nobody is serving.
+    /// Writing the phase from a failed read refuses every caller until some
+    /// session reconnects, on evidence that was never gathered.
+    #[tokio::test]
+    async fn supervisor_session_disconnected_leaves_the_phase_alone_when_peers_are_unknown() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let before = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1", false, PeerSessions::Unknown)
+            .await
+            .unwrap();
+
+        let after = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.resource_version, before.resource_version);
+        assert_eq!(after.payload, before.payload);
+    }
+
+    /// The replica holding the session is the authority on it. A phase demoted
+    /// by a peer whose lookup raced an expiry is corrected on the next
+    /// renewal, from the connection rather than from a row.
+    #[tokio::test]
+    async fn a_live_session_re_asserts_ready_over_a_spurious_demotion() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        runtime
+            .supervisor_session_still_ready("sb-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert!(
+            watch_rx.try_recv().is_ok(),
+            "a phase that changed has to reach the watchers"
+        );
+    }
+
+    /// A live session says the supervisor is there. It says nothing about
+    /// whether the sandbox is being deleted, has stopped, or has already
+    /// reported a result, and it must not overwrite any of them.
+    #[tokio::test]
+    async fn re_asserting_ready_never_revives_a_sandbox_that_left_the_running_phases() {
+        for phase in [
+            SandboxPhase::Deleting,
+            SandboxPhase::Stopping,
+            SandboxPhase::Stopped,
+            SandboxPhase::Completed,
+            SandboxPhase::Error,
+        ] {
+            let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+            let mut sandbox = sandbox_record("sb-1", "sandbox-a", phase);
+            sandbox.set_phase(phase as i32);
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let before = runtime
+                .store
+                .get(Sandbox::object_type(), "sb-1")
+                .await
+                .unwrap()
+                .unwrap();
+
+            runtime
+                .supervisor_session_still_ready("sb-1")
+                .await
+                .unwrap();
+
+            let after = runtime
+                .store
+                .get(Sandbox::object_type(), "sb-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.resource_version, before.resource_version,
+                "{phase:?} is a lifecycle fact a live session does not contradict"
+            );
+        }
     }
 
     // --- Composition rule tests ---
@@ -9801,7 +10110,7 @@ mod tests {
         // Session drops.
         runtime.supervisor_sessions.cleanup_sandbox("sb-1");
         runtime
-            .supervisor_session_disconnected("sb-1", false)
+            .supervisor_session_disconnected("sb-1", false, PeerSessions::None)
             .await
             .unwrap();
         let stored = runtime

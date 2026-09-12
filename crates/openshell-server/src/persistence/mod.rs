@@ -289,6 +289,21 @@ impl Store {
     /// * `Ok(WriteResult)` - Write succeeded with new `resource_version` and timestamps
     /// * `Err(Conflict)` - Resource version mismatch (for `MatchResourceVersion`)
     /// * `Err(UniqueViolation)` - Object already exists (for `MustCreate`) or name conflict
+    ///
+    /// # `id` is globally unique, `name` is scoped
+    ///
+    /// `objects.id` is the table's entire primary key: it is **not** qualified
+    /// by `object_type`. A new object type that keys rows on an id another type
+    /// already uses therefore collides on every `MustCreate`, while a
+    /// type-filtered [`Store::get`] still reports the row as absent — so the
+    /// failure surfaces as a phantom write conflict rather than a collision,
+    /// and no amount of retrying clears it. Namespace ids per type (as
+    /// `supervisor-session-liveness:{sandbox_id}` does) when the natural key is
+    /// borrowed from another type's id.
+    ///
+    /// `name` needs no such treatment: it is unique per
+    /// `(object_type, workspace, name)`, so the same name under two types is
+    /// fine.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "store",

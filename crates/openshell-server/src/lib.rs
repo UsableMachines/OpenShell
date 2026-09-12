@@ -35,6 +35,7 @@ mod readiness;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+pub mod session_liveness;
 mod ssh_sessions;
 pub mod supervisor_session;
 mod telemetry;
@@ -588,7 +589,29 @@ pub(crate) async fn run_server(
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
-    let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
+    // Supervisor sessions live in one replica's memory. Record liveness in
+    // the shared store so a replica without the local session can redirect
+    // the caller instead of waiting out its session timeout.
+    let session_liveness_records = Arc::new(session_liveness::SessionLiveness::new(
+        store.clone(),
+        compute::lease::replica_id(),
+        session_liveness::advertise_address(config.bind_address.port()),
+        session_liveness::LIVENESS_TTL,
+    ));
+    info!(
+        replica = %session_liveness_records.replica_id(),
+        advertise_address = %session_liveness_records.advertise_address(),
+        "supervisor session liveness tracking enabled"
+    );
+    // The gateway computes no subsets. It reports on the sessions it holds and
+    // answers immediately when it holds none, so it never needs to agree with
+    // anyone about the hash — only the supervisor, which chooses where to
+    // connect, and sandbox-api, which chooses where to dispatch, do.
+    let supervisor_sessions = Arc::new(
+        supervisor_session::SupervisorSessionRegistry::with_liveness(Arc::clone(
+            &session_liveness_records,
+        )),
+    );
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
@@ -800,6 +823,35 @@ pub(crate) async fn run_server(
         if let Err(err) = task.await {
             warn!(error = %err, "Gateway listener task failed during shutdown");
         }
+    }
+
+    // Drop our liveness records here — after the listeners have stopped, so
+    // no new supervisor session can claim one behind us mid-drain, and before
+    // the compute cleanup, because the sooner the store stops naming this pod
+    // the sooner other replicas stop redirecting callers to it. Per-session
+    // releases already run when a session ends, but a pod being replaced can
+    // exit before those writes land.
+    //
+    // Bounded and best-effort by design: the kubelet SIGKILLs us at the end of
+    // the termination grace period whatever we do, and any record left behind
+    // expires after its TTL. This step must never block or fail shutdown.
+    if let Some(summary) = session_liveness_records
+        .withdraw_all_within(session_liveness::LIVENESS_RELEASE_ALL_TIMEOUT)
+        .await
+    {
+        info!(
+            replica = %session_liveness_records.replica_id(),
+            released = summary.released,
+            skipped = summary.skipped,
+            failed = summary.failed,
+            "released supervisor session liveness records"
+        );
+    } else {
+        warn!(
+            replica = %session_liveness_records.replica_id(),
+            timeout = ?session_liveness::LIVENESS_RELEASE_ALL_TIMEOUT,
+            "supervisor session liveness release did not finish before its shutdown deadline; remaining records expire after their TTL"
+        );
     }
 
     state

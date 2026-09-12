@@ -11,6 +11,7 @@
 pub mod child_env;
 pub mod debug_rpc;
 #[cfg(unix)]
+pub mod gateway_fleet;
 pub mod identity;
 pub mod log_push;
 pub mod main_session;

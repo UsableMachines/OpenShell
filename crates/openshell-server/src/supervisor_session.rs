@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -22,13 +24,12 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::session_liveness::{
+    LIVENESS_RENEWAL_INTERVAL, PeerSessions, SERVING_REPLICA_METADATA_KEY, SessionLiveness,
+};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
-/// Initial backoff between session-availability polls in `wait_for_session`.
-const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-/// Maximum backoff between session-availability polls in `wait_for_session`.
-const SESSION_WAIT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// Upper bound on unclaimed relay channels across all sandboxes. Caps the
 /// memory a misbehaving caller can pin by calling `open_relay` repeatedly
 /// while the supervisor never claims (or isn't responding). Sized generously
@@ -76,6 +77,10 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// Cross-replica liveness records for supervisor sessions. `None` in
+    /// unit and integration tests that drive the registry without a store —
+    /// the registry then behaves exactly as a single-replica gateway.
+    liveness: Option<Arc<SessionLiveness>>,
 }
 
 struct PendingRelay {
@@ -105,6 +110,133 @@ impl std::fmt::Debug for SupervisorSessionRegistry {
 impl SupervisorSessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Registry that also publishes which replica owns each sandbox's
+    /// supervisor session, enabling redirect hints on the no-local-session
+    /// path.
+    pub fn with_liveness(liveness: Arc<SessionLiveness>) -> Self {
+        Self {
+            liveness: Some(liveness),
+            ..Self::default()
+        }
+    }
+
+    /// Claim cross-replica liveness of a session and keep the claim fresh
+    /// for as long as the returned handle is alive.
+    ///
+    /// Liveness bookkeeping is strictly advisory: every failure here is
+    /// logged and swallowed. A local session that works is better than a
+    /// refused request, so a store outage must never tear down or reject a
+    /// session that is otherwise serving fine.
+    /// `keep_phase_ready` runs after each successful renewal. A replica with a
+    /// live session is the authority on that session, and saying so on the
+    /// renewal cadence is what stops a row from holding a serving sandbox
+    /// down: a phase demoted by some peer's disconnect — because its lookup
+    /// raced an expiry — is corrected within one interval by the replica that
+    /// can see the connection. It asserts exactly what the connect asserted,
+    /// for as long as it stays true.
+    pub fn spawn_liveness_record<F, Fut>(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        keep_phase_ready: F,
+    ) -> Option<LivenessRenewal>
+    where
+        F: Fn(String) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let liveness = Arc::clone(self.liveness.as_ref()?);
+        let handle = tokio::spawn(async move {
+            let mut claim = match liveness.announce(&sandbox_id, &session_id).await {
+                Ok(claim) => claim,
+                Err(err) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        replica = %liveness.replica_id(),
+                        error = %err,
+                        "supervisor session: liveness claim failed — serving locally without a redirect record"
+                    );
+                    return;
+                }
+            };
+            debug!(
+                sandbox_id = %sandbox_id,
+                session_id = %session_id,
+                replica = %liveness.replica_id(),
+                "supervisor session: liveness claimed"
+            );
+
+            loop {
+                tokio::time::sleep(LIVENESS_RENEWAL_INTERVAL).await;
+                if let Err(err) = liveness.renew(&sandbox_id, &mut claim).await {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        replica = %liveness.replica_id(),
+                        error = %err,
+                        "supervisor session: liveness renewal failed — session keeps serving, redirects may point elsewhere"
+                    );
+                    return;
+                }
+                keep_phase_ready(sandbox_id.clone()).await;
+            }
+        });
+        Some(LivenessRenewal {
+            handle: Some(handle),
+        })
+    }
+
+    /// Release cross-replica liveness, guarded on `session_id` so a
+    /// superseded session cannot delete the serving replica's record.
+    pub async fn withdraw_liveness(&self, sandbox_id: &str, session_id: &str) {
+        let Some(liveness) = self.liveness.as_ref() else {
+            return;
+        };
+        withdraw_liveness_record(liveness, sandbox_id, session_id).await;
+    }
+
+    /// Whether an unexpired liveness record for this sandbox still exists.
+    ///
+    /// Asked after a session has released its own record, so a `true` answer
+    /// means somebody else is still serving the sandbox — another replica, or
+    /// a newer session on this one. That is what separates "this session
+    /// ended" from "this sandbox lost its supervisor", and only the second is
+    /// a phase change.
+    ///
+    /// With no cross-replica liveness configured the answer is `None` and not
+    /// `Unknown`: there is only ever one session, and it is the one that just
+    /// ended. A store that cannot answer is `Unknown`, which is not evidence
+    /// of a peer and not evidence against one either.
+    pub async fn sandbox_peer_sessions(&self, sandbox_id: &str) -> PeerSessions {
+        let Some(liveness) = self.liveness.as_ref() else {
+            return PeerSessions::None;
+        };
+
+        match liveness.lookup(sandbox_id).await {
+            Ok(Some(_)) => PeerSessions::Serving,
+            Ok(None) => PeerSessions::None,
+            Err(error) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    replica = %liveness.replica_id(),
+                    error = %error,
+                    "supervisor session: liveness lookup failed on disconnect — phase left alone"
+                );
+                PeerSessions::Unknown
+            }
+        }
+    }
+
+    /// Release liveness without awaiting, for synchronous teardown paths.
+    fn withdraw_liveness_detached(&self, sandbox_id: String, session_id: String) {
+        let Some(liveness) = self.liveness.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            withdraw_liveness_record(&liveness, &sandbox_id, &session_id).await;
+        });
     }
 
     /// Register a live supervisor session for the given sandbox.
@@ -142,9 +274,13 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    /// Remove the session for a sandbox.
-    fn remove(&self, sandbox_id: &str) {
-        self.sessions.lock().unwrap().remove(sandbox_id);
+    /// Remove the session for a sandbox, returning its `session_id`.
+    fn remove(&self, sandbox_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .remove(sandbox_id)
+            .map(|session| session.session_id)
     }
 
     /// Disconnect the current supervisor session for a sandbox.
@@ -155,6 +291,7 @@ impl SupervisorSessionRegistry {
         let session = self.sessions.lock().unwrap().remove(sandbox_id);
         if let Some(session) = session {
             let _ = session.shutdown.send(());
+            self.withdraw_liveness_detached(sandbox_id.to_string(), session.session_id);
             true
         } else {
             false
@@ -180,27 +317,137 @@ impl SupervisorSessionRegistry {
         None
     }
 
-    /// Look up the sender for a supervisor session, waiting up to `timeout`
-    /// for it to appear if absent.
+    /// Look up the sender for a supervisor session, answering immediately
+    /// when this replica holds none.
     ///
-    /// Uses exponential backoff (100ms → 2s) while polling the sessions map.
-    async fn wait_for_session(
+    /// This deliberately does not wait. A replica can only ever report on its
+    /// own connections, so "no session here" is the complete and final answer
+    /// it has — waiting turns that answer into a delayed version of itself,
+    /// and does so on the one process with the least information about where
+    /// the session actually is.
+    ///
+    /// Retry policy therefore belongs to the caller, which is the only party
+    /// that knows how long it is willing to wait, whether to ask this replica
+    /// again or a different one, and when to re-resolve membership and work
+    /// from a fresher view. A gateway-side wait pre-empts all three choices
+    /// and can express none of them; sandbox-api's exec loop makes them
+    /// explicitly.
+    ///
+    /// This is also why no subset check is needed here. One existed only to
+    /// avoid entering the wait on a replica the session would never reach —
+    /// with no wait to avoid, it saved nothing and was a second way of saying
+    /// what an immediate `unavailable` already says.
+    async fn session_or_unavailable(
         &self,
         sandbox_id: &str,
-        timeout: Duration,
     ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
-        let deadline = Instant::now() + timeout;
-        let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
+        if let Some(tx) = self.lookup_session(sandbox_id) {
+            return Ok(tx);
+        }
 
-        loop {
-            if let Some(tx) = self.lookup_session(sandbox_id) {
-                return Ok(tx);
+        // A liveness row may name a replica that had this session. It is a
+        // hint that biases the caller's next attempt, never a claim this
+        // replica can stand behind — the dispatch there is what tests it.
+        if let Some(status) = self.serving_replica_redirect_status(sandbox_id).await {
+            return Err(status);
+        }
+
+        Err(Status::unavailable("supervisor session not connected"))
+    }
+
+    /// Build a redirect status when a *different* live replica owns this
+    /// sandbox's supervisor session.
+    ///
+    /// The address travels as `x-openshell-serving-replica` response
+    /// metadata on an otherwise ordinary `unavailable` status, and is repeated
+    /// in the message text for logs. This is deliberately a hint and not a
+    /// contract: a client that ignores the metadata sees exactly the
+    /// single-replica behavior it saw before, which is what keeps the change
+    /// compatible with upstream clients.
+    ///
+    /// Returns `None` — leaving today's wait-then-`unavailable` path intact —
+    /// when liveness tracking is off, when there is no live record, when the
+    /// record is ours (the session may still be connecting), or when the
+    /// recorded address is empty or our own.
+    async fn serving_replica_redirect_status(&self, sandbox_id: &str) -> Option<Status> {
+        let liveness = self.liveness.as_ref()?;
+
+        let record = match liveness.lookup(sandbox_id).await {
+            Ok(record) => record?,
+            Err(err) => {
+                // A store hiccup must not change how a request is answered.
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "supervisor session: liveness lookup failed — falling back to waiting"
+                );
+                return None;
             }
-            if Instant::now() + backoff > deadline {
-                return Err(Status::unavailable("supervisor session not connected"));
+        };
+
+        if record.replica_id == liveness.replica_id() {
+            return None;
+        }
+        let address = record.advertise_address.trim();
+        if address.is_empty() || address == liveness.advertise_address() {
+            return None;
+        }
+
+        let Ok(header) = address.parse::<MetadataValue<Ascii>>() else {
+            warn!(
+                sandbox_id = %sandbox_id,
+                serving_replica = %record.replica_id,
+                serving_address = %address,
+                "supervisor session: serving address is not valid header text — falling back to waiting"
+            );
+            return None;
+        };
+
+        info!(
+            sandbox_id = %sandbox_id,
+            serving_replica = %record.replica_id,
+            serving_address = %address,
+            "supervisor session: owned by another replica — returning redirect hint"
+        );
+        let mut metadata = MetadataMap::new();
+        metadata.insert(SERVING_REPLICA_METADATA_KEY, header);
+        Some(Status::with_metadata(
+            tonic::Code::Unavailable,
+            format!("supervisor session not connected on this gateway replica; owned by {address}"),
+            metadata,
+        ))
+    }
+
+    /// True if *any* replica holds a supervisor session for this sandbox.
+    ///
+    /// Sandbox readiness is a fact about the fleet, not about this process.
+    /// Deriving it from the local session map was sound only while one replica
+    /// held every session: with more than one, a replica that never had the
+    /// session would answer "no" and reconcile a healthy sandbox back to
+    /// `Provisioning`. The liveness records already carry the answer — a
+    /// record exists and is renewed for exactly as long as some replica holds
+    /// the session.
+    pub async fn session_connected_in_fleet(&self, sandbox_id: &str) -> bool {
+        if self.has_session(sandbox_id) {
+            return true;
+        }
+        let Some(liveness) = self.liveness.as_ref() else {
+            return false;
+        };
+        match liveness.lookup(sandbox_id).await {
+            Ok(record) => record.is_some(),
+            Err(err) => {
+                // Fall back to the local answer. Reporting "not connected"
+                // because the store hiccuped would regress a healthy
+                // sandbox's phase, which is the failure this method exists to
+                // prevent.
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "supervisor session: fleet-wide session lookup failed; using the local session map"
+                );
+                false
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
         }
     }
 
@@ -258,25 +505,21 @@ impl SupervisorSessionRegistry {
     /// oneshot receiver that resolves once the supervisor opens its reverse
     /// HTTP CONNECT to `/relay/{channel_id}`.
     ///
-    /// If the session is not currently registered, this method waits up to
-    /// `session_wait_timeout` for it to appear. A session may be temporarily
-    /// absent for several reasons — all of which look identical from here:
+    /// If the session is not registered here, this fails immediately with
+    /// `unavailable`. A session may be absent for several reasons — a startup
+    /// race before the supervisor's `ConnectSupervisor` handshake completes, a
+    /// transient disconnect mid-reconnect, or a session that is live on a
+    /// different replica — and none of them are distinguishable from this
+    /// process, which is why it states what it knows instead of waiting to see
+    /// whether one of them resolves.
     ///
-    /// - startup race: the sandbox just reported Ready but the supervisor's
-    ///   `ConnectSupervisor` gRPC handshake hasn't completed yet
-    /// - transient disconnect: the session was up but got dropped (network
-    ///   blip, gateway restart, supervisor restart) and the supervisor is
-    ///   in its reconnect backoff loop
-    ///
-    /// Callers pick the timeout based on how much patience the caller needs.
-    /// A first `sandbox connect` right after `sandbox create` may need to
-    /// wait for the supervisor's initial TLS + gRPC handshake (tens of
-    /// seconds on a slow cluster), while mid-lifetime calls typically just
-    /// need to cover a short reconnect window.
+    /// The caller owns the patience. It decides how long to keep trying, which
+    /// replica to ask next, and when to re-resolve membership so the next
+    /// attempt works from a fresher view — none of which a timeout passed down
+    /// here could express.
     pub async fn open_relay(
         &self,
         sandbox_id: &str,
-        session_wait_timeout: Duration,
     ) -> Result<
         (
             String,
@@ -288,7 +531,6 @@ impl SupervisorSessionRegistry {
             sandbox_id,
             relay_open::Target::Ssh(SshRelayTarget {}),
             String::new(),
-            session_wait_timeout,
         )
         .await
     }
@@ -298,7 +540,6 @@ impl SupervisorSessionRegistry {
         sandbox_id: &str,
         target: relay_open::Target,
         service_id: String,
-        session_wait_timeout: Duration,
     ) -> Result<
         (
             String,
@@ -306,9 +547,7 @@ impl SupervisorSessionRegistry {
         ),
         Status,
     > {
-        let tx = self
-            .wait_for_session(sandbox_id, session_wait_timeout)
-            .await?;
+        let tx = self.session_or_unavailable(sandbox_id).await?;
 
         let channel_id = Uuid::new_v4().to_string();
         let relay_open = RelayOpen {
@@ -435,7 +674,9 @@ impl SupervisorSessionRegistry {
 
     /// Clean up all state for a sandbox (session + pending relays).
     pub fn cleanup_sandbox(&self, sandbox_id: &str) {
-        self.remove(sandbox_id);
+        if let Some(session_id) = self.remove(sandbox_id) {
+            self.withdraw_liveness_detached(sandbox_id.to_string(), session_id);
+        }
     }
 
     pub async fn replay_pending_relays(&self, sandbox_id: &str, tx: &mpsc::Sender<GatewayMessage>) {
@@ -456,6 +697,43 @@ impl SupervisorSessionRegistry {
                 warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "supervisor session: failed to replay pending relay to superseding session");
                 break;
             }
+        }
+    }
+}
+
+async fn withdraw_liveness_record(liveness: &SessionLiveness, sandbox_id: &str, session_id: &str) {
+    match liveness.withdraw(sandbox_id, session_id).await {
+        Ok(true) => debug!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            "supervisor session: liveness released"
+        ),
+        Ok(false) => debug!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            "supervisor session: liveness record not ours to release"
+        ),
+        Err(err) => warn!(
+            sandbox_id = %sandbox_id,
+            session_id = %session_id,
+            error = %err,
+            "supervisor session: liveness release failed — record expires on its own"
+        ),
+    }
+}
+
+/// Handle to the background task that keeps a session's liveness record
+/// fresh. Dropping it stops renewals, so the record ages out on its own if
+/// the explicit release never runs.
+#[derive(Debug)]
+pub struct LivenessRenewal {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for LivenessRenewal {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
@@ -769,6 +1047,31 @@ pub async fn handle_connect_supervisor(
         );
     }
 
+    // Publish this replica as the session's owner and keep the claim fresh for
+    // the life of the session. Failures are logged inside the task and never
+    // block the handshake.
+    let phase_keeper = Arc::clone(state);
+    let liveness_renewal = state.supervisor_sessions.spawn_liveness_record(
+        sandbox_id.clone(),
+        session_id.clone(),
+        move |sandbox_id| {
+            let state = Arc::clone(&phase_keeper);
+            async move {
+                if let Err(err) = state
+                    .compute
+                    .supervisor_session_still_ready(&sandbox_id)
+                    .await
+                {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "supervisor session: could not re-assert Ready while the session is live"
+                    );
+                }
+            }
+        },
+    );
+
     // Step 3: Send SessionAccepted.
     let accepted = GatewayMessage {
         payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
@@ -782,6 +1085,11 @@ pub async fn handle_connect_supervisor(
         state
             .supervisor_sessions
             .remove_if_current(&sandbox_id, &session_id);
+        drop(liveness_renewal);
+        state
+            .supervisor_sessions
+            .withdraw_liveness(&sandbox_id, &session_id)
+            .await;
         return Err(Status::internal("failed to send session accepted"));
     }
 
@@ -811,6 +1119,7 @@ pub async fn handle_connect_supervisor(
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
     tokio::spawn(async move {
+        let liveness_renewal = liveness_renewal;
         run_session_loop(
             &state_clone,
             &sandbox_id_clone,
@@ -820,6 +1129,13 @@ pub async fn handle_connect_supervisor(
             shutdown_rx,
         )
         .await;
+        // Stop renewing before releasing so the release can't race a renewal
+        // and leave a resurrected record behind.
+        drop(liveness_renewal);
+        state_clone
+            .supervisor_sessions
+            .withdraw_liveness(&sandbox_id_clone, &session_id)
+            .await;
         let terminal_finalized = state_clone
             .supervisor_sessions
             .remove_if_current(&sandbox_id_clone, &session_id);
@@ -828,9 +1144,15 @@ pub async fn handle_connect_supervisor(
             state_clone
                 .telemetry
                 .sandbox_session_disconnected(&sandbox_id_clone);
+            // Asked after the release above, so this replica's own record is
+            // already gone and a hit names a peer still serving the sandbox.
+            let peers = state_clone
+                .supervisor_sessions
+                .sandbox_peer_sessions(&sandbox_id_clone)
+                .await;
             if let Err(err) = state_clone
                 .compute
-                .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized)
+                .supervisor_session_disconnected(&sandbox_id_clone, terminal_finalized, peers)
                 .await
             {
                 warn!(
@@ -1042,6 +1364,37 @@ mod tests {
         Arc::new(crate::persistence::test_store().await)
     }
 
+    /// A store already holding the `sandbox` rows a test claims liveness for,
+    /// matching what the compute layer writes in production. `objects.id` is
+    /// globally unique, so fixtures without these rows cannot catch an
+    /// liveness key that collides with a sandbox's own row.
+    async fn store_with_sandboxes(sandbox_ids: &[&str]) -> Arc<Store> {
+        let store = test_store().await;
+        for sandbox_id in sandbox_ids {
+            store
+                .put_message(&sandbox_record(sandbox_id, sandbox_id))
+                .await
+                .expect("sandbox object row should persist");
+        }
+        store
+    }
+
+    fn liveness(store: &Arc<Store>, replica_id: &str, address: &str) -> Arc<SessionLiveness> {
+        Arc::new(SessionLiveness::new(
+            Arc::clone(store),
+            replica_id.to_string(),
+            address.to_string(),
+            crate::session_liveness::LIVENESS_TTL,
+        ))
+    }
+
+    fn redirect_hint(status: &Status) -> Option<String> {
+        status
+            .metadata()
+            .get(SERVING_REPLICA_METADATA_KEY)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
     /// Returns a shutdown sender with its receiver immediately dropped. Tests
     /// that don't observe the shutdown signal can use this to satisfy the
     /// `register` signature without the receiver noise.
@@ -1225,7 +1578,7 @@ mod tests {
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
 
         let (channel_id, _relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx")
             .await
             .expect("open_relay should succeed when session is live");
 
@@ -1243,35 +1596,35 @@ mod tests {
     async fn open_relay_times_out_without_session() {
         let registry = SupervisorSessionRegistry::new();
         let err = registry
-            .open_relay("missing", Duration::from_millis(50))
+            .open_relay("missing")
             .await
             .expect_err("open_relay should time out");
         assert_eq!(err.code(), tonic::Code::Unavailable);
     }
 
+    /// A session arriving later does not rescue an in-flight call — the
+    /// refusal is returned at once and it is the *caller's* next attempt that
+    /// succeeds. This is the whole shape of the change: the gateway reports,
+    /// the caller decides when to ask again.
     #[tokio::test]
-    async fn open_relay_waits_for_session_to_appear() {
+    async fn a_session_arriving_later_is_found_by_the_next_attempt() {
         let registry = Arc::new(SupervisorSessionRegistry::new());
-        let registry_for_register = Arc::clone(&registry);
 
-        // Register the session after a small delay, shorter than the wait.
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
-            // Keep the receiver alive so the send in open_relay succeeds.
-            tokio::spawn(async move { while rx.recv().await.is_some() {} });
-            registry_for_register.register(
-                "sbx".to_string(),
-                "s1".to_string(),
-                tx,
-                make_shutdown(),
-            );
-        });
-
-        let result = registry.open_relay("sbx", Duration::from_secs(2)).await;
+        let first = registry.open_relay("sbx").await;
         assert!(
-            result.is_ok(),
-            "open_relay should succeed when session arrives mid-wait: {result:?}"
+            first.is_err(),
+            "a call made before the session exists must be refused, not held"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
+        // Keep the receiver alive so the send in open_relay succeeds.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
+
+        let retried = registry.open_relay("sbx").await;
+        assert!(
+            retried.is_ok(),
+            "the caller's retry must find the session: {retried:?}"
         );
     }
 
@@ -1286,7 +1639,7 @@ mod tests {
         drop(rx);
 
         let err = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx")
             .await
             .expect_err("open_relay should fail when mpsc is closed");
         assert_eq!(err.code(), tonic::Code::Unavailable);
@@ -1321,7 +1674,7 @@ mod tests {
         }
 
         let err = registry
-            .open_relay("sbx-a", Duration::from_millis(50))
+            .open_relay("sbx-a")
             .await
             .expect_err("open_relay should reject once global cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -1346,7 +1699,7 @@ mod tests {
         }
 
         let err = registry
-            .open_relay("sbx", Duration::from_millis(50))
+            .open_relay("sbx")
             .await
             .expect_err("open_relay should reject when per-sandbox cap is reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -1361,7 +1714,7 @@ mod tests {
             make_shutdown(),
         );
         registry
-            .open_relay("sbx-other", Duration::from_millis(50))
+            .open_relay("sbx-other")
             .await
             .expect("different sandbox should still accept new relays");
     }
@@ -1393,7 +1746,7 @@ mod tests {
         );
 
         let (_channel_id, _relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx")
             .await
             .expect("open_relay should succeed");
 
@@ -1453,7 +1806,7 @@ mod tests {
         );
 
         let (channel_id, _relay_rx) = registry
-            .open_relay("sbx", Duration::from_secs(1))
+            .open_relay("sbx")
             .await
             .expect("open_relay should succeed");
 
@@ -1773,5 +2126,359 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-fresh")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-replica redirect on the no-local-session path
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_liveness_row_redirects_without_delay() {
+        let store = store_with_sandboxes(&["sbx-redirect"]).await;
+        let remote = liveness(&store, "replica-remote", "10-0-0-9.gw.ns.svc:8080");
+        remote
+            .announce("sbx-redirect", "session-remote")
+            .await
+            .unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        let started = Instant::now();
+        let err = registry
+            .session_or_unavailable("sbx-redirect")
+            .await
+            .expect_err("no local session for this sandbox");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a redirect must be immediate"
+        );
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            redirect_hint(&err).as_deref(),
+            Some("10-0-0-9.gw.ns.svc:8080")
+        );
+        assert!(
+            err.message().contains("10-0-0-9.gw.ns.svc:8080"),
+            "message should name the replica for logs: {}",
+            err.message()
+        );
+    }
+
+    /// The contract this registry now keeps: a replica holding no session
+    /// answers at once. It cannot observe another replica's connections, so
+    /// waiting would only delay the same answer, and how long to keep trying
+    /// is the caller's to decide.
+    #[tokio::test]
+    async fn no_local_session_answers_immediately() {
+        let store = store_with_sandboxes(&["sbx-nobody"]).await;
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        let started = Instant::now();
+        let err = registry
+            .session_or_unavailable("sbx-nobody")
+            .await
+            .expect_err("session is not registered here");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the answer must not be delayed: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "supervisor session not connected");
+    }
+
+    /// Including for a sandbox no replica has connected yet. This is the cold
+    /// start, and it is answered rather than waited out — sandbox-api retries
+    /// on its own schedule and against a freshly resolved fleet, which a
+    /// timeout passed in here could not have expressed.
+    #[tokio::test]
+    async fn a_cold_start_is_answered_rather_than_waited_out() {
+        let registry = SupervisorSessionRegistry::new();
+
+        let started = Instant::now();
+        let err = registry
+            .session_or_unavailable("sbx-never-connected")
+            .await
+            .expect_err("nothing has connected");
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    /// A liveness row naming a peer is the better answer, so it replaces the
+    /// bare refusal when one exists.
+    #[tokio::test]
+    async fn a_named_replica_beats_the_bare_refusal() {
+        let store = store_with_sandboxes(&["sbx-served-elsewhere"]).await;
+        let remote = liveness(&store, "replica-remote", "10-0-0-9.gw.ns.svc:8080");
+        remote
+            .announce("sbx-served-elsewhere", "session-remote")
+            .await
+            .unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        let err = registry
+            .session_or_unavailable("sbx-served-elsewhere")
+            .await
+            .expect_err("no local session");
+
+        assert_eq!(
+            redirect_hint(&err).as_deref(),
+            Some("10-0-0-9.gw.ns.svc:8080")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sandbox readiness is a fact about the fleet, not about this process
+    // -----------------------------------------------------------------------
+
+    /// The bug this exists to prevent: a replica that never held the session
+    /// answering "not connected" and reconciling a healthy sandbox back to
+    /// `Provisioning`.
+    #[tokio::test]
+    async fn session_connected_in_fleet_sees_a_peer_replicas_session() {
+        let store = store_with_sandboxes(&["sbx-remote-session"]).await;
+        let remote = liveness(&store, "replica-remote", "10-0-0-9.gw.ns.svc:8080");
+        remote
+            .announce("sbx-remote-session", "session-remote")
+            .await
+            .unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        assert!(!registry.has_session("sbx-remote-session"));
+        assert!(
+            registry
+                .session_connected_in_fleet("sbx-remote-session")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn session_connected_in_fleet_is_false_with_no_session_anywhere() {
+        let store = store_with_sandboxes(&["sbx-nobody"]).await;
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        assert!(!registry.session_connected_in_fleet("sbx-nobody").await);
+    }
+
+    /// Without liveness tracking the only answer available is the local one,
+    /// which is what a single-replica gateway had all along.
+    #[tokio::test]
+    async fn session_connected_in_fleet_falls_back_to_the_local_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = oneshot::channel();
+        registry.register(
+            "sbx-local".to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown,
+        );
+
+        assert!(registry.session_connected_in_fleet("sbx-local").await);
+        assert!(!registry.session_connected_in_fleet("sbx-other").await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_does_not_redirect_when_owner_is_us() {
+        let store = store_with_sandboxes(&["sbx-self-owned"]).await;
+        let local = liveness(&store, "replica-local", "local:1");
+        local
+            .announce("sbx-self-owned", "session-local")
+            .await
+            .unwrap();
+
+        let registry = SupervisorSessionRegistry::with_liveness(local);
+        let err = registry
+            .session_or_unavailable("sbx-self-owned")
+            .await
+            .expect_err("session is not registered yet");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "supervisor session not connected");
+        assert!(redirect_hint(&err).is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_does_not_redirect_without_an_owner() {
+        let store = store_with_sandboxes(&["sbx-unowned"]).await;
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        let err = registry
+            .session_or_unavailable("sbx-unowned")
+            .await
+            .expect_err("session is not registered");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "supervisor session not connected");
+        assert!(redirect_hint(&err).is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_does_not_redirect_to_an_empty_address() {
+        let store = store_with_sandboxes(&["sbx-no-address"]).await;
+        let remote = liveness(&store, "replica-remote", "");
+        remote
+            .announce("sbx-no-address", "session-remote")
+            .await
+            .unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+        let err = registry
+            .session_or_unavailable("sbx-no-address")
+            .await
+            .expect_err("session is not registered");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "supervisor session not connected");
+        assert!(redirect_hint(&err).is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_does_not_redirect_to_our_own_address() {
+        let store = store_with_sandboxes(&["sbx-same-address"]).await;
+        // Same advertised address under a different replica id — e.g. a
+        // restarted pod that reused its IP. Redirecting to ourselves would
+        // just loop the caller back here.
+        let remote = liveness(&store, "replica-previous", "10-0-0-1.gw.ns.svc:8080");
+        remote
+            .announce("sbx-same-address", "session-old")
+            .await
+            .unwrap();
+
+        let registry = SupervisorSessionRegistry::with_liveness(liveness(
+            &store,
+            "replica-local",
+            "10-0-0-1.gw.ns.svc:8080",
+        ));
+        let err = registry
+            .session_or_unavailable("sbx-same-address")
+            .await
+            .expect_err("session is not registered");
+
+        assert_eq!(err.message(), "supervisor session not connected");
+        assert!(redirect_hint(&err).is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_prefers_the_local_session_over_a_remote_owner() {
+        let store = store_with_sandboxes(&["sbx-local-wins"]).await;
+        let remote = liveness(&store, "replica-remote", "10-0-0-9.gw.ns.svc:8080");
+        remote
+            .announce("sbx-local-wins", "session-remote")
+            .await
+            .unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register(
+            "sbx-local-wins".to_string(),
+            "session-local".to_string(),
+            tx,
+            make_shutdown(),
+        );
+
+        registry
+            .session_or_unavailable("sbx-local-wins")
+            .await
+            .expect("a working local session must win over a stale liveness record");
+    }
+
+    /// The assertion that would have caught the metadata being dropped: drive
+    /// the real entry point the exec handler calls (`open_relay`), wrap the
+    /// error with the real production wrapper, and read the hint back the way
+    /// a client does. Both halves were individually correct while the chain
+    /// was broken, so only an end-to-end check over both is sufficient.
+    #[tokio::test]
+    async fn a_redirect_survives_the_relay_open_wrapper_a_client_sees() {
+        let store = store_with_sandboxes(&["sbx-e2e"]).await;
+        let remote = liveness(
+            &store,
+            "replica-remote",
+            "10-42-0-243.openshell-headless.sandbox.svc.cluster.local:8080",
+        );
+        remote.announce("sbx-e2e", "session-remote").await.unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        let inner = registry
+            .open_relay("sbx-e2e")
+            .await
+            .expect_err("no local session, so open_relay must fail with the redirect");
+        let wrapped = crate::grpc::sandbox::relay_open_failure(&inner);
+
+        assert_eq!(
+            redirect_hint(&wrapped).as_deref(),
+            Some("10-42-0-243.openshell-headless.sandbox.svc.cluster.local:8080"),
+            "the client keys off the metadata, not the message text"
+        );
+        assert_eq!(wrapped.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_plain_session_timeout_reaches_the_client_without_a_hint() {
+        let store = store_with_sandboxes(&["sbx-e2e-none"]).await;
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+
+        let inner = registry
+            .open_relay("sbx-e2e-none")
+            .await
+            .expect_err("no session and no owner, so this times out as before");
+        let wrapped = crate::grpc::sandbox::relay_open_failure(&inner);
+
+        assert!(redirect_hint(&wrapped).is_none());
+        assert_eq!(wrapped.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn registry_without_liveness_keeps_single_replica_behavior() {
+        let registry = SupervisorSessionRegistry::new();
+        let err = registry
+            .session_or_unavailable("sbx-no-tracking")
+            .await
+            .expect_err("session is not registered");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "supervisor session not connected");
+        assert!(redirect_hint(&err).is_none());
+    }
+
+    #[tokio::test]
+    async fn withdraw_liveness_from_a_superseded_session_keeps_the_current_record() {
+        let store = store_with_sandboxes(&["sbx-supersede"]).await;
+        let local = liveness(&store, "replica-local", "local:1");
+        local
+            .announce("sbx-supersede", "session-old")
+            .await
+            .unwrap();
+        local
+            .announce("sbx-supersede", "session-new")
+            .await
+            .unwrap();
+
+        let registry = SupervisorSessionRegistry::with_liveness(Arc::clone(&local));
+        registry
+            .withdraw_liveness("sbx-supersede", "session-old")
+            .await;
+
+        let record = local
+            .lookup("sbx-supersede")
+            .await
+            .unwrap()
+            .expect("current liveness record must survive");
+        assert_eq!(record.session_id, "session-new");
     }
 }

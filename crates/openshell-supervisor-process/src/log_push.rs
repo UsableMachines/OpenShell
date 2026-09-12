@@ -127,7 +127,23 @@ async fn run_push_loop(
         attempt += 1;
 
         // --- Connect ---
-        let client = match CachedOpenShellClient::connect(&endpoint).await {
+        // To a replica, never to the configured endpoint: with a fleet
+        // configured that is the headless `Service`, which the gateway's
+        // serving certificate omits, so the handshake fails. Unresolved
+        // membership takes the same backoff as a failed connect.
+        let target =
+            match crate::gateway_fleet::unary_endpoint(&endpoint, &sandbox_id, attempt as usize)
+                .await
+            {
+                Some(target) => target,
+                None => {
+                    eprintln!("openshell: log push has no resolved gateway replica yet");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(tokio::time::Duration::from_secs(30));
+                    continue;
+                }
+            };
+        let client = match CachedOpenShellClient::connect(&target).await {
             Ok(c) => {
                 if attempt > 1 {
                     eprintln!("openshell: log push reconnected (attempt {attempt})");

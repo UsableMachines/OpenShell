@@ -334,7 +334,6 @@ async fn proxy_to_endpoint(
                 port: u32::from(target_port),
             }),
             endpoint.object_id().to_string(),
-            Duration::from_secs(15),
         )
         .await
         .map_err(|err| {

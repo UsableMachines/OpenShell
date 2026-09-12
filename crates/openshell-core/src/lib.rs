@@ -21,7 +21,9 @@ pub mod endpoint_path;
 pub mod error;
 #[cfg(unix)]
 pub mod external_driver_socket;
+mod fleet_dns;
 pub mod forward;
+pub mod gateway_fleet;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;

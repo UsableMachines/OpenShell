@@ -456,9 +456,11 @@ pub async fn run_process(
     if outcome.should_report_main_process_exit() {
         if let Some(tx) = sidecar_exit_tx.as_ref() {
             report_sidecar_main_process_exit(tx, &main_instance_id, rendered_code).await?;
-        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-            report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code)
-                .await;
+        // The endpoint is still the gate — it is how this supervisor knows it
+        // has a gateway at all — but it is no longer a dial target: the RPC
+        // goes to a replica holding this sandbox's session.
+        } else if let (Some(_), Some(id)) = (openshell_endpoint, sandbox_id) {
+            report_main_process_exit_until_ack(id, &main_instance_id, rendered_code).await;
             info!(instance_id = %main_instance_id, "main-process exit acknowledged");
         }
     } else {
@@ -477,8 +479,11 @@ pub async fn run_process(
     if outcome.should_report_main_process_exit() {
         if let Some(tx) = sidecar_exit_tx.as_ref() {
             finalize_sidecar_main_process_exit(tx, &main_instance_id).await?;
-        } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-            finalize_main_process_exit_until_ack(endpoint, id, &main_instance_id).await;
+        // The endpoint is still the gate — it is how this supervisor knows it
+        // has a gateway at all — but it is no longer a dial target: the RPC
+        // goes to a replica holding this sandbox's session.
+        } else if let (Some(_), Some(id)) = (openshell_endpoint, sandbox_id) {
+            finalize_main_process_exit_until_ack(id, &main_instance_id).await;
             info!(instance_id = %main_instance_id, "main-process terminal delivery finalized");
         }
     }
@@ -491,16 +496,30 @@ pub async fn run_process(
     Ok(rendered_code)
 }
 
-async fn report_main_process_exit_until_ack(
-    endpoint: &str,
-    sandbox_id: &str,
-    instance_id: &str,
-    exit_code: i32,
-) {
+/// Report the exit, retrying until a gateway acknowledges it.
+///
+/// Each attempt is addressed to a replica this supervisor holds a session to
+/// (see [`crate::gateway_fleet::endpoint_for_attempt`]). The gateway rejects
+/// this report unless the receiving replica holds the session, so sending it
+/// through the load-balanced `Service` would fail on every replica outside
+/// the sandbox's subset. The configured endpoint is therefore not a parameter
+/// here: there is no correct way to use it.
+async fn report_main_process_exit_until_ack(sandbox_id: &str, instance_id: &str, exit_code: i32) {
     let mut retry_delay = Duration::from_millis(250);
+    let mut attempt = 0usize;
     loop {
+        let Some(target) = crate::gateway_fleet::endpoint_for_attempt(attempt) else {
+            // Membership not resolved yet. Waiting is the whole answer: the
+            // configured endpoint is the headless Service, and this RPC is
+            // rejected by any replica holding no session for this sandbox.
+            attempt += 1;
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+            continue;
+        };
+        attempt += 1;
         match crate::supervisor_session::report_main_process_exit(
-            endpoint,
+            &target,
             sandbox_id,
             instance_id,
             exit_code,
@@ -509,7 +528,7 @@ async fn report_main_process_exit_until_ack(
         {
             Ok(()) => return,
             Err(error) => {
-                tracing::warn!(%error, "main-process exit report failed; retrying");
+                tracing::warn!(%error, %target, "main-process exit report failed; retrying");
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
             }
@@ -517,11 +536,25 @@ async fn report_main_process_exit_until_ack(
     }
 }
 
-async fn finalize_main_process_exit_until_ack(endpoint: &str, sandbox_id: &str, instance_id: &str) {
+/// Confirm terminal delivery, retrying until a gateway acknowledges it.
+///
+/// Addressed per attempt for the same reason as the exit report above.
+async fn finalize_main_process_exit_until_ack(sandbox_id: &str, instance_id: &str) {
     let mut retry_delay = Duration::from_millis(250);
+    let mut attempt = 0usize;
     loop {
+        let Some(target) = crate::gateway_fleet::endpoint_for_attempt(attempt) else {
+            // Membership not resolved yet. Waiting is the whole answer: the
+            // configured endpoint is the headless Service, and this RPC is
+            // rejected by any replica holding no session for this sandbox.
+            attempt += 1;
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+            continue;
+        };
+        attempt += 1;
         match crate::supervisor_session::finalize_main_process_exit(
-            endpoint,
+            &target,
             sandbox_id,
             instance_id,
         )
@@ -529,7 +562,7 @@ async fn finalize_main_process_exit_until_ack(endpoint: &str, sandbox_id: &str, 
         {
             Ok(()) => return,
             Err(error) => {
-                tracing::warn!(%error, "main-process terminal finalization failed; retrying");
+                tracing::warn!(%error, %target, "main-process terminal finalization failed; retrying");
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
             }

@@ -1782,18 +1782,18 @@ pub(super) async fn handle_exec_sandbox(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
+    if let Some(refusal) = phase_forecloses_relay(&sandbox) {
+        return Err(refusal);
     }
 
-    // Open a relay channel through the supervisor session. Use a 15s
-    // session-wait timeout, enough to cover a transient supervisor reconnect
-    // while still failing quickly during normal operation.
+    // Answers immediately when this replica holds no session: it cannot say
+    // anything about the other replicas, so the caller decides whether to ask
+    // one of them, and how long to keep asking.
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+        .open_relay(sandbox.object_id())
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| relay_open_failure(&e))?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -1806,15 +1806,13 @@ pub(super) async fn handle_exec_sandbox(
 
     let no_login_shell = req.no_login_shell;
 
+    // Awaited here, before the response, so that a relay that never arrives is
+    // a handler error rather than a stream item. See `relay_stream_or_status`.
+    let relay_stream =
+        relay_stream_or_status(relay_rx, &sandbox_id, &channel_id, "ExecSandbox").await?;
+
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
-        // Wait for the supervisor's reverse CONNECT to deliver the relay stream.
-        let Some(relay_stream) =
-            await_relay_stream(relay_rx, &tx, &sandbox_id, &channel_id, "ExecSandbox").await
-        else {
-            return;
-        };
-
         if let Err(err) = stream_exec_over_relay(
             tx.clone(),
             &sandbox_id,
@@ -1842,6 +1840,103 @@ pub(super) async fn handle_exec_sandbox(
 ///
 /// Returns `Some(stream)` on success. On any failure the error is sent on `tx`
 /// and `None` is returned; the caller should then `return` immediately.
+/// Refuse an exec on a phase, or let the relay answer.
+///
+/// Only phases the gateway owns outright refuse here: the sandbox is being
+/// deleted, is stopping or stopped, or has reached a terminal result. Those
+/// are facts about the object's own lifecycle, written by whoever drove the
+/// transition.
+///
+/// `Provisioning` deliberately is not one of them. It is also what a session
+/// disconnect writes when no peer is known to be serving, so refusing on it
+/// lets a lagging liveness row reject a request whose supervisor is live —
+/// including on the very replica holding that session, which need only look at
+/// its own connections to know better. The relay answers instead, immediately,
+/// and a refusal there is the one the caller can act on.
+fn phase_forecloses_relay(sandbox: &Sandbox) -> Option<Status> {
+    match SandboxPhase::try_from(sandbox.phase()).ok()? {
+        SandboxPhase::Deleting
+        | SandboxPhase::Stopping
+        | SandboxPhase::Stopped
+        | SandboxPhase::Completed
+        | SandboxPhase::Error => Some(Status::failed_precondition("sandbox is not ready")),
+        _ => None,
+    }
+}
+
+/// Wrap a relay-open failure for the client.
+///
+/// Shared by every relay-open call site so the message cannot drift between
+/// them and, more importantly, so none of them can drop the serving-replica
+/// redirect hint that `wait_for_session` attaches. Building a fresh
+/// `Status::unavailable` here instead would discard it — the address would
+/// still appear in the message text, which is only for logs, while the
+/// metadata the client actually keys off would be gone.
+pub fn relay_open_failure(inner: &Status) -> Status {
+    crate::session_liveness::wrap_status_preserving_redirect_hint(
+        inner,
+        tonic::Code::Unavailable,
+        format!("supervisor relay failed: {inner}"),
+    )
+}
+
+/// Wait for the supervisor's reverse CONNECT to deliver a relay stream,
+/// answering as a handler error rather than as a stream item.
+///
+/// ── The dispatch boundary ───────────────────────────────────────────────
+///
+/// A command must be dispatched to a supervisor at most once, so a client that
+/// wants to try another replica needs to know whether this one got as far as
+/// running anything. It cannot infer that from the error code — a transport
+/// failure looks identical whether it happened before or after the command was
+/// written — and it cannot infer it from having seen no output, because output
+/// is buffered.
+///
+/// What it can observe exactly is initial metadata. Tonic answers a handler
+/// error with a trailers-only response, so a failure returned from the handler
+/// reaches the client with **no headers**, while a failure sent on the stream
+/// arrives after them. That makes one rule carry the whole guarantee:
+///
+///   * failures before the command is written are returned from the handler;
+///   * failures after it are sent as stream items.
+///
+/// "No headers" is then the client's proof that nothing ran, and it holds for
+/// unplanned failures — a pod dying, a connection breaking — not just for the
+/// refusals the gateway states explicitly.
+///
+/// This is why the relay stream is awaited *before* the response is returned.
+/// Waiting for it inside the spawned task would put "the supervisor never
+/// connected back" — a case in which demonstrably nothing ran — on the far
+/// side of the headers, indistinguishable to the client from a connection that
+/// died mid-command, and therefore unretryable.
+///
+/// If you add a failure path to an exec handler, put it on the correct side of
+/// this line. Moving one across it does not fail any test here; it silently
+/// converts "retry is safe" into "retry runs the command twice", or costs a
+/// retry that was safe.
+async fn relay_stream_or_status(
+    relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    sandbox_id: &str,
+    channel_id: &str,
+    context: &str,
+) -> Result<tokio::io::DuplexStream, Status> {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx).await {
+        Ok(Ok(Ok(stream))) => Ok(stream),
+        Ok(Ok(Err(status))) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "{context}: relay target open failed");
+            Err(status)
+        }
+        Ok(Err(_)) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay channel dropped");
+            Err(Status::unavailable("relay channel dropped"))
+        }
+        Err(_) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay open timed out");
+            Err(Status::deadline_exceeded("relay open timed out"))
+        }
+    }
+}
+
 async fn await_relay_stream<T: Send + 'static>(
     relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
     tx: &mpsc::Sender<Result<T, Status>>,
@@ -1908,14 +2003,9 @@ pub(super) async fn handle_forward_tcp(
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            target,
-            init.service_id.clone(),
-            std::time::Duration::from_secs(15),
-        )
+        .open_relay_with_target(sandbox.object_id(), target, init.service_id.clone())
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| relay_open_failure(&e))?;
 
     let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
@@ -2223,15 +2313,15 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
-    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
-        return Err(Status::failed_precondition("sandbox is not ready"));
+    if let Some(refusal) = phase_forecloses_relay(&sandbox) {
+        return Err(refusal);
     }
 
     let (channel_id, relay_rx) = state
         .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+        .open_relay(sandbox.object_id())
         .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+        .map_err(|e| relay_open_failure(&e))?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -2242,20 +2332,14 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let sandbox_id = sandbox.object_id().to_string();
 
+    // Awaited here, before the response, so that a relay that never arrives is
+    // a handler error rather than a stream item. See `relay_stream_or_status`.
+    let relay_stream =
+        relay_stream_or_status(relay_rx, &sandbox_id, &channel_id, "ExecSandboxInteractive")
+            .await?;
+
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
-        let Some(relay_stream) = await_relay_stream(
-            relay_rx,
-            &tx,
-            &sandbox_id,
-            &channel_id,
-            "ExecSandboxInteractive",
-        )
-        .await
-        else {
-            return;
-        };
-
         if let Err(err) = stream_interactive_exec_over_relay(
             tx.clone(),
             &sandbox_id,
@@ -3097,6 +3181,172 @@ async fn run_exec_with_russh(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod relay_failure_tests {
+    use super::*;
+    use crate::session_liveness::SERVING_REPLICA_METADATA_KEY;
+
+    fn redirect_hint(status: &Status) -> Option<String> {
+        status
+            .metadata()
+            .get(SERVING_REPLICA_METADATA_KEY)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    /// Every way the relay can fail to arrive must be expressible as a handler
+    /// error, because that is what reaches the client without headers and so
+    /// marks the failure as "nothing ran". A variant that could only be
+    /// reported on the stream would sit on the wrong side of the dispatch
+    /// boundary; see `relay_stream_or_status`.
+    #[tokio::test]
+    async fn a_relay_that_never_arrives_is_a_handler_error() {
+        // Target open refused by the supervisor: the status travels verbatim,
+        // so a serving-replica redirect attached upstream survives to the client.
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(Status::unavailable("supervisor said no")))
+            .unwrap();
+        let err = relay_stream_or_status(rx, "sb-1", "ch-1", "ExecSandbox")
+            .await
+            .expect_err("a refused target must not yield a stream");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "supervisor said no");
+
+        // Sender dropped without answering — the session went away between
+        // open_relay and the reverse CONNECT.
+        let (tx, rx) = oneshot::channel::<Result<tokio::io::DuplexStream, Status>>();
+        drop(tx);
+        let err = relay_stream_or_status(rx, "sb-1", "ch-1", "ExecSandbox")
+            .await
+            .expect_err("a dropped relay channel must not yield a stream");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+
+        // A relay that does arrive is handed back, so the command is written
+        // only on the far side of the boundary.
+        let (client, _server) = tokio::io::duplex(64);
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(client)).unwrap();
+        assert!(
+            relay_stream_or_status(rx, "sb-1", "ch-1", "ExecSandbox")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn relay_open_failure_keeps_the_session_redirect_hint() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            SERVING_REPLICA_METADATA_KEY,
+            "10-42-0-243.openshell-headless.sandbox.svc.cluster.local:8080"
+                .parse()
+                .unwrap(),
+        );
+        let inner = Status::with_metadata(
+            tonic::Code::Unavailable,
+            "supervisor session not connected on this gateway replica",
+            metadata,
+        );
+
+        let wrapped = relay_open_failure(&inner);
+        assert_eq!(
+            redirect_hint(&wrapped).as_deref(),
+            Some("10-42-0-243.openshell-headless.sandbox.svc.cluster.local:8080"),
+            "a client keying off the metadata must still see the redirect after wrapping"
+        );
+        assert_eq!(wrapped.code(), tonic::Code::Unavailable);
+        assert!(wrapped.message().starts_with("supervisor relay failed: "));
+    }
+
+    fn in_phase(phase: SandboxPhase) -> Sandbox {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(phase as i32);
+        sandbox
+    }
+
+    /// `Provisioning` is what a session disconnect writes when no peer is
+    /// known to be serving, so refusing on it hands a lagging row the power to
+    /// reject a request whose supervisor is live — on the very replica holding
+    /// that session. The relay answers instead.
+    #[test]
+    fn a_phase_a_liveness_row_can_write_does_not_refuse_an_exec() {
+        for phase in [
+            SandboxPhase::Provisioning,
+            SandboxPhase::Ready,
+            SandboxPhase::Unspecified,
+        ] {
+            assert!(
+                phase_forecloses_relay(&in_phase(phase)).is_none(),
+                "{phase:?} must reach the relay"
+            );
+        }
+    }
+
+    /// The sandbox's own lifecycle is the gateway's to know, and no dispatch
+    /// can improve on it.
+    #[test]
+    fn a_sandbox_that_is_not_running_refuses_before_the_relay() {
+        for phase in [
+            SandboxPhase::Deleting,
+            SandboxPhase::Stopping,
+            SandboxPhase::Stopped,
+            SandboxPhase::Completed,
+            SandboxPhase::Error,
+        ] {
+            let refusal = phase_forecloses_relay(&in_phase(phase))
+                .unwrap_or_else(|| panic!("{phase:?} must refuse"));
+            assert_eq!(refusal.code(), tonic::Code::FailedPrecondition);
+        }
+    }
+
+    #[test]
+    fn relay_open_failure_does_not_invent_a_hint() {
+        let wrapped = relay_open_failure(&Status::unavailable("supervisor session not connected"));
+        assert!(redirect_hint(&wrapped).is_none());
+        assert!(wrapped.metadata().is_empty());
+        assert!(
+            wrapped
+                .message()
+                .contains("supervisor session not connected")
+        );
+    }
+
+    /// Every relay-open call site must wrap through [`relay_open_failure`].
+    ///
+    /// There are three of them in three separate handlers, and a fresh
+    /// `Status::unavailable` at any one silently drops the redirect metadata —
+    /// the exact defect this guard exists to stop recurring. Driving all three
+    /// handlers would need a fully authorized `ServerState`, so this checks the
+    /// source instead. The needles are assembled at runtime so this test's own
+    /// text cannot satisfy them.
+    #[test]
+    fn every_relay_open_call_site_wraps_through_the_preserving_helper() {
+        let source = include_str!("sandbox.rs");
+
+        let relay_call = format!("{}{}", ".open_", "relay");
+        let call_sites = source.matches(relay_call.as_str()).count();
+        assert_eq!(
+            call_sites, 3,
+            "relay-open call sites changed; re-check that each preserves the redirect metadata"
+        );
+
+        let wrapped = format!("{}{}", ".map_err(|e| relay_open_", "failure(&e))?");
+        assert_eq!(
+            source.matches(wrapped.as_str()).count(),
+            call_sites,
+            "every relay-open call site must map its error through relay_open_failure"
+        );
+
+        let banned = format!(
+            "{}{}",
+            "Status::unavailable(format!(\"supervisor relay", " failed"
+        );
+        assert!(
+            !source.contains(banned.as_str()),
+            "constructing a fresh Status here discards the x-openshell-serving-replica trailer"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

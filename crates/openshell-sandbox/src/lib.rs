@@ -269,7 +269,17 @@ pub async fn run_sandbox(
             static_credential_bindings,
             non_secret_environment_keys,
         ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+            // A replica, never the configured endpoint — see `fleet_target`.
+            // An unresolved fleet takes the same arm as a failed fetch, which
+            // fails closed: no provider credentials. Falling back to the
+            // configured endpoint would only fail the handshake instead.
+            let fetched = async {
+                let target = fleet_target(endpoint, id, 0).await?;
+
+                openshell_core::grpc_client::fetch_provider_environment(&target, id).await
+            }
+            .await;
+            match fetched {
                 Ok(result) => {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -2290,6 +2300,51 @@ where
     ))
 }
 
+/// One gateway replica's address for a unary RPC, or a retryable error.
+///
+/// Every RPC here predates this sandbox's supervisor sessions, so none of them
+/// may use the configured endpoint: with a fleet configured that is the
+/// headless `Service`, which the gateway's serving certificate deliberately
+/// omits, so dialling it fails the TLS handshake. Single-endpoint deployments
+/// get their one endpoint back unchanged.
+async fn fleet_target(endpoint: &str, sandbox_id: &str, attempt: usize) -> Result<String> {
+    openshell_supervisor_process::gateway_fleet::unary_endpoint(endpoint, sandbox_id, attempt)
+        .await
+        .ok_or_else(|| miette::miette!("gateway fleet membership is not resolved yet"))
+}
+
+/// [`grpc_retry`], re-addressing a replica on every attempt.
+///
+/// Resolving once and retrying against the same target would spend all five
+/// attempts on a replica that has died; the rotation inside
+/// [`gateway_fleet::unary_endpoint`](openshell_supervisor_process::gateway_fleet::unary_endpoint)
+/// costs one. Membership that cannot be resolved yet is a retryable error, so
+/// the backoff covers a sandbox that starts while the fleet is still coming up.
+async fn grpc_retry_on_fleet<T, F, Fut>(
+    op_name: &str,
+    endpoint: &str,
+    sandbox_id: &str,
+    f: F,
+) -> Result<T>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let attempt = std::sync::atomic::AtomicUsize::new(0);
+
+    grpc_retry(op_name, || {
+        let attempt = &attempt;
+        let f = &f;
+        async move {
+            let n = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let target = fleet_target(endpoint, sandbox_id, n).await?;
+
+            f(target).await
+        }
+    })
+    .await
+}
+
 /// Load sandbox policy from local files or gRPC.
 ///
 /// Priority:
@@ -2376,8 +2431,11 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let mut snapshot = grpc_retry("Policy fetch", || {
-            openshell_core::grpc_client::fetch_settings_snapshot(endpoint, id)
+        // Addressed to a replica. This fetch is a hard startup gate — it fails
+        // the sandbox — and the configured endpoint is the one name that cannot
+        // serve it.
+        let mut snapshot = grpc_retry_on_fleet("Policy fetch", endpoint, id, |target| async move {
+            openshell_core::grpc_client::fetch_settings_snapshot(&target, id).await
         })
         .await?;
 
@@ -2410,14 +2468,20 @@ async fn load_policy(
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
             let ws = snapshot.workspace.clone();
-            snapshot = grpc_retry("Policy discovery sync", || {
-                openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
-                    endpoint,
-                    id,
-                    sandbox,
-                    &discovered,
-                    &ws,
-                )
+            snapshot = grpc_retry_on_fleet("Policy discovery sync", endpoint, id, |target| {
+                // Cloned per attempt: the retry calls this more than once.
+                let discovered = discovered.clone();
+                let ws = ws.clone();
+                async move {
+                    openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+                        &target,
+                        id,
+                        sandbox,
+                        &discovered,
+                        &ws,
+                    )
+                    .await
+                }
             })
             .await?;
             snapshot.policy.clone().ok_or_else(|| {
@@ -2438,15 +2502,20 @@ async fn load_policy(
         let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
         if let Some(sync_policy) = sync_policy {
             if let Some(sandbox_name) = sandbox.as_deref() {
-                match openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
-                    endpoint,
-                    id,
-                    sandbox_name,
-                    &sync_policy,
-                    &snapshot.workspace,
-                )
-                .await
-                {
+                let synced = async {
+                    let target = fleet_target(endpoint, id, 0).await?;
+
+                    openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+                        &target,
+                        id,
+                        sandbox_name,
+                        &sync_policy,
+                        &snapshot.workspace,
+                    )
+                    .await
+                }
+                .await;
+                match synced {
                     Ok(canonical) => {
                         if let Some(policy) = canonical.policy.clone() {
                             proto_policy = policy;
@@ -2531,12 +2600,17 @@ async fn load_policy(
             let middleware_services = middleware_services.clone();
             let extension_credentials = extension_credentials.clone();
             let extension_authentication_enabled = snapshot.extension_authentication_enabled;
+            let fleet_sandbox_id = sandbox_id.clone();
             async move {
                 let credentials = if extension_authentication_enabled {
                     // Share the supervisor's store so the slots installed here
                     // are the ones the policy poll loop later rotates in place.
+                    let target = match &fleet_sandbox_id {
+                        Some(id) => fleet_target(endpoint, id, 0).await?,
+                        None => endpoint.to_string(),
+                    };
                     openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-                        endpoint,
+                        &target,
                         extension_credentials,
                     )
                     .await?
@@ -3733,8 +3807,12 @@ fn emit_policy_validation_failure(
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
+    // One replica, held for the life of the loop. The configured endpoint is
+    // the headless `Service` when a fleet is configured, and it is absent from
+    // the serving certificate — see `fleet_target`.
+    let target = fleet_target(&ctx.endpoint, &ctx.sandbox_id, 0).await?;
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-        &ctx.endpoint,
+        &target,
         ctx.extension_credentials.clone(),
     )
     .await?;
@@ -4005,12 +4083,14 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
 
         if provider_env_changed {
-            match openshell_core::grpc_client::fetch_provider_environment(
-                &ctx.endpoint,
-                &ctx.sandbox_id,
-            )
-            .await
-            {
+            let fetched = async {
+                let target = fleet_target(&ctx.endpoint, &ctx.sandbox_id, 0).await?;
+
+                openshell_core::grpc_client::fetch_provider_environment(&target, &ctx.sandbox_id)
+                    .await
+            }
+            .await;
+            match fetched {
                 Ok(env_result) => {
                     let provider_env_revision = env_result.provider_env_revision;
                     let install_result = ctx.provider_credentials.install_bound_environment(

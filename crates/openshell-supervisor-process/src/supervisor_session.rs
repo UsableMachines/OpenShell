@@ -292,20 +292,28 @@ pub fn spawn(
         terminating,
         instance_id,
     };
-    tokio::spawn(run_session_loop(config))
+    // One task, however many sessions it holds: callers abort this handle at
+    // shutdown, and `gateway_fleet::run` owns its sessions in a `JoinSet` so
+    // that abort reaches all of them.
+    tokio::spawn(crate::gateway_fleet::run(config))
 }
 
-struct SessionConfig {
-    endpoint: String,
-    sandbox_id: String,
-    ssh_socket_path: std::path::PathBuf,
-    netns_fd: Option<i32>,
-    expected_ssh_peer_pid: Option<u32>,
-    terminating: Arc<AtomicBool>,
-    instance_id: String,
+/// Everything one supervisor session needs. Cloned per subset member, with
+/// only `endpoint` differing.
+#[derive(Clone)]
+pub(crate) struct SessionConfig {
+    pub(crate) endpoint: String,
+    pub(crate) sandbox_id: String,
+    pub(crate) ssh_socket_path: std::path::PathBuf,
+    pub(crate) netns_fd: Option<i32>,
+    pub(crate) expected_ssh_peer_pid: Option<u32>,
+    pub(crate) terminating: Arc<AtomicBool>,
+    pub(crate) instance_id: String,
 }
 
-async fn run_session_loop(config: SessionConfig) {
+/// Keep one session to one gateway replica alive, reconnecting with
+/// exponential backoff until the gateway closes the stream cleanly.
+pub(crate) async fn run_session_loop(config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
