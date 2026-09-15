@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::gateway_channels::{self, GatewayChannel};
 use crate::proto::{
     DenialSummary, ExchangeProviderSubjectTokenRequest, GetDraftPolicyRequest,
     GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
@@ -213,20 +214,22 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// bootstrap is both unnecessary and (on the K8s SA path) expensive
 /// (one apiserver round-trip per call). The renewal loop itself is
 /// spawned once per process via [`REFRESH_SPAWNED`].
-async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
+async fn connect_channel(endpoint: &str) -> Result<GatewayChannel> {
     let channel = build_plain_channel(endpoint).await?;
     let (slot, refresh_mode) = token_slot(endpoint, &channel).await?;
-    let plain_channel = channel.clone();
-    let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
+    let plain = channel.clone();
+    let gateway = GatewayChannel {
+        endpoint: endpoint.to_string(),
+        authed: InterceptedService::new(channel, AuthInterceptor::new(slot.clone())),
+        plain,
+    };
     if REFRESH_SPAWNED.set(()).is_ok() {
         let RefreshMode::GatewayJwt(source) = refresh_mode;
-        let refresh_channel = intercepted.clone();
-        let endpoint = endpoint.to_string();
         tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel).await;
+            refresh_token_loop(slot, source).await;
         });
     }
-    Ok(intercepted)
+    Ok(gateway)
 }
 
 async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, RefreshMode)> {
@@ -334,6 +337,12 @@ async fn acquire_k8s_sandbox_token(
 /// Build an authenticated channel for direct external use (e.g. the
 /// long-lived `supervisor_session` control stream).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
+    Ok(connect_channel(endpoint).await?.authed)
+}
+
+/// Both halves of a gateway connection, for a caller that will publish it to
+/// [`crate::gateway_channels`] once its supervisor session is accepted.
+pub async fn connect_gateway_channel(endpoint: &str) -> Result<GatewayChannel> {
     connect_channel(endpoint).await
 }
 
@@ -342,83 +351,147 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
 /// in-flight and future clients pick it up on their next request. The
 /// loop never panics: every failure is logged and re-attempted after a
 /// bounded backoff.
-async fn refresh_token_loop(
-    channel: AuthedChannel,
-    slot: TokenSlot,
-    source: TokenSource,
-    endpoint: String,
-    plain_channel: Channel,
-) {
-    let mut client = OpenShellClient::new(channel);
+///
+/// One task per process, because the token is per process — but deliberately
+/// not one *gateway* per process. It borrows an established session from
+/// [`gateway_channels`] on every attempt, so renewal follows the sessions
+/// wherever they move. Holding the channel it was built from meant a
+/// supervisor whose original gateway went away kept renewing against a dead
+/// address until the JWT expired, while healthy sessions to other replicas sat
+/// unused beside it.
+async fn refresh_token_loop(slot: TokenSlot, source: TokenSource) {
     loop {
         let sleep = compute_refresh_delay(&slot);
         tokio::time::sleep(sleep).await;
-        match client
+
+        let renewed = gateway_channels::with_gateway("RefreshSandboxToken", |gateway| {
+            let slot = slot.clone();
+            async move { renew_against(&gateway, &slot, source).await }
+        })
+        .await;
+
+        if let Err(error) = renewed {
+            warn!(
+                %error,
+                "RefreshSandboxToken failed on every established gateway; will retry"
+            );
+            // Backoff so we don't spin against a sustained failure.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+}
+
+/// One renewal against one gateway.
+///
+/// An error here is how [`gateway_channels::with_gateway`] learns to try
+/// another gateway, so every failure path must return one rather than log and
+/// carry on.
+async fn renew_against<G: RenewalGateway + ?Sized>(
+    gateway: &G,
+    slot: &TokenSlot,
+    source: TokenSource,
+) -> Result<()> {
+    let status = match gateway.refresh_token().await {
+        Ok(token) => {
+            install_bearer(slot, &token)
+                .wrap_err("refreshed JWT contained invalid header bytes")?;
+            info!(endpoint = %gateway.endpoint(), "renewed gateway sandbox JWT in-place");
+            return Ok(());
+        }
+        Err(status) => status,
+    };
+
+    if status.code() != tonic::Code::Unauthenticated {
+        return Err(miette::miette!("RefreshSandboxToken failed: {status}"));
+    }
+
+    // Unauthenticated means the token itself is no longer accepted, which no
+    // other gateway will answer differently — only a new token helps, and only
+    // the K8s path can mint one without help.
+    if source != TokenSource::K8sServiceAccount {
+        warn!(
+            source = ?source,
+            "RefreshSandboxToken returned Unauthenticated; static token sources cannot rebootstrap automatically"
+        );
+        return Err(miette::miette!(
+            "RefreshSandboxToken returned Unauthenticated and {source:?} cannot rebootstrap"
+        ));
+    }
+
+    let sa_path = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "RefreshSandboxToken returned Unauthenticated and K8s SA token file is unavailable"
+            )
+        })?;
+
+    // The bootstrap exchange must not present the token that was just
+    // rejected, so it goes over this gateway's plain channel.
+    let token = gateway.rebootstrap_token(&sa_path).await.wrap_err(
+        "K8s ServiceAccount bootstrap retry failed after refresh authentication failure",
+    )?;
+    install_bearer(slot, &token).wrap_err("rebootstrapped JWT contained invalid header bytes")?;
+    info!(
+        endpoint = %gateway.endpoint(),
+        "rebootstrapped gateway sandbox JWT after refresh authentication failure"
+    );
+
+    Ok(())
+}
+
+/// What renewing a token needs of a gateway.
+///
+/// A trait rather than the concrete channel because the defect this replaced
+/// was that renewal could not move between gateways, and nothing short of two
+/// gateways demonstrates that it now does. Standing up two servers to show it
+/// would test tonic; this seam lets a test remove the member renewal started
+/// on and drive a token to expiry against the one that remains.
+#[tonic::async_trait]
+trait RenewalGateway: Send + Sync {
+    /// For logs, and for the bootstrap exchange's error text.
+    fn endpoint(&self) -> &str;
+
+    /// `RefreshSandboxToken`, returning the raw token.
+    async fn refresh_token(&self) -> std::result::Result<String, Status>;
+
+    /// The K8s `ServiceAccount` bootstrap, over a channel carrying no token:
+    /// it runs exactly when the one we would have sent has been rejected.
+    async fn rebootstrap_token(&self, sa_path: &str) -> Result<String>;
+}
+
+#[tonic::async_trait]
+impl RenewalGateway for GatewayChannel {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    async fn refresh_token(&self) -> std::result::Result<String, Status> {
+        let mut client = OpenShellClient::new(self.authed.clone());
+        let resp = client
             .refresh_sandbox_token(RefreshSandboxTokenRequest {
                 extension_service_names: Vec::new(),
             })
-            .await
-        {
-            Ok(resp) => {
-                let new_token = resp.into_inner().token;
-                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                    Ok(value) => {
-                        if let Ok(mut guard) = slot.write() {
-                            *guard = value;
-                            info!("renewed gateway sandbox JWT in-place");
-                        }
-                    }
-                    Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
-                }
-            }
-            Err(status) => {
-                if status.code() == tonic::Code::Unauthenticated
-                    && source == TokenSource::K8sServiceAccount
-                {
-                    if let Some(sa_path) = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
-                        .ok()
-                        .filter(|p| !p.is_empty())
-                    {
-                        match acquire_k8s_sandbox_token(&endpoint, &plain_channel, &sa_path).await {
-                            Ok(new_token) => {
-                                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                                    Ok(value) => {
-                                        if let Ok(mut guard) = slot.write() {
-                                            *guard = value;
-                                            info!(
-                                                "rebootstrapped gateway sandbox JWT after refresh authentication failure"
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    Err(e) => warn!(
-                                        error = %e,
-                                        "rebootstrapped JWT contained invalid header bytes"
-                                    ),
-                                }
-                            }
-                            Err(e) => warn!(
-                                error = %e,
-                                "K8s ServiceAccount bootstrap retry failed after refresh authentication failure"
-                            ),
-                        }
-                    } else {
-                        warn!(
-                            "RefreshSandboxToken returned Unauthenticated and K8s SA token file is unavailable"
-                        );
-                    }
-                } else if status.code() == tonic::Code::Unauthenticated {
-                    warn!(
-                        source = ?source,
-                        "RefreshSandboxToken returned Unauthenticated; static token sources cannot rebootstrap automatically"
-                    );
-                }
-                warn!(error = %status, "RefreshSandboxToken failed; will retry");
-                // Backoff so we don't spin against a sustained failure.
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            }
-        }
+            .await?;
+
+        Ok(resp.into_inner().token)
     }
+
+    async fn rebootstrap_token(&self, sa_path: &str) -> Result<String> {
+        acquire_k8s_sandbox_token(&self.endpoint, &self.plain, sa_path).await
+    }
+}
+
+/// Install a raw token into the shared slot as a Bearer credential.
+fn install_bearer(slot: &TokenSlot, token: &str) -> Result<()> {
+    let value = AsciiMetadataValue::try_from(format!("Bearer {token}")).into_diagnostic()?;
+    let mut guard = slot
+        .write()
+        .map_err(|_| miette::miette!("token slot lock was poisoned"))?;
+    *guard = value;
+
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -551,6 +624,143 @@ fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
+mod renewal_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn slot_with(token: &str) -> TokenSlot {
+        Arc::new(RwLock::new(
+            AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        ))
+    }
+
+    fn token_in(slot: &TokenSlot) -> String {
+        slot.read().unwrap().to_str().unwrap().to_string()
+    }
+
+    /// A gateway that answers renewals, or does not.
+    struct FakeGateway {
+        endpoint: String,
+        /// `None` once this gateway is gone: every call fails at the transport.
+        answers: Mutex<Option<String>>,
+        calls: Mutex<usize>,
+    }
+
+    impl FakeGateway {
+        fn live(endpoint: &str, token: &str) -> Self {
+            Self {
+                endpoint: endpoint.to_string(),
+                answers: Mutex::new(Some(token.to_string())),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn gone(endpoint: &str) -> Self {
+            Self {
+                endpoint: endpoint.to_string(),
+                answers: Mutex::new(None),
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl RenewalGateway for FakeGateway {
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        async fn refresh_token(&self) -> std::result::Result<String, Status> {
+            *self.calls.lock().unwrap() += 1;
+            let answer = self.answers.lock().unwrap().clone();
+
+            answer.map_or_else(|| Err(Status::unavailable("connection refused")), Ok)
+        }
+
+        async fn rebootstrap_token(&self, _sa_path: &str) -> Result<String> {
+            Err(miette::miette!("not used in these tests"))
+        }
+    }
+
+    async fn renew_across(gateways: Vec<Arc<FakeGateway>>, slot: &TokenSlot) -> Result<()> {
+        gateway_channels::first_to_answer(
+            "RefreshSandboxToken",
+            gateways,
+            |gateway| gateway.endpoint.clone(),
+            |gateway| {
+                let slot = slot.clone();
+                async move { renew_against(gateway.as_ref(), &slot, TokenSource::Env).await }
+            },
+        )
+        .await
+    }
+
+    /// The defect this replaced: the renewal task kept the channel it was
+    /// built from, so removing that gateway left the token expiring against a
+    /// dead address while the rest of the fleet was healthy. Renewal has to
+    /// move, and the only way to show that is to take its first gateway away.
+    #[tokio::test]
+    async fn renewal_moves_to_a_surviving_gateway_when_the_first_is_gone() {
+        let slot = slot_with("about-to-expire");
+        let gone = Arc::new(FakeGateway::gone("10-0-0-1.gw:8080"));
+        let alive = Arc::new(FakeGateway::live("10-0-0-2.gw:8080", "renewed"));
+
+        renew_across(vec![gone.clone(), alive.clone()], &slot)
+            .await
+            .expect("a healthy gateway remained, so the token must be renewed");
+
+        assert_eq!(token_in(&slot), "Bearer renewed");
+        assert_eq!(*gone.calls.lock().unwrap(), 1, "the dead one costs one try");
+        assert_eq!(*alive.calls.lock().unwrap(), 1);
+    }
+
+    /// And keeps moving: a fleet that loses its remaining gateway between one
+    /// renewal and the next must not leave the loop pinned to the one that
+    /// happened to answer last.
+    #[tokio::test]
+    async fn renewal_moves_again_when_the_gateway_that_answered_also_goes() {
+        let slot = slot_with("about-to-expire");
+        let first = Arc::new(FakeGateway::live("10-0-0-1.gw:8080", "renewed-once"));
+        let second = Arc::new(FakeGateway::live("10-0-0-2.gw:8080", "renewed-twice"));
+
+        renew_across(vec![first.clone(), second.clone()], &slot)
+            .await
+            .unwrap();
+        assert_eq!(token_in(&slot), "Bearer renewed-once");
+
+        // The gateway that just served the renewal is removed.
+        *first.answers.lock().unwrap() = None;
+
+        renew_across(vec![first.clone(), second.clone()], &slot)
+            .await
+            .expect("the surviving gateway must take over");
+
+        assert_eq!(token_in(&slot), "Bearer renewed-twice");
+    }
+
+    /// Every gateway refusing is a real failure and must surface, so the loop
+    /// backs off and retries rather than treating the token as renewed.
+    #[tokio::test]
+    async fn renewal_fails_when_no_gateway_answers() {
+        let slot = slot_with("about-to-expire");
+        let gateways = vec![
+            Arc::new(FakeGateway::gone("10-0-0-1.gw:8080")),
+            Arc::new(FakeGateway::gone("10-0-0-2.gw:8080")),
+        ];
+
+        renew_across(gateways, &slot)
+            .await
+            .expect_err("nothing answered");
+
+        assert_eq!(
+            token_in(&slot),
+            "Bearer about-to-expire",
+            "a failed renewal must leave the slot alone"
+        );
+    }
+}
+
+#[cfg(test)]
 mod auth_tests {
     use super::*;
 
@@ -678,13 +888,13 @@ mod workspace_tests {
 /// Connect to the `OpenShell` server.
 async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
     let channel = connect_channel(endpoint).await?;
-    Ok(OpenShellClient::new(channel))
+    Ok(OpenShellClient::new(channel.authed))
 }
 
 /// Connect to the inference service.
 async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChannel>> {
     let channel = connect_channel(endpoint).await?;
-    Ok(InferenceClient::new(channel))
+    Ok(InferenceClient::new(channel.authed))
 }
 
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
@@ -1046,6 +1256,24 @@ impl CachedOpenShellClient {
             workspace: Arc::new(tokio::sync::OnceCell::new()),
             extension_credentials,
         })
+    }
+
+    /// Wrap a gateway channel that is already established, sharing cached
+    /// state with the client it came from.
+    ///
+    /// For callers that borrow a connection per call rather than holding one:
+    /// the channel changes between calls, the learned workspace and the
+    /// credential slots must not.
+    pub fn from_channel(
+        channel: AuthedChannel,
+        extension_credentials: ExtensionCredentialStore,
+        workspace: Arc<tokio::sync::OnceCell<String>>,
+    ) -> Self {
+        Self {
+            client: OpenShellClient::new(channel),
+            workspace,
+            extension_credentials,
+        }
     }
 
     /// Get a clone of the underlying tonic client for direct RPC calls.

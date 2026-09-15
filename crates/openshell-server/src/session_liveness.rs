@@ -11,7 +11,7 @@
 //!
 //! This module records that a replica held a session for a sandbox as of a
 //! moment, so a replica without a local session can point the caller at one
-//! that had it rather than waiting out its session timeout and failing.
+//! that had it rather than answering a bare refusal it cannot act on.
 //!
 //! A row is liveness, not ownership. Several replicas legitimately serve one
 //! sandbox, each writes only its own row, and a row is a lagging account of
@@ -87,6 +87,15 @@ pub const LIVENESS_TTL: Duration = Duration::from_secs(30);
 /// Interval between liveness renewals while a session is live.
 pub const LIVENESS_RENEWAL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How soon to try again after a failed claim or renewal.
+///
+/// Half [`LIVENESS_RENEWAL_INTERVAL`], so a record that misses one write still
+/// gets several attempts inside its TTL instead of having its next attempt
+/// race expiry. The TTL already assumes retries happen — that is what "three
+/// renewal attempts fit inside the TTL" buys — so this is what makes the
+/// assumption true rather than a new allowance.
+pub const LIVENESS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Overall budget for withdrawing this replica's rows during graceful shutdown.
 ///
 /// Deliberately far shorter than any sane `terminationGracePeriodSeconds`:
@@ -101,8 +110,31 @@ pub const LIVENESS_RELEASE_ALL_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Advisory in the strong sense: it biases the next attempt and never
 /// refuses one. A client that ignores it sees exactly the pre-HA behavior —
-/// an `unavailable` status after the session wait timeout.
+/// an immediate `unavailable`. A replica never waits for a session to arrive:
+/// see `session_or_unavailable` for why that decision belongs to the caller.
 pub const SERVING_REPLICA_METADATA_KEY: &str = "x-openshell-serving-replica";
+
+/// Response metadata key carrying *every* replica with a live session for this
+/// sandbox, each with the age of the fact.
+///
+/// [`SERVING_REPLICA_METADATA_KEY`] answers "here is one of them", which is all
+/// a client can act on without knowing how stale the answer is. A liveness row
+/// is believed for [`LIVENESS_TTL`], so that single address may have last been
+/// renewed 30 seconds ago — an eternity to a client retrying over hundreds of
+/// milliseconds, and indistinguishable from one renewed 200ms ago.
+///
+/// The rows are already read together (see [`SessionLiveness::lookup`]), so
+/// reporting all of them with their ages costs no extra store round trip. The
+/// format is `address;age=<ms>`, comma-separated, youngest first:
+///
+/// ```text
+/// x-openshell-serving-replicas: 10-42-0-7:8080;age=120,10-42-0-9:8080;age=8400
+/// ```
+///
+/// Additive by construction: the single-address key keeps its exact former
+/// meaning and is emitted in exactly the cases it always was, so a client that
+/// knows only that key is unaffected.
+pub const SERVING_REPLICAS_METADATA_KEY: &str = "x-openshell-serving-replicas";
 
 /// Build a wrapping [`Status`] that keeps `inner`'s serving-replica hint.
 ///
@@ -125,12 +157,32 @@ pub fn wrap_status_preserving_redirect_hint(
     message: impl Into<String>,
 ) -> Status {
     let mut wrapped = Status::new(code, message);
-    if let Some(hint) = inner.metadata().get(SERVING_REPLICA_METADATA_KEY) {
-        wrapped
-            .metadata_mut()
-            .insert(SERVING_REPLICA_METADATA_KEY, hint.clone());
+    for key in [SERVING_REPLICA_METADATA_KEY, SERVING_REPLICAS_METADATA_KEY] {
+        if let Some(hint) = inner.metadata().get(key) {
+            wrapped.metadata_mut().insert(key, hint.clone());
+        }
     }
     wrapped
+}
+
+/// Render replicas for [`SERVING_REPLICAS_METADATA_KEY`], or `None` when there
+/// are none to report.
+///
+/// Header text only: addresses are validated where they are written, and an
+/// address that cannot be header text is dropped by the caller rather than
+/// corrupting the whole list.
+pub fn encode_serving_replicas(replicas: &[ServingReplica]) -> Option<String> {
+    if replicas.is_empty() {
+        return None;
+    }
+
+    Some(
+        replicas
+            .iter()
+            .map(|replica| format!("{};age={}", replica.address, replica.age_ms))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 #[derive(Debug, Error)]
@@ -169,6 +221,27 @@ pub struct LivenessRecord {
     pub renewed_at_ms: i64,
     pub resource_version: u64,
     pub updated_at_ms: i64,
+}
+
+/// What a replica can tell a client about who is serving a sandbox.
+pub struct ServingHint {
+    /// The freshest unexpired row, this replica's own included. The input to
+    /// the single-address hint, whose behavior is unchanged.
+    pub freshest: Option<LivenessRecord>,
+    /// Every *other* replica with a live row, youngest first.
+    pub others: Vec<ServingReplica>,
+}
+
+/// One replica serving this sandbox, and how stale that fact is.
+///
+/// `age_ms` is measured against `updated_at_ms` — the store's own write
+/// timestamp — because that is the field [`LIVENESS_TTL`] expiry is computed
+/// from. Reporting an age derived from anything else would let a client see a
+/// record we are about to stop believing described as fresh.
+#[derive(Debug, Clone)]
+pub struct ServingReplica {
+    pub address: String,
+    pub age_ms: i64,
 }
 
 /// Handle to an liveness record this replica holds, carrying the CAS version
@@ -316,8 +389,9 @@ impl SessionLiveness {
     ///
     /// Both guards matter. A superseded session's cleanup can run long after a
     /// reconnect installed a newer session — possibly on a different replica —
-    /// and an unguarded delete there would erase the serving replica's record and
-    /// send every subsequent request into the wait-then-fail path.
+    /// and an unguarded delete there would erase the serving replica's record,
+    /// leaving every subsequent request with a bare refusal naming nowhere to
+    /// go next.
     ///
     /// Returns `true` when a record was removed.
     pub async fn withdraw(
@@ -429,6 +503,51 @@ impl SessionLiveness {
             .into_iter()
             .filter(|record| !record_is_expired(now_ms, record.updated_at_ms, ttl_ms))
             .max_by_key(|record| record.renewed_at_ms))
+    }
+
+    /// Everything this replica can tell a client about who is serving
+    /// `sandbox_id`, from a single read of the rows.
+    ///
+    /// Both halves come from the same list because the redirect path needs
+    /// both and a refusal is exactly the moment not to double the store load:
+    /// refusals are rare when routing is healthy and spike together when it is
+    /// not.
+    ///
+    /// [`ServingHint::freshest`] reproduces [`Self::lookup`] exactly, this
+    /// replica's own row included, so the long-standing single-address hint
+    /// keeps its meaning to the letter. [`ServingHint::others`] is the part
+    /// that was previously computed and thrown away.
+    pub async fn serving_hint(&self, sandbox_id: &str) -> Result<ServingHint, LivenessError> {
+        let now_ms = now_ms();
+        let ttl_ms = self.ttl_ms();
+
+        let live: Vec<LivenessRecord> = self
+            .read_all(sandbox_id)
+            .await?
+            .into_iter()
+            .filter(|record| !record_is_expired(now_ms, record.updated_at_ms, ttl_ms))
+            .collect();
+
+        // Our own row is excluded from `others`: this tells a client where
+        // *else* to go, and we are the replica that just failed to serve it. A
+        // row with no advertise address is excluded too — a replica that could
+        // not determine its own routable address is not somewhere to be sent.
+        let mut others: Vec<ServingReplica> = live
+            .iter()
+            .filter(|record| record.replica_id != self.replica_id)
+            .filter(|record| !record.advertise_address.trim().is_empty())
+            .map(|record| ServingReplica {
+                address: record.advertise_address.trim().to_string(),
+                // Clamped for the same clock skew `record_is_expired` clamps.
+                age_ms: now_ms.saturating_sub(record.updated_at_ms).max(0),
+            })
+            .collect();
+        others.sort_by_key(|replica| replica.age_ms);
+
+        Ok(ServingHint {
+            freshest: live.into_iter().max_by_key(|record| record.renewed_at_ms),
+            others,
+        })
     }
 
     /// Every replica this sandbox has a session row for, expired or not.
@@ -752,6 +871,29 @@ mod tests {
         );
     }
 
+    /// The richer key has to survive re-wrapping for the same reason the
+    /// single one does: a `Status` rebuilt anywhere up the stack keeps only its
+    /// `Display` text, and the ages would vanish while still appearing in logs.
+    #[test]
+    fn wrapping_keeps_the_replica_list_too() {
+        let mut inner = status_with_redirect("10-0-0-9.gw.ns.svc:8080");
+        inner.metadata_mut().insert(
+            SERVING_REPLICAS_METADATA_KEY,
+            "10-0-0-9.gw.ns.svc:8080;age=120".parse().unwrap(),
+        );
+
+        let wrapped =
+            wrap_status_preserving_redirect_hint(&inner, tonic::Code::Unavailable, "wrapped");
+
+        assert_eq!(
+            wrapped
+                .metadata()
+                .get(SERVING_REPLICAS_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some("10-0-0-9.gw.ns.svc:8080;age=120")
+        );
+    }
+
     #[test]
     fn liveness_object_id_is_namespaced_away_from_the_sandbox_row() {
         let sandbox_id = "1f8b4fc9-2c4d-4f2a-9f1e-0b6d3a5c7e91";
@@ -793,6 +935,128 @@ mod tests {
         assert_eq!(record.replica_id, "replica-1");
         assert_eq!(record.advertise_address, "10-0-0-1.gw.ns.svc:8080");
         assert_eq!(record.session_id, "session-a");
+    }
+
+    /// The information the single-address hint threw away. A client retrying
+    /// over hundreds of milliseconds has to tell a session renewed moments ago
+    /// from one renewed nearly `LIVENESS_TTL` ago, and one address cannot.
+    #[tokio::test]
+    async fn serving_hint_reports_every_holder_youngest_first() {
+        let store = store_with_sandboxes(&["sbx-all"]).await;
+        let o1 = liveness(store.clone(), "replica-1", "a:1", LIVENESS_TTL);
+        let o2 = liveness(store.clone(), "replica-2", "b:2", LIVENESS_TTL);
+        let observer = liveness(store.clone(), "replica-3", "c:3", LIVENESS_TTL);
+
+        o1.announce("sbx-all", "session-a").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        o2.announce("sbx-all", "session-b").await.unwrap();
+
+        let hint = observer.serving_hint("sbx-all").await.unwrap();
+
+        let addresses: Vec<&str> = hint
+            .others
+            .iter()
+            .map(|replica| replica.address.as_str())
+            .collect();
+        assert_eq!(
+            addresses,
+            vec!["b:2", "a:1"],
+            "the most recently renewed holder must come first"
+        );
+        assert!(
+            hint.others[0].age_ms <= hint.others[1].age_ms,
+            "ages must be non-decreasing: {:?}",
+            hint.others
+                .iter()
+                .map(|replica| replica.age_ms)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hint.freshest.map(|record| record.replica_id),
+            Some("replica-2".to_string()),
+            "the single-address hint must keep naming the freshest row"
+        );
+    }
+
+    /// The hint exists to say where *else* to go, and the replica answering is
+    /// the one that just failed to serve the request.
+    #[tokio::test]
+    async fn serving_hint_excludes_the_replica_answering() {
+        let store = store_with_sandboxes(&["sbx-self"]).await;
+        let o1 = liveness(store.clone(), "replica-1", "a:1", LIVENESS_TTL);
+        let o2 = liveness(store.clone(), "replica-2", "b:2", LIVENESS_TTL);
+
+        o1.announce("sbx-self", "session-a").await.unwrap();
+        o2.announce("sbx-self", "session-b").await.unwrap();
+
+        let hint = o1.serving_hint("sbx-self").await.unwrap();
+
+        let addresses: Vec<&str> = hint
+            .others
+            .iter()
+            .map(|replica| replica.address.as_str())
+            .collect();
+        assert_eq!(addresses, vec!["b:2"]);
+    }
+
+    /// An expired row names a replica that stopped renewing. Sending a client
+    /// there is worse than telling it nothing.
+    #[tokio::test]
+    async fn serving_hint_drops_rows_past_the_ttl() {
+        let store = store_with_sandboxes(&["sbx-stale"]).await;
+        let ttl = Duration::from_millis(30);
+        let o1 = liveness(store.clone(), "replica-1", "a:1", ttl);
+        let observer = liveness(store.clone(), "replica-2", "b:2", ttl);
+
+        o1.announce("sbx-stale", "session-a").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let hint = observer.serving_hint("sbx-stale").await.unwrap();
+
+        assert!(hint.others.is_empty(), "{:?}", hint.others.len());
+        assert!(hint.freshest.is_none());
+    }
+
+    /// A replica that could not determine its own routable address is not
+    /// somewhere a client can be sent, so it must not appear in the list.
+    #[tokio::test]
+    async fn serving_hint_omits_a_holder_with_no_address() {
+        let store = store_with_sandboxes(&["sbx-blank"]).await;
+        let blank = liveness(store.clone(), "replica-1", "", LIVENESS_TTL);
+        let observer = liveness(store.clone(), "replica-2", "b:2", LIVENESS_TTL);
+
+        blank.announce("sbx-blank", "session-a").await.unwrap();
+
+        let hint = observer.serving_hint("sbx-blank").await.unwrap();
+
+        assert!(hint.others.is_empty());
+        assert_eq!(
+            hint.freshest.map(|record| record.replica_id),
+            Some("replica-1".to_string()),
+            "the row still exists; only its usability as a target is in question"
+        );
+    }
+
+    #[test]
+    fn encodes_replicas_as_addresses_with_ages() {
+        let encoded = encode_serving_replicas(&[
+            ServingReplica {
+                address: "a:1".to_string(),
+                age_ms: 120,
+            },
+            ServingReplica {
+                address: "b:2".to_string(),
+                age_ms: 8_400,
+            },
+        ]);
+
+        assert_eq!(encoded.as_deref(), Some("a:1;age=120,b:2;age=8400"));
+    }
+
+    /// Nothing to say means no header, not an empty one.
+    #[test]
+    fn encodes_nothing_when_no_replica_is_serving() {
+        assert!(encode_serving_replicas(&[]).is_none());
     }
 
     /// A supervisor connects to every member of its subset, so two replicas

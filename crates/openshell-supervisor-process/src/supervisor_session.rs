@@ -345,6 +345,33 @@ pub(crate) async fn run_session_loop(config: SessionConfig) {
     }
 }
 
+/// Keeps a gateway channel published for exactly as long as its session lives.
+///
+/// A `Drop` guard rather than an explicit withdrawal because a session ends in
+/// more ways than it returns: the fleet loop aborts these tasks when a member
+/// leaves the subset, and an aborted task runs no more of its body. A channel
+/// left published after its session died is the stale pin this whole mechanism
+/// exists to prevent, so withdrawal has to be something the runtime does for
+/// us rather than something every exit path remembers.
+struct RegisteredChannel {
+    endpoint: String,
+}
+
+impl RegisteredChannel {
+    fn publish(gateway: openshell_core::gateway_channels::GatewayChannel) -> Self {
+        let endpoint = gateway.endpoint.clone();
+        openshell_core::gateway_channels::register(gateway);
+
+        Self { endpoint }
+    }
+}
+
+impl Drop for RegisteredChannel {
+    fn drop(&mut self) {
+        openshell_core::gateway_channels::withdraw(&self.endpoint);
+    }
+}
+
 async fn run_single_session(
     config: &SessionConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -352,9 +379,10 @@ async fn run_single_session(
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(&config.endpoint)
+    let gateway = grpc_client::connect_gateway_channel(&config.endpoint)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
+    let channel = gateway.authed.clone();
     let mut client = OpenShellClient::new(channel.clone());
 
     // Create the outbound message stream.
@@ -391,6 +419,13 @@ async fn run_single_session(
         }
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
+
+    // Published only now, not at connect: membership of the pool means "this
+    // gateway accepted a session and is heartbeating", which is what makes it
+    // a better liveness signal than anything DNS can answer. The guard
+    // withdraws it on every exit from this function — including the abort
+    // `reap_drained` issues, which runs no further code but does drop locals.
+    let _registration = RegisteredChannel::publish(gateway);
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(

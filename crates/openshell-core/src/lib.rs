@@ -23,6 +23,7 @@ pub mod error;
 pub mod external_driver_socket;
 mod fleet_dns;
 pub mod forward;
+pub mod gateway_channels;
 pub mod gateway_fleet;
 pub mod google_cloud;
 pub mod gpu;
