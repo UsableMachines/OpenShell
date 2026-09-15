@@ -1868,10 +1868,11 @@ fn phase_forecloses_relay(sandbox: &Sandbox) -> Option<Status> {
 ///
 /// Shared by every relay-open call site so the message cannot drift between
 /// them and, more importantly, so none of them can drop the serving-replica
-/// redirect hint that `wait_for_session` attaches. Building a fresh
-/// `Status::unavailable` here instead would discard it — the address would
-/// still appear in the message text, which is only for logs, while the
-/// metadata the client actually keys off would be gone.
+/// metadata that `SupervisorSessionRegistry::no_local_session_status` attaches.
+/// Building a fresh `Status::unavailable` here instead would discard it — the
+/// address would still appear in the message text, which is only for logs,
+/// while the metadata the client actually keys off would be gone, and with it
+/// the client's proof that nothing was dispatched.
 pub fn relay_open_failure(inner: &Status) -> Status {
     crate::session_liveness::wrap_status_preserving_redirect_hint(
         inner,

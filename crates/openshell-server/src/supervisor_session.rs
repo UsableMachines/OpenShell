@@ -25,7 +25,9 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::session_liveness::{
-    LIVENESS_RENEWAL_INTERVAL, PeerSessions, SERVING_REPLICA_METADATA_KEY, SessionLiveness,
+    LIVENESS_RENEWAL_INTERVAL, LIVENESS_RETRY_INTERVAL, LivenessHandle, PeerSessions,
+    SERVING_REPLICA_METADATA_KEY, SERVING_REPLICAS_METADATA_KEY, SessionLiveness,
+    encode_serving_replicas,
 };
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
@@ -148,39 +150,63 @@ impl SupervisorSessionRegistry {
     {
         let liveness = Arc::clone(self.liveness.as_ref()?);
         let handle = tokio::spawn(async move {
-            let mut claim = match liveness.announce(&sandbox_id, &session_id).await {
-                Ok(claim) => claim,
-                Err(err) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        session_id = %session_id,
-                        replica = %liveness.replica_id(),
-                        error = %err,
-                        "supervisor session: liveness claim failed — serving locally without a redirect record"
-                    );
-                    return;
-                }
-            };
-            debug!(
-                sandbox_id = %sandbox_id,
-                session_id = %session_id,
-                replica = %liveness.replica_id(),
-                "supervisor session: liveness claimed"
-            );
+            // Held only while this replica has a usable claim. A store error
+            // drops it and the next pass re-announces: giving up instead would
+            // let a session that is serving perfectly well go unrecorded, and
+            // the TTL is sized on the assumption that a write is retried
+            // rather than abandoned. The task itself ends only when the
+            // session does, because `LivenessRenewal` aborts it on drop.
+            let mut claim: Option<LivenessHandle> = None;
 
             loop {
-                tokio::time::sleep(LIVENESS_RENEWAL_INTERVAL).await;
-                if let Err(err) = liveness.renew(&sandbox_id, &mut claim).await {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        session_id = %session_id,
-                        replica = %liveness.replica_id(),
-                        error = %err,
-                        "supervisor session: liveness renewal failed — session keeps serving, redirects may point elsewhere"
-                    );
-                    return;
-                }
-                keep_phase_ready(sandbox_id.clone()).await;
+                let wait = match claim.as_mut() {
+                    None => match liveness.announce(&sandbox_id, &session_id).await {
+                        Ok(fresh) => {
+                            debug!(
+                                sandbox_id = %sandbox_id,
+                                session_id = %session_id,
+                                replica = %liveness.replica_id(),
+                                "supervisor session: liveness claimed"
+                            );
+                            claim = Some(fresh);
+                            LIVENESS_RENEWAL_INTERVAL
+                        }
+                        Err(err) => {
+                            warn!(
+                                sandbox_id = %sandbox_id,
+                                session_id = %session_id,
+                                replica = %liveness.replica_id(),
+                                error = %err,
+                                "supervisor session: liveness claim failed — serving locally, will retry"
+                            );
+                            LIVENESS_RETRY_INTERVAL
+                        }
+                    },
+                    Some(held) => match liveness.renew(&sandbox_id, held).await {
+                        Ok(()) => {
+                            keep_phase_ready(sandbox_id.clone()).await;
+                            LIVENESS_RENEWAL_INTERVAL
+                        }
+                        Err(err) => {
+                            warn!(
+                                sandbox_id = %sandbox_id,
+                                session_id = %session_id,
+                                replica = %liveness.replica_id(),
+                                error = %err,
+                                "supervisor session: liveness renewal failed — session keeps serving, re-claiming"
+                            );
+                            // Dropped rather than retried in place: a renewal
+                            // writes against a resource version, and a failed
+                            // one may mean ours is stale. Re-announcing reads
+                            // the current version first, so it can recover from
+                            // a conflict that renewing never could.
+                            claim = None;
+                            LIVENESS_RETRY_INTERVAL
+                        }
+                    },
+                };
+
+                tokio::time::sleep(wait).await;
             }
         });
         Some(LivenessRenewal {
@@ -345,46 +371,101 @@ impl SupervisorSessionRegistry {
             return Ok(tx);
         }
 
-        // A liveness row may name a replica that had this session. It is a
-        // hint that biases the caller's next attempt, never a claim this
-        // replica can stand behind — the dispatch there is what tests it.
-        if let Some(status) = self.serving_replica_redirect_status(sandbox_id).await {
-            return Err(status);
-        }
-
-        Err(Status::unavailable("supervisor session not connected"))
+        Err(self.no_local_session_status(sandbox_id).await)
     }
 
-    /// Build a redirect status when a *different* live replica owns this
-    /// sandbox's supervisor session.
+    /// The refusal this replica answers with when it holds no session.
     ///
-    /// The address travels as `x-openshell-serving-replica` response
-    /// metadata on an otherwise ordinary `unavailable` status, and is repeated
-    /// in the message text for logs. This is deliberately a hint and not a
-    /// contract: a client that ignores the metadata sees exactly the
-    /// single-replica behavior it saw before, which is what keeps the change
-    /// compatible with upstream clients.
+    /// Always reached before anything is dispatched — [`Self::session_or_unavailable`]
+    /// runs before a relay is registered or a message is built — which is what
+    /// lets a client treat this status as proof that nothing ran.
     ///
-    /// Returns `None` — leaving today's wait-then-`unavailable` path intact —
-    /// when liveness tracking is off, when there is no live record, when the
-    /// record is ours (the session may still be connecting), or when the
-    /// recorded address is empty or our own.
-    async fn serving_replica_redirect_status(&self, sandbox_id: &str) -> Option<Status> {
-        let liveness = self.liveness.as_ref()?;
+    /// Carries [`SERVING_REPLICAS_METADATA_KEY`] whenever liveness is tracked,
+    /// *including with an empty value*. An empty list is a positive statement —
+    /// "no replica holds a session for this sandbox" — and it is the answer
+    /// every replica would give, because they all read the same store. A client
+    /// can therefore tell the two refusals apart: somebody else is serving, so
+    /// try there; or nobody is, so asking another replica is guaranteed to
+    /// learn nothing and only time can change the answer.
+    ///
+    /// The key is absent entirely when liveness is off or the store could not
+    /// be read, because then this replica knows nothing about anyone else, and
+    /// silence must not read as "nobody is serving".
+    async fn no_local_session_status(&self, sandbox_id: &str) -> Status {
+        const NOT_CONNECTED: &str = "supervisor session not connected";
 
-        let record = match liveness.lookup(sandbox_id).await {
-            Ok(record) => record?,
+        let Some(liveness) = self.liveness.as_ref() else {
+            return Status::unavailable(NOT_CONNECTED);
+        };
+
+        let hint = match liveness.serving_hint(sandbox_id).await {
+            Ok(hint) => hint,
             Err(err) => {
                 // A store hiccup must not change how a request is answered.
                 warn!(
                     sandbox_id = %sandbox_id,
                     error = %err,
-                    "supervisor session: liveness lookup failed — falling back to waiting"
+                    "supervisor session: liveness lookup failed — answering without a hint"
                 );
-                return None;
+                return Status::unavailable(NOT_CONNECTED);
             }
         };
 
+        let mut metadata = MetadataMap::new();
+        let encoded = encode_serving_replicas(&hint.others).unwrap_or_default();
+        if let Ok(value) = encoded.parse::<MetadataValue<Ascii>>() {
+            metadata.insert(SERVING_REPLICAS_METADATA_KEY, value);
+        } else {
+            warn!(
+                sandbox_id = %sandbox_id,
+                "supervisor session: serving replica list is not valid header text — omitting it"
+            );
+        }
+
+        // Whether a *redirect* happens, and the single-address key that carries
+        // it, are unchanged from before the list existed: it turns on the
+        // freshest row alone, ours excluded. A client that reads only the old
+        // key cannot tell the difference.
+        let Some(redirect) = Self::redirect_address(liveness, sandbox_id, &hint) else {
+            debug!(
+                sandbox_id = %sandbox_id,
+                known_serving_replicas = hint.others.len(),
+                "supervisor session: no session here and none to redirect to"
+            );
+
+            return Status::with_metadata(tonic::Code::Unavailable, NOT_CONNECTED, metadata);
+        };
+
+        metadata.insert(SERVING_REPLICA_METADATA_KEY, redirect.header);
+        info!(
+            sandbox_id = %sandbox_id,
+            serving_address = %redirect.address,
+            known_serving_replicas = hint.others.len(),
+            youngest_age_ms = hint.others.first().map_or(-1, |replica| replica.age_ms),
+            "supervisor session: owned by another replica — returning redirect hint"
+        );
+
+        Status::with_metadata(
+            tonic::Code::Unavailable,
+            format!(
+                "{NOT_CONNECTED} on this gateway replica; owned by {}",
+                redirect.address
+            ),
+            metadata,
+        )
+    }
+
+    /// The address to redirect to, or `None` to answer without one.
+    ///
+    /// `None` when there is no live record, when the record is ours (the
+    /// session may still be connecting), or when the recorded address is empty,
+    /// our own, or not usable as header text.
+    fn redirect_address(
+        liveness: &SessionLiveness,
+        sandbox_id: &str,
+        hint: &crate::session_liveness::ServingHint,
+    ) -> Option<RedirectAddress> {
+        let record = hint.freshest.as_ref()?;
         if record.replica_id == liveness.replica_id() {
             return None;
         }
@@ -398,24 +479,15 @@ impl SupervisorSessionRegistry {
                 sandbox_id = %sandbox_id,
                 serving_replica = %record.replica_id,
                 serving_address = %address,
-                "supervisor session: serving address is not valid header text — falling back to waiting"
+                "supervisor session: serving address is not valid header text — answering without a redirect"
             );
             return None;
         };
 
-        info!(
-            sandbox_id = %sandbox_id,
-            serving_replica = %record.replica_id,
-            serving_address = %address,
-            "supervisor session: owned by another replica — returning redirect hint"
-        );
-        let mut metadata = MetadataMap::new();
-        metadata.insert(SERVING_REPLICA_METADATA_KEY, header);
-        Some(Status::with_metadata(
-            tonic::Code::Unavailable,
-            format!("supervisor session not connected on this gateway replica; owned by {address}"),
-            metadata,
-        ))
+        Some(RedirectAddress {
+            address: address.to_string(),
+            header,
+        })
     }
 
     /// True if *any* replica holds a supervisor session for this sandbox.
@@ -726,6 +798,12 @@ async fn withdraw_liveness_record(liveness: &SessionLiveness, sandbox_id: &str, 
 /// fresh. Dropping it stops renewals, so the record ages out on its own if
 /// the explicit release never runs.
 #[derive(Debug)]
+/// A validated redirect target: the address for logs and the header to send.
+struct RedirectAddress {
+    address: String,
+    header: MetadataValue<Ascii>,
+}
+
 pub struct LivenessRenewal {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -2209,6 +2287,58 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unavailable);
     }
 
+    /// The distinction a client cannot otherwise make. Every replica reads the
+    /// same store, so "no replica holds a session" is an answer all of them
+    /// would give: asking another is guaranteed to learn nothing, and only
+    /// time can change it. Saying so takes a present-but-empty header, which
+    /// is a different statement from sending no header at all.
+    #[tokio::test]
+    async fn an_empty_serving_list_is_sent_when_nobody_holds_a_session() {
+        let store = store_with_sandboxes(&["sbx-nobody-home"]).await;
+        let registry = SupervisorSessionRegistry::with_liveness(liveness(
+            &store,
+            "replica-local",
+            "10-0-0-1.gw.ns.svc:8080",
+        ));
+
+        let err = registry
+            .session_or_unavailable("sbx-nobody-home")
+            .await
+            .expect_err("nothing holds this session");
+
+        let value = err
+            .metadata()
+            .get(SERVING_REPLICAS_METADATA_KEY)
+            .expect("the key states that nobody is serving, so it must be present");
+        assert_eq!(
+            value.to_str().expect("header text"),
+            "",
+            "an empty value is the statement; a missing key would be silence"
+        );
+        assert!(
+            err.metadata().get(SERVING_REPLICA_METADATA_KEY).is_none(),
+            "there is nowhere to redirect to"
+        );
+    }
+
+    /// Silence, not a claim. With no liveness tracking this replica knows
+    /// nothing about any other, and an empty list would assert something it
+    /// cannot observe.
+    #[tokio::test]
+    async fn no_serving_list_is_sent_when_liveness_is_off() {
+        let registry = SupervisorSessionRegistry::new();
+
+        let err = registry
+            .session_or_unavailable("sbx-untracked")
+            .await
+            .expect_err("nothing holds this session");
+
+        assert!(
+            err.metadata().get(SERVING_REPLICAS_METADATA_KEY).is_none(),
+            "a replica that tracks nothing must not claim nobody is serving"
+        );
+    }
+
     /// A liveness row naming a peer is the better answer, so it replaces the
     /// bare refusal when one exists.
     #[tokio::test]
@@ -2289,7 +2419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_session_does_not_redirect_when_owner_is_us() {
+    async fn a_refusal_does_not_redirect_when_the_owner_is_us() {
         let store = store_with_sandboxes(&["sbx-self-owned"]).await;
         let local = liveness(&store, "replica-local", "local:1");
         local
@@ -2309,7 +2439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_session_does_not_redirect_without_an_owner() {
+    async fn a_refusal_does_not_redirect_without_an_owner() {
         let store = store_with_sandboxes(&["sbx-unowned"]).await;
         let registry =
             SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
@@ -2325,7 +2455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_session_does_not_redirect_to_an_empty_address() {
+    async fn a_refusal_does_not_redirect_to_an_empty_address() {
         let store = store_with_sandboxes(&["sbx-no-address"]).await;
         let remote = liveness(&store, "replica-remote", "");
         remote
@@ -2346,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_session_does_not_redirect_to_our_own_address() {
+    async fn a_refusal_does_not_redirect_to_our_own_address() {
         let store = store_with_sandboxes(&["sbx-same-address"]).await;
         // Same advertised address under a different replica id — e.g. a
         // restarted pod that reused its IP. Redirecting to ourselves would
@@ -2372,7 +2502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_session_prefers_the_local_session_over_a_remote_owner() {
+    async fn a_local_session_is_preferred_over_a_remote_owner() {
         let store = store_with_sandboxes(&["sbx-local-wins"]).await;
         let remote = liveness(&store, "replica-remote", "10-0-0-9.gw.ns.svc:8080");
         remote

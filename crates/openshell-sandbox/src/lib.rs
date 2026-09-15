@@ -273,11 +273,14 @@ pub async fn run_sandbox(
             // An unresolved fleet takes the same arm as a failed fetch, which
             // fails closed: no provider credentials. Falling back to the
             // configured endpoint would only fail the handshake instead.
-            let fetched = async {
-                let target = fleet_target(endpoint, id, 0).await?;
-
-                openshell_core::grpc_client::fetch_provider_environment(&target, id).await
-            }
+            let fetched = grpc_retry_on_fleet(
+                "fetch_provider_environment",
+                endpoint,
+                id,
+                |target| async move {
+                    openshell_core::grpc_client::fetch_provider_environment(&target, id).await
+                },
+            )
             .await;
             match fetched {
                 Ok(result) => {
@@ -2502,18 +2505,23 @@ async fn load_policy(
         let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
         if let Some(sync_policy) = sync_policy {
             if let Some(sandbox_name) = sandbox.as_deref() {
-                let synced = async {
-                    let target = fleet_target(endpoint, id, 0).await?;
-
-                    openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
-                        &target,
-                        id,
-                        sandbox_name,
-                        &sync_policy,
-                        &snapshot.workspace,
-                    )
-                    .await
-                }
+                let sync_policy = &sync_policy;
+                let workspace = &snapshot.workspace;
+                let synced = grpc_retry_on_fleet(
+                    "sync_policy_and_fetch_snapshot",
+                    endpoint,
+                    id,
+                    |target| async move {
+                        openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+                            &target,
+                            id,
+                            sandbox_name,
+                            sync_policy,
+                            workspace,
+                        )
+                        .await
+                    },
+                )
                 .await;
                 match synced {
                     Ok(canonical) => {
@@ -3265,6 +3273,108 @@ impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient 
     }
 }
 
+/// A [`PolicyGatewayClient`] that borrows an established gateway session for
+/// each call instead of holding one.
+///
+/// Settings polling reads fleet-wide state, so every gateway answers it
+/// identically and there is nothing to choose between them — which is what
+/// makes borrowing viable at all. Holding one instead meant this loop pinned
+/// itself to whichever replica it resolved at startup and retried that address
+/// forever once the pod went away, while the supervisor's own sessions had
+/// already moved on.
+///
+/// The cached state is what must *not* move with the connection: the learned
+/// workspace and the credential slots handed to the middleware registry are
+/// this sandbox's, not any gateway's.
+#[derive(Clone)]
+struct PooledGatewayClient {
+    extension_credentials: openshell_extension_core::ExtensionCredentialStore,
+    workspace: Arc<tokio::sync::OnceCell<String>>,
+}
+
+impl PooledGatewayClient {
+    fn new(extension_credentials: openshell_extension_core::ExtensionCredentialStore) -> Self {
+        Self {
+            extension_credentials,
+            workspace: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// One established gateway, wrapped so the cached state travels with it.
+    fn borrowed(
+        &self,
+        gateway: &openshell_core::gateway_channels::GatewayChannel,
+    ) -> openshell_core::grpc_client::CachedOpenShellClient {
+        openshell_core::grpc_client::CachedOpenShellClient::from_channel(
+            gateway.authed.clone(),
+            self.extension_credentials.clone(),
+            self.workspace.clone(),
+        )
+    }
+}
+
+#[tonic::async_trait]
+impl PolicyGatewayClient for PooledGatewayClient {
+    async fn poll_settings(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+        openshell_core::gateway_channels::with_gateway("Settings poll", |gateway| async move {
+            self.borrowed(&gateway).poll_settings(sandbox_id).await
+        })
+        .await
+    }
+
+    async fn report_policy_status(
+        &self,
+        sandbox_id: &str,
+        version: u32,
+        loaded: bool,
+        error: &str,
+    ) -> Result<()> {
+        openshell_core::gateway_channels::with_gateway(
+            "Policy status report",
+            |gateway| async move {
+                self.borrowed(&gateway)
+                    .report_policy_status(sandbox_id, version, loaded, error)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn refresh_installed_extension_credentials(&self) -> Result<()> {
+        openshell_core::gateway_channels::with_gateway(
+            "Extension credential refresh",
+            |gateway| async move {
+                self.borrowed(&gateway)
+                    .refresh_installed_extension_credentials()
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn extension_credentials_for(
+        &self,
+        services: &[openshell_core::proto::SupervisorMiddlewareService],
+    ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
+        openshell_core::gateway_channels::with_gateway(
+            "Extension credentials",
+            |gateway| async move {
+                self.borrowed(&gateway)
+                    .extension_credentials_for(services)
+                    .await
+            },
+        )
+        .await
+    }
+
+    fn workspace(&self) -> String {
+        self.workspace.get().cloned().unwrap_or_default()
+    }
+}
+
 async fn run_policy_status_reporter<C: PolicyGatewayClient>(
     client: C,
     sandbox_id: String,
@@ -3807,15 +3917,12 @@ fn emit_policy_validation_failure(
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
-    // One replica, held for the life of the loop. The configured endpoint is
-    // the headless `Service` when a fleet is configured, and it is absent from
-    // the serving certificate — see `fleet_target`.
-    let target = fleet_target(&ctx.endpoint, &ctx.sandbox_id, 0).await?;
-    let client = openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
-        &target,
-        ctx.extension_credentials.clone(),
-    )
-    .await?;
+    // No replica is resolved or held here: the supervisor already holds a
+    // session to every member of its subset, and this loop borrows one per
+    // call. A gateway that goes away therefore costs one poll interval, not
+    // the rest of the sandbox's life.
+    let client = PooledGatewayClient::new(ctx.extension_credentials.clone());
+
     run_policy_poll_loop_with_client(ctx, client).await
 }
 
@@ -4083,12 +4190,16 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
 
         if provider_env_changed {
-            let fetched = async {
-                let target = fleet_target(&ctx.endpoint, &ctx.sandbox_id, 0).await?;
-
-                openshell_core::grpc_client::fetch_provider_environment(&target, &ctx.sandbox_id)
-                    .await
-            }
+            let sandbox_id = &ctx.sandbox_id;
+            let fetched = grpc_retry_on_fleet(
+                "fetch_provider_environment",
+                &ctx.endpoint,
+                sandbox_id,
+                |target| async move {
+                    openshell_core::grpc_client::fetch_provider_environment(&target, sandbox_id)
+                        .await
+                },
+            )
             .await;
             match fetched {
                 Ok(env_result) => {

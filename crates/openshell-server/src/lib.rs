@@ -591,7 +591,7 @@ pub(crate) async fn run_server(
     let sandbox_watch_bus = SandboxWatchBus::new();
     // Supervisor sessions live in one replica's memory. Record liveness in
     // the shared store so a replica without the local session can redirect
-    // the caller instead of waiting out its session timeout.
+    // the caller instead of answering a refusal that names nowhere to go.
     let session_liveness_records = Arc::new(session_liveness::SessionLiveness::new(
         store.clone(),
         compute::lease::replica_id(),
