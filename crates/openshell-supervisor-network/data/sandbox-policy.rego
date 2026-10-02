@@ -876,10 +876,11 @@ command_matches(actual, expected) if {
 	upper(actual) == upper(expected)
 }
 
-# --- Matched endpoint config (for L7 and allowed_ips extraction) ---
+# --- Matched endpoint config (for L7, allowed_ips, and upstream_ca_pem extraction) ---
 # Returns the raw endpoint object for the matched policy + host:port.
 # Used by Rust to extract L7 config (protocol, tls, enforcement,
-# allow_encoded_slash) and/or allowed_ips for SSRF allowlist validation.
+# allow_encoded_slash), allowed_ips for SSRF validation, and upstream_ca_pem
+# for endpoint-scoped upstream TLS verification.
 
 # Per-policy helper: returns matching endpoint configs for a single policy.
 _policy_endpoint_configs(policy) := [ep |
@@ -1023,7 +1024,7 @@ endpoint_path_matches_request(ep, request) if {
 }
 
 # An endpoint has extended config if it specifies an L7 protocol, allowed_ips,
-# or an explicit tls mode (e.g. tls: skip). Explicit protocol "tcp" is the
+# upstream_ca_pem, or an explicit tls mode (e.g. tls: skip). Explicit protocol "tcp" is the
 # authored spelling of plain L4 behavior and does not select an L7 config.
 endpoint_has_extended_config(ep) if {
 	protocol := object.get(ep, "protocol", "")
@@ -1037,4 +1038,8 @@ endpoint_has_extended_config(ep) if {
 
 endpoint_has_extended_config(ep) if {
 	ep.tls
+}
+
+endpoint_has_extended_config(ep) if {
+	ep.upstream_ca_pem
 }

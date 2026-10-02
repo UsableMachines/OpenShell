@@ -129,6 +129,8 @@ struct NetworkEndpointDef {
     protocol: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     tls: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_ca_pem: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     enforcement: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -845,6 +847,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             ports: normalized_ports,
                             protocol: protocol.clone(),
                             tls: e.tls,
+                            upstream_ca_pem: e.upstream_ca_pem.unwrap_or_default(),
                             enforcement: e.enforcement,
                             access: e.access,
                             rules: allow_rules
@@ -1013,6 +1016,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             ports,
                             protocol,
                             tls: e.tls.clone(),
+                            upstream_ca_pem: (!e.upstream_ca_pem.is_empty())
+                                .then(|| e.upstream_ca_pem.clone()),
                             enforcement: e.enforcement.clone(),
                             access: e.access.clone(),
                             rules,
@@ -1164,6 +1169,17 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
     let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
+    for rule in raw.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            if endpoint
+                .upstream_ca_pem
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                return Err(miette::miette!("upstream_ca_pem cannot be empty"));
+            }
+        }
+    }
     validate_mcp_version_schema(&raw)?;
     to_proto(raw)
 }
@@ -1817,7 +1833,22 @@ fn validate_sandbox_policy_with_mcp_presence(
                     .unwrap_or(false),
             };
             let mut l7_errors = validate_l7_endpoint_semantics(&fields);
+            if !ep.upstream_ca_pem.is_empty() {
+                if ep.tls.eq_ignore_ascii_case("skip") {
+                    l7_errors.push("upstream_ca_pem cannot be used with tls: skip".to_string());
+                }
+                let usable = validate_upstream_ca_pem(&ep.upstream_ca_pem);
+                if !usable {
+                    l7_errors.push(
+                        "upstream_ca_pem must contain at least one usable PEM certificate"
+                            .to_string(),
+                    );
+                }
+            }
             let mut explicit_tcp_fields = Vec::new();
+            if !ep.upstream_ca_pem.is_empty() {
+                explicit_tcp_fields.push("upstream_ca_pem");
+            }
             if !ep.enforcement.is_empty() {
                 explicit_tcp_fields.push("enforcement");
             }
@@ -1919,6 +1950,101 @@ fn validate_sandbox_policy_with_mcp_presence(
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+/// Accept only usable certificate PEM blocks; private keys and unrelated PEM
+/// material must never be carried in an endpoint policy.
+fn validate_upstream_ca_pem(pem: &str) -> bool {
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    let mut certs = Vec::new();
+    loop {
+        match rustls_pemfile::read_one(&mut reader) {
+            Ok(Some(rustls_pemfile::Item::X509Certificate(cert))) => certs.push(cert),
+            Ok(None) => break,
+            _ => return false,
+        }
+    }
+    if certs.is_empty() {
+        return false;
+    }
+    let mut store = rustls::RootCertStore::empty();
+    let expected = certs.len();
+    let (added, ignored) = store.add_parsable_certificates(certs);
+    added == expected && ignored == 0
+}
+
+#[cfg(test)]
+mod upstream_ca_tests {
+    use super::*;
+
+    #[test]
+    fn supplemental_ca_round_trips_and_rejects_unsafe_combinations() {
+        let cert = rcgen::generate_simple_self_signed(vec!["api.example.test".into()]).unwrap();
+        let pem = cert.cert.pem();
+        let indented_pem = pem
+            .lines()
+            .map(|line| format!("          {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let yaml = format!(
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.test\n        port: 443\n        upstream_ca_pem: |\n{indented_pem}\n"
+        );
+        let policy = parse_sandbox_policy(&yaml).unwrap();
+        assert_eq!(
+            policy.network_policies["api"].endpoints[0]
+                .upstream_ca_pem
+                .trim(),
+            pem.trim()
+        );
+        assert_eq!(
+            parse_sandbox_policy(&serialize_sandbox_policy(&policy).unwrap()).unwrap(),
+            policy
+        );
+        let mut skip = policy.clone();
+        skip.network_policies.get_mut("api").unwrap().endpoints[0].tls = "skip".into();
+        assert!(validate_sandbox_policy(&skip).unwrap_err().iter().any(|v| {
+            v.to_string()
+                .contains("upstream_ca_pem cannot be used with tls: skip")
+        }));
+        let mut tcp = policy;
+        tcp.network_policies.get_mut("api").unwrap().endpoints[0].protocol = "tcp".into();
+        assert!(
+            validate_sandbox_policy(&tcp)
+                .unwrap_err()
+                .iter()
+                .any(|v| v.to_string().contains("upstream_ca_pem"))
+        );
+    }
+
+    #[test]
+    fn supplemental_ca_rejects_empty_invalid_and_private_key_material() {
+        assert!(!validate_upstream_ca_pem(""));
+        assert!(!validate_upstream_ca_pem("not a certificate"));
+        assert!(!validate_upstream_ca_pem(
+            "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----"
+        ));
+        let yaml = "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.test\n        port: 443\n        upstream_ca_pem: ''\n";
+        assert!(
+            parse_sandbox_policy(yaml)
+                .unwrap_err()
+                .to_string()
+                .contains("upstream_ca_pem cannot be empty")
+        );
+        let mut policy = parse_sandbox_policy("version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.test\n        port: 443\n").unwrap();
+        for invalid in [
+            "not a certificate",
+            "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----",
+        ] {
+            policy.network_policies.get_mut("api").unwrap().endpoints[0].upstream_ca_pem =
+                invalid.into();
+            assert!(
+                validate_sandbox_policy(&policy)
+                    .unwrap_err()
+                    .iter()
+                    .any(|v| v.to_string().contains("upstream_ca_pem must contain"))
+            );
+        }
     }
 }
 

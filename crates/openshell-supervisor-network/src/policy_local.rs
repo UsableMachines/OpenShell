@@ -1199,6 +1199,7 @@ fn network_endpoint_from_json(
         port,
         protocol: endpoint.protocol,
         tls: endpoint.tls,
+        upstream_ca_pem: String::new(),
         enforcement: endpoint.enforcement,
         access: endpoint.access,
         rules,

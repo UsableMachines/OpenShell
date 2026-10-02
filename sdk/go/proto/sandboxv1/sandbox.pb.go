@@ -655,7 +655,7 @@ type NetworkEndpoint struct {
 	// Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
 	// "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
 	Protocol string `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
-	// TLS handling: "terminate" or "passthrough" (default).
+	// TLS handling: "auto" (default) or "skip" (raw tunnel).
 	Tls string `protobuf:"bytes,4,opt,name=tls,proto3" json:"tls,omitempty"`
 	// Enforcement mode: "enforce" or "audit" (default).
 	Enforcement string `protobuf:"bytes,5,opt,name=enforcement,proto3" json:"enforcement,omitempty"`
@@ -738,8 +738,11 @@ type NetworkEndpoint struct {
 	// Internal gateway-derived marker indicating that this endpoint belongs to
 	// an attached credentialed provider. User-authored values are ignored.
 	ProviderCredentialed bool `protobuf:"varint,26,opt,name=provider_credentialed,json=providerCredentialed,proto3" json:"provider_credentialed,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Additional PEM-encoded CA certificates trusted only when the supervisor
+	// re-encrypts TLS to this endpoint. Does not disable TLS inspection.
+	UpstreamCaPem string `protobuf:"bytes,27,opt,name=upstream_ca_pem,json=upstreamCaPem,proto3" json:"upstream_ca_pem,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkEndpoint) Reset() {
@@ -952,6 +955,13 @@ func (x *NetworkEndpoint) GetProviderCredentialed() bool {
 		return x.ProviderCredentialed
 	}
 	return false
+}
+
+func (x *NetworkEndpoint) GetUpstreamCaPem() string {
+	if x != nil {
+		return x.UpstreamCaPem
+	}
+	return ""
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
@@ -2113,8 +2123,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +
 	"\x18NetworkCredentialBinding\x12\x1a\n" +
-	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xdc\n" +
-	"\n" +
+	"\bprovider\x18\x01 \x01(\tR\bprovider\"\x84\v\n" +
 	"\x0fNetworkEndpoint\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +
@@ -2144,7 +2153,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x03mcp\x18\x17 \x01(\v2 .openshell.sandbox.v1.McpOptionsR\x03mcp\x12]\n" +
 	"\x12credential_binding\x18\x18 \x01(\v2..openshell.sandbox.v1.NetworkCredentialBindingR\x11credentialBinding\x12B\n" +
 	"\x1dallow_uninspected_credentials\x18\x19 \x01(\bR\x1ballowUninspectedCredentials\x123\n" +
-	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1ar\n" +
+	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x12&\n" +
+	"\x0fupstream_ca_pem\x18\x1b \x01(\tR\rupstreamCaPem\x1ar\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xd2\x01\n" +
