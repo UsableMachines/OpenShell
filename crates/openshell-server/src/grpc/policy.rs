@@ -6355,6 +6355,7 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         }
         openshell_policy::PolicyMergeError::InvalidInputPolicy { .. }
         | openshell_policy::PolicyMergeError::McpContractConflict { .. }
+        | openshell_policy::PolicyMergeError::UpstreamCaConflict { .. }
         | openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
         | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
             ..

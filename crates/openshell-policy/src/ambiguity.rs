@@ -181,6 +181,9 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
         &normalized_strings(&left.allowed_ips),
         &normalized_strings(&right.allowed_ips),
     );
+    if left.upstream_ca_pem != right.upstream_ca_pem {
+        conflicts.push("upstream_ca_pem differs".to_string());
+    }
     conflicts
 }
 
@@ -1065,5 +1068,19 @@ mod tests {
                 .iter()
                 .any(|conflict| conflict.contains("transparent_tcp_eligible"))
         );
+    }
+
+    #[test]
+    fn different_upstream_ca_pem_is_ambiguous_without_disclosing_certificates() {
+        let mut left = endpoint("api.example.com", 443);
+        left.upstream_ca_pem = "private-left-pem".to_string();
+        let mut right = endpoint("api.example.com", 443);
+        right.upstream_ca_pem = "private-right-pem".to_string();
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
+        assert_eq!(ambiguities.len(), 1);
+        let diagnostic = ambiguities[0].to_string();
+        assert!(diagnostic.contains("upstream_ca_pem differs"));
+        assert!(!diagnostic.contains("private-left-pem"));
+        assert!(!diagnostic.contains("private-right-pem"));
     }
 }

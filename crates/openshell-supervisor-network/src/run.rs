@@ -350,7 +350,10 @@ pub async fn run_networking(
 
                         let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
-                        let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
+                        let state = Arc::new(
+                            ProxyTlsState::new(cert_cache, upstream_config)
+                                .with_upstream_roots(&system_ca_bundle)?,
+                        );
                         ocsf_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::Informational)

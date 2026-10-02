@@ -2219,8 +2219,24 @@ async fn handle_tcp_connection(
             let tls_result = async {
                 let mut tls_client =
                     crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                let endpoint_ca = decision
+                    .endpoint
+                    .policy_configs
+                    .first()
+                    .and_then(|config| match config {
+                        regorus::Value::Object(fields) => {
+                            fields.get(&regorus::Value::String("upstream_ca_pem".into()))
+                        }
+                        _ => None,
+                    })
+                    .and_then(|value| match value {
+                        regorus::Value::String(value) => Some(value.as_ref()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                let upstream_config = tls.endpoint_upstream_config(endpoint_ca)?;
                 let mut tls_upstream =
-                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
+                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, &upstream_config)
                         .await?;
                 let Some(relay_context) =
                     relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
