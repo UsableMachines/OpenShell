@@ -14,6 +14,13 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 const MAX_RETAINED_CREDENTIAL_GENERATIONS: usize = 8;
+const SUPERVISOR_TUNNEL_ENV_PREFIX: &str = "OPENSHELL_WG_";
+
+/// Reserved supervisor tunnel material remains in the resolver but never in
+/// any workload-facing environment snapshot, including sidecar refreshes.
+fn strip_supervisor_tunnel_keys(child_env: &mut HashMap<String, String>) {
+    child_env.retain(|key, _| !key.starts_with(SUPERVISOR_TUNNEL_ENV_PREFIX));
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCredentialSnapshot {
@@ -80,12 +87,13 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> Self {
-        let (child_env, generation_resolver, current_resolver) =
+        let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
                 env,
                 credential_expires_at_ms,
                 revision,
             );
+        strip_supervisor_tunnel_keys(&mut child_env);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
@@ -124,13 +132,14 @@ impl ProviderCredentialState {
             &non_secret_environment_keys,
         )?;
         let stable_handles = static_credential_stable_handles(&static_credential_bindings);
-        let (child_env, generation_resolver, current_resolver) =
+        let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
                 env,
                 credential_expires_at_ms,
                 revision,
                 &stable_handles,
             );
+        strip_supervisor_tunnel_keys(&mut child_env);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
@@ -170,7 +179,8 @@ impl ProviderCredentialState {
     /// workload-facing env map over a local control channel. The process leaf
     /// must inject that map into child processes without re-placeholderizing it
     /// or holding the gateway-side resolver material.
-    pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {
+    pub fn from_child_env_snapshot(revision: u64, mut child_env: HashMap<String, String>) -> Self {
+        strip_supervisor_tunnel_keys(&mut child_env);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
@@ -208,6 +218,7 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
 
+        strip_supervisor_tunnel_keys(&mut child_env);
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
@@ -240,7 +251,26 @@ impl ProviderCredentialState {
             .read()
             .expect("provider credential state poisoned")
             .combined_resolver
-            .clone()
+            .as_ref()
+            .map(|resolver| Arc::new(resolver.without_env_key_prefix(SUPERVISOR_TUNNEL_ENV_PREFIX)))
+    }
+
+    /// Resolve a reserved tunnel key for supervisor transport setup only.
+    /// Workload-facing resolver views never contain this value.
+    pub fn supervisor_tunnel_private_key(&self, key: &str) -> Option<String> {
+        if !key.starts_with(SUPERVISOR_TUNNEL_ENV_PREFIX)
+            || key.len() == SUPERVISOR_TUNNEL_ENV_PREFIX.len()
+        {
+            return None;
+        }
+        self.inner
+            .read()
+            .expect("provider credential state poisoned")
+            .current_resolver
+            .as_ref()?
+            .resolve_current_env_key_checked(key, "supervisor tunnel")
+            .ok()?
+            .map(str::to_owned)
     }
 
     /// Resolve provider placeholders only for credentials bound to this
@@ -295,6 +325,7 @@ impl ProviderCredentialState {
             .map(|(key, _)| key.clone())
             .collect();
         let resolver = inner.combined_resolver.as_ref().map(|resolver| {
+            let workload_resolver = resolver.without_env_key_prefix(SUPERVISOR_TUNNEL_ENV_PREFIX);
             let revision_fallback_allowed_revisions = inner
                 .static_credential_identity_epochs
                 .iter()
@@ -307,7 +338,7 @@ impl ProviderCredentialState {
                 })
                 .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
                 .collect();
-            Arc::new(resolver.scoped_to_env_keys(
+            Arc::new(workload_resolver.scoped_to_env_keys(
                 &inner.known_static_credential_keys,
                 &allowed,
                 revision_fallback_allowed_revisions,
@@ -474,6 +505,7 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
 
+        strip_supervisor_tunnel_keys(&mut child_env);
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
@@ -537,6 +569,7 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
 
+        strip_supervisor_tunnel_keys(&mut child_env);
         for key in &inner.suppressed_keys {
             child_env.remove(key);
         }
@@ -2082,6 +2115,80 @@ mod tests {
             !state.snapshot().child_env.contains_key("GCE_METADATA_HOST"),
             "suppressed key must not reappear after install_environment"
         );
+    }
+
+    #[test]
+    fn supervisor_tunnel_key_never_enters_workload_or_sidecar_environment() {
+        let key = "OPENSHELL_WG_PRIVATE_KEY";
+        let env = HashMap::from([
+            (key.to_string(), "supervisor-secret".to_string()),
+            ("API_TOKEN".to_string(), "ordinary-secret".to_string()),
+        ]);
+        let state = ProviderCredentialState::from_environment(
+            1,
+            env.clone(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(!state.snapshot().child_env.contains_key(key));
+        assert!(!state.child_env_with_gcp_resolved().contains_key(key));
+        assert!(state.snapshot().child_env.contains_key("API_TOKEN"));
+        assert_eq!(
+            state.supervisor_tunnel_private_key(key).as_deref(),
+            Some("supervisor-secret")
+        );
+        for token in [
+            "openshell:resolve:env:OPENSHELL_WG_PRIVATE_KEY",
+            "openshell:resolve:env:v1_OPENSHELL_WG_PRIVATE_KEY",
+            "xOPENSHELL-RESOLVE-ENV-OPENSHELL_WG_PRIVATE_KEY",
+        ] {
+            assert!(
+                state
+                    .resolver()
+                    .unwrap()
+                    .resolve_placeholder(token)
+                    .is_none()
+            );
+            assert!(
+                state
+                    .resolver_for_endpoint("api.example.test", 80, "/")
+                    .unwrap()
+                    .resolve_placeholder(token)
+                    .is_none()
+            );
+        }
+        state.install_environment(2, env.clone(), HashMap::new(), HashMap::new());
+        assert!(!state.snapshot().child_env.contains_key(key));
+        assert_eq!(
+            state.supervisor_tunnel_private_key(key).as_deref(),
+            Some("supervisor-secret")
+        );
+        for token in [
+            "openshell:resolve:env:OPENSHELL_WG_PRIVATE_KEY",
+            "openshell:resolve:env:v1_OPENSHELL_WG_PRIVATE_KEY",
+            "openshell:resolve:env:v2_OPENSHELL_WG_PRIVATE_KEY",
+        ] {
+            assert!(
+                state
+                    .resolver()
+                    .unwrap()
+                    .resolve_placeholder(token)
+                    .is_none()
+            );
+            assert!(
+                state
+                    .resolver_for_endpoint("api.example.test", 80, "/")
+                    .unwrap()
+                    .resolve_placeholder(token)
+                    .is_none()
+            );
+        }
+
+        let sidecar = ProviderCredentialState::from_child_env_snapshot(1, env.clone());
+        assert!(!sidecar.snapshot().child_env.contains_key(key));
+        sidecar.install_child_env_snapshot(2, env);
+        assert!(!sidecar.snapshot().child_env.contains_key(key));
+        assert!(sidecar.snapshot().child_env.contains_key("API_TOKEN"));
     }
 
     #[test]

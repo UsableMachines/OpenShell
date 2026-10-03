@@ -37,6 +37,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
+use crate::tunnel::TunnelManager;
 
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
@@ -149,6 +150,7 @@ fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) ->
 /// `run_sandbox`'s frame.
 pub struct Networking {
     pub proxy: Option<ProxyHandle>,
+    _tunnel: Option<Arc<TunnelManager>>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// Policy-local route context: shared with the orchestrator's policy poll
@@ -198,6 +200,11 @@ pub async fn run_networking(
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
 ) -> Result<Networking> {
+    let tunnel = retained_proto
+        .map(|proto| TunnelManager::new(proto, provider_credentials))
+        .transpose()?
+        .flatten()
+        .map(Arc::new);
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
@@ -231,6 +238,7 @@ pub async fn run_networking(
             let resolve_engine = engine.clone();
             let resolve_proto = proto.clone();
             let resolve_pid = entrypoint_pid.clone();
+            let resolve_tunnel = tunnel.clone();
             tokio::spawn(async move {
                 // Phase 1: wait for run_process to publish the entrypoint PID.
                 // 20 attempts * 250ms = 5s window.
@@ -251,6 +259,9 @@ pub async fn run_networking(
                         "Entrypoint PID never published; binary symlink resolution skipped. \
                      Policy binary paths will be matched literally."
                     );
+                    if let Some(tunnel) = &resolve_tunnel {
+                        tunnel.accept_initial_generation(resolve_engine.current_generation());
+                    }
                     let _ = engine_ready_tx.send(true);
                     return;
                 }
@@ -282,6 +293,9 @@ pub async fn run_networking(
                                 );
                             }
                         }
+                        if let Some(tunnel) = &resolve_tunnel {
+                            tunnel.accept_initial_generation(resolve_engine.current_generation());
+                        }
                         let _ = engine_ready_tx.send(true);
                         return;
                     }
@@ -298,10 +312,16 @@ pub async fn run_networking(
                  If binaries are symlinks, use canonical paths in your policy \
                  (run 'readlink -f <path>' inside the sandbox)"
                 );
+                if let Some(tunnel) = &resolve_tunnel {
+                    tunnel.accept_initial_generation(resolve_engine.current_generation());
+                }
                 let _ = engine_ready_tx.send(true);
             });
         } else {
             // No process supervisor — PID will never arrive, skip symlink resolution.
+            if let Some(tunnel) = &tunnel {
+                tunnel.accept_initial_generation(engine.current_generation());
+            }
             let _ = engine_ready_tx.send(true);
         }
     } else {
@@ -451,6 +471,7 @@ pub async fn run_networking(
             engine_ready_rx,
             upstream_proxy_args,
             sandbox_id,
+            tunnel.clone(),
         )
         .await?;
         Some(proxy_handle)
@@ -487,6 +508,7 @@ pub async fn run_networking(
             upstream_proxy_args,
             sandbox_id,
             transparent_engine_ready_rx,
+            tunnel.clone(),
         )?;
         (Some(dns), Some(transparent))
     } else {
@@ -495,6 +517,7 @@ pub async fn run_networking(
 
     Ok(Networking {
         proxy: proxy_handle,
+        _tunnel: tunnel,
         ca_file_paths,
         policy_local_ctx,
         #[cfg(target_os = "linux")]

@@ -45,6 +45,7 @@ sha2 = { workspace = true }
 spiffe = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-wireguard = { path = "../../vendor/tokio-wireguard" }
 tokio-rustls = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }

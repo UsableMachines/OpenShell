@@ -376,6 +376,22 @@ impl SecretResolver {
         }
     }
 
+    /// Remove supervisor-only environment keys from a workload resolver view.
+    /// This filters canonical, revisioned, stable, and provider-shaped aliases;
+    /// revision fallback cannot restore a removed canonical key.
+    pub(crate) fn without_env_key_prefix(&self, prefix: &str) -> Self {
+        let mut view = self.clone();
+        view.by_placeholder.retain(|placeholder, _| {
+            placeholder_env_key(placeholder).is_none_or(|key| !key.starts_with(prefix))
+        });
+        view.denied_env_keys.retain(|key| !key.starts_with(prefix));
+        view.identity_bound_env_keys
+            .retain(|key| !key.starts_with(prefix));
+        view.revision_fallback_allowed_revisions
+            .retain(|key, _| !key.starts_with(prefix));
+        view
+    }
+
     /// Return a cheap endpoint-scoped resolver view.
     ///
     /// Secret strings are shared through cloned resolver entries. Credential

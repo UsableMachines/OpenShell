@@ -31,6 +31,21 @@ message SandboxPolicy {
   // policy-local names. At most 10 configs are accepted, and at most 10 stages
   // can be selected per request.
   map<string, NetworkMiddlewareConfig> network_middlewares = 6;
+  // Supervisor-owned WireGuard peers. Key bytes never enter the workload.
+  map<string, NetworkTunnel> tunnels = 7;
+}
+
+// One supervisor-originated WireGuard transport to a customer appliance.
+message NetworkTunnel {
+  string endpoint_host = 1;
+  uint32 endpoint_udp_port = 2;
+  bytes peer_public_key = 3;
+  // Supervisor-only provider credential key. The material is never stored in policy.
+  string private_key_env_key = 4;
+  string local_address = 5;
+  repeated string allowed_inner_cidrs = 6;
+  uint32 mtu = 7;
+  uint32 keepalive_seconds = 8;
 }
 
 // Filesystem access policy.
@@ -197,6 +212,8 @@ message NetworkEndpoint {
   // Additional PEM-encoded CA certificates trusted only when the supervisor
   // re-encrypts TLS to this endpoint. Does not disable TLS inspection.
   string upstream_ca_pem = 27;
+  // Named supervisor WireGuard transport for this inner destination.
+  string tunnel_id = 28;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
