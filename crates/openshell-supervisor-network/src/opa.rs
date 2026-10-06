@@ -700,6 +700,16 @@ impl OpaEngine {
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
     ) -> Result<()> {
+        self.reload_from_proto_with_pid_and_generation(proto, entrypoint_pid)
+            .map(|_| ())
+    }
+
+    /// Reload policy and return the generation committed under the engine lock.
+    pub fn reload_from_proto_with_pid_and_generation(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+    ) -> Result<u64> {
         // Build a complete new engine through the same validated pipeline.
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
         let new_engine = new
@@ -715,8 +725,7 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+        Ok(self.advance_generation())
     }
 
     /// Reload the policy and middleware registry as one runtime generation.
@@ -731,6 +740,21 @@ impl OpaEngine {
         entrypoint_pid: u32,
         registry: MiddlewareRegistry,
     ) -> Result<()> {
+        self.reload_policy_and_middleware_from_proto_with_pid_and_generation(
+            proto,
+            entrypoint_pid,
+            registry,
+        )
+        .map(|_| ())
+    }
+
+    /// Reload policy and middleware and return their committed generation.
+    pub fn reload_policy_and_middleware_from_proto_with_pid_and_generation(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        registry: MiddlewareRegistry,
+    ) -> Result<u64> {
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
         let new_engine = new
             .engine
@@ -753,8 +777,7 @@ impl OpaEngine {
             .fail_closed_reason
             .write()
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+        Ok(self.advance_generation())
     }
 
     /// Publish a deny-all quarantine generation without activating any part
@@ -815,7 +838,7 @@ impl OpaEngine {
     /// generation comparison and callback linearizes state derived from an OPA
     /// snapshot with every policy reload and fail-closed transition. Callers
     /// must not perform I/O or other long-running work in `operation`.
-    pub(crate) fn with_current_generation<T>(
+    pub fn with_current_generation<T>(
         &self,
         expected_generation: u64,
         operation: impl FnOnce(u64) -> T,
@@ -2255,7 +2278,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 )]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
@@ -2325,7 +2347,7 @@ mod tests {
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         }
     }
@@ -3423,7 +3445,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
@@ -3963,7 +3985,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -4036,7 +4058,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -4114,7 +4136,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5304,7 +5326,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5363,7 +5385,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5423,7 +5445,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5485,7 +5507,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5546,7 +5568,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -7029,7 +7051,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -7085,7 +7107,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -7157,7 +7179,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
@@ -7389,7 +7411,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            tunnels: HashMap::default(),
+            tunnels: std::collections::HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();

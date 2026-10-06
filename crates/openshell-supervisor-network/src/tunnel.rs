@@ -4,7 +4,7 @@
 //! Supervisor-owned `WireGuard` transport for one policy-authorized IPv4 endpoint.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -20,7 +20,12 @@ use tokio_wireguard::x25519::{PublicKey, StaticSecret};
 pub struct TunnelManager {
     id: String,
     destination: SocketAddrV4,
-    accepted_generation: OnceLock<u64>,
+    state: Mutex<TunnelGeneration>,
+    credentials: ProviderCredentialState,
+    key_name: String,
+    pinned_tunnel: openshell_core::proto::NetworkTunnel,
+    pinned_inner: NetworkEndpoint,
+    pinned_outer: NetworkEndpoint,
     interface: tokio::sync::OnceCell<Interface>,
     private_key: [u8; 32],
     peer_public_key: [u8; 32],
@@ -29,6 +34,12 @@ pub struct TunnelManager {
     route: IpNet,
     mtu: usize,
     keepalive: u16,
+}
+
+#[derive(Default)]
+struct TunnelGeneration {
+    accepted: Option<u64>,
+    revoked: bool,
 }
 
 impl TunnelManager {
@@ -72,7 +83,7 @@ impl TunnelManager {
             .ok()
             .filter(|port| *port != 0)
             .ok_or_else(|| miette::miette!("invalid appliance UDP port"))?;
-        let outer_allowed = policy
+        let outer: Vec<_> = policy
             .network_policies
             .values()
             .flat_map(|rule| &rule.endpoints)
@@ -81,9 +92,8 @@ impl TunnelManager {
                     && endpoint.host == tunnel.endpoint_host
                     && single_port(endpoint) == Some(u32::from(endpoint_port))
             })
-            .count()
-            == 1;
-        if !outer_allowed {
+            .collect();
+        if outer.len() != 1 {
             return Err(miette::miette!(
                 "appliance UDP endpoint is not exactly authorized"
             ));
@@ -168,7 +178,12 @@ impl TunnelManager {
         Ok(Some(Self {
             id: id.clone(),
             destination: SocketAddrV4::new(inner_ip, inner_port),
-            accepted_generation: OnceLock::new(),
+            state: Mutex::new(TunnelGeneration::default()),
+            credentials: credentials.clone(),
+            key_name: key_name.clone(),
+            pinned_tunnel: tunnel.clone(),
+            pinned_inner: endpoint.clone(),
+            pinned_outer: outer[0].clone(),
             interface: tokio::sync::OnceCell::new(),
             private_key: private,
             peer_public_key: public,
@@ -180,9 +195,56 @@ impl TunnelManager {
         }))
     }
 
-    /// Accept only the generation resulting from initial binary reconciliation.
+    /// Accept the initial generation after binary reconciliation.
     pub(crate) fn accept_initial_generation(&self, generation: u64) {
-        let _ = self.accepted_generation.set(generation);
+        let mut state = self.state.lock().expect("tunnel generation poisoned");
+        if !state.revoked && self.key_is_current() {
+            state.accepted = Some(generation);
+        } else {
+            state.revoked = true;
+        }
+    }
+
+    fn key_is_current(&self) -> bool {
+        self.credentials
+            .supervisor_tunnel_private_key(&self.key_name)
+            .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+            .as_deref()
+            .is_some_and(|candidate| self.same_private_key(candidate))
+    }
+
+    fn same_private_key(&self, candidate: &[u8]) -> bool {
+        if candidate.len() != self.private_key.len() {
+            return false;
+        }
+        self.private_key
+            .iter()
+            .zip(candidate)
+            .fold(0u8, |difference, (expected, actual)| {
+                difference | (expected ^ actual)
+            })
+            == 0
+    }
+
+    /// Called only after OPA commits a new policy. Any tunnel change requires restart.
+    pub fn reconcile_policy(&self, policy: &SandboxPolicy, generation: u64) {
+        let mut state = self.state.lock().expect("tunnel generation poisoned");
+        if state.revoked {
+            return;
+        }
+        let valid = Self::new(policy, &self.credentials).ok().flatten();
+        let unchanged = valid.is_some_and(|candidate| {
+            candidate.id == self.id
+                && candidate.pinned_tunnel == self.pinned_tunnel
+                && candidate.pinned_inner == self.pinned_inner
+                && candidate.pinned_outer == self.pinned_outer
+                && self.same_private_key(&candidate.private_key)
+        });
+        if unchanged && self.key_is_current() {
+            state.accepted = Some(generation);
+        } else {
+            state.revoked = true;
+        }
     }
 
     /// Connect only the destination pinned by the validated endpoint decision.
@@ -192,14 +254,21 @@ impl TunnelManager {
         destination: SocketAddr,
         policy_generation: u64,
     ) -> std::io::Result<tokio_wireguard::TcpStream> {
-        if id != self.id
-            || destination != SocketAddr::V4(self.destination)
-            || self.accepted_generation.get() != Some(&policy_generation)
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "tunnel route unavailable",
-            ));
+            let mut state = self.state.lock().expect("tunnel generation poisoned");
+            if !self.key_is_current() {
+                state.revoked = true;
+            }
+            if id != self.id
+                || destination != SocketAddr::V4(self.destination)
+                || state.revoked
+                || state.accepted != Some(policy_generation)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "tunnel route unavailable",
+                ));
+            }
         }
         let interface = self
             .interface
@@ -440,6 +509,128 @@ mod tests {
         assert!(!String::from_utf8_lossy(&observed).contains("openshell:resolve:env:"));
         drop(client);
         drop(appliance);
+        assert!(!manager.interface.get().unwrap().is_closed());
+        let (second, accepted) = tokio::join!(
+            manager.dial("customer", "10.80.0.2:8080".parse().unwrap(), 42),
+            tokio::time::timeout(Duration::from_secs(15), listener.accept()),
+        );
+        let second = second.expect("second tunnel connection failed");
+        let (second_appliance, _) = accepted.expect("second accept timed out").unwrap();
+        drop(second);
+        drop(second_appliance);
+        manager.reconcile_policy(&policy, 43);
+        assert_eq!(manager.state.lock().unwrap().accepted, Some(43));
+        assert!(!manager.state.lock().unwrap().revoked);
+        assert!(
+            manager
+                .dial("customer", "10.80.0.2:8080".parse().unwrap(), 42)
+                .await
+                .is_err()
+        );
+        let (after_reconcile, accepted) = tokio::join!(
+            manager.dial("customer", "10.80.0.2:8080".parse().unwrap(), 43),
+            tokio::time::timeout(Duration::from_secs(15), listener.accept()),
+        );
+        let after_reconcile = after_reconcile.expect("post-reload tunnel connection failed");
+        let (appliance, _) = accepted.expect("post-reload accept timed out").unwrap();
+        drop(after_reconcile);
+        drop(appliance);
+        let engine = crate::opa::OpaEngine::from_proto(&policy).unwrap();
+        let initial_generation = engine.current_generation();
+        manager.accept_initial_generation(initial_generation);
+        let quarantined_generation = engine.enter_fail_closed("rejected candidate").unwrap();
+        assert!(quarantined_generation > initial_generation);
+        let restored_generation = engine.exit_fail_closed().unwrap();
+        assert!(restored_generation > quarantined_generation);
+        assert_eq!(
+            manager.state.lock().unwrap().accepted,
+            Some(initial_generation)
+        );
+        assert!(
+            engine
+                .with_current_generation(restored_generation, |_| {
+                    manager.reconcile_policy(&policy, restored_generation);
+                })
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            manager.state.lock().unwrap().accepted,
+            Some(restored_generation)
+        );
+        let old_generation = manager
+            .dial(
+                "customer",
+                "10.80.0.2:8080".parse().unwrap(),
+                initial_generation,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(old_generation.kind(), std::io::ErrorKind::PermissionDenied);
+        let restored = manager
+            .dial(
+                "customer",
+                "10.80.0.2:8080".parse().unwrap(),
+                restored_generation,
+            )
+            .await;
+        if let Err(error) = restored {
+            assert_ne!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        let mut changed = policy.clone();
+        changed.tunnels.get_mut("customer").unwrap().mtu = 1300;
+        manager.reconcile_policy(&changed, 44);
+        assert!(manager.state.lock().unwrap().revoked);
+        manager.reconcile_policy(&policy, 45);
+        assert!(manager.state.lock().unwrap().revoked);
+        let mut changed_inner = policy.clone();
+        changed_inner
+            .network_policies
+            .get_mut("inner")
+            .unwrap()
+            .endpoints[0]
+            .enforcement = "enforce".into();
+        let mut changed_outer = policy.clone();
+        changed_outer
+            .network_policies
+            .get_mut("outer")
+            .unwrap()
+            .endpoints[0]
+            .enforcement = "enforce".into();
+        let mut removed = policy.clone();
+        removed.tunnels.clear();
+        let mut changed_key_ref = policy.clone();
+        changed_key_ref
+            .tunnels
+            .get_mut("customer")
+            .unwrap()
+            .private_key_env_key = "OPENSHELL_WG_OTHER".into();
+        for candidate in [&changed_inner, &changed_outer, &removed, &changed_key_ref] {
+            let route = TunnelManager::new(&policy, &credentials).unwrap().unwrap();
+            route.accept_initial_generation(42);
+            route.reconcile_policy(candidate, 43);
+            assert!(route.state.lock().unwrap().revoked);
+            route.reconcile_policy(&policy, 44);
+            assert!(route.state.lock().unwrap().revoked);
+        }
+        let provider_route = TunnelManager::new(&policy, &credentials).unwrap().unwrap();
+        provider_route.accept_initial_generation(42);
+        credentials.install_environment(
+            3,
+            HashMap::from([(
+                "OPENSHELL_WG_PRIVATE_KEY".into(),
+                base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(
+            provider_route
+                .dial("customer", "10.80.0.2:8080".parse().unwrap(), 42)
+                .await
+                .is_err()
+        );
+        assert!(provider_route.state.lock().unwrap().revoked);
         drop(listener);
         server.close();
         tokio::time::timeout(Duration::from_secs(5), server.closed())

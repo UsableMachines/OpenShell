@@ -150,7 +150,7 @@ fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) ->
 /// `run_sandbox`'s frame.
 pub struct Networking {
     pub proxy: Option<ProxyHandle>,
-    _tunnel: Option<Arc<TunnelManager>>,
+    pub tunnel: Option<Arc<TunnelManager>>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// Policy-local route context: shared with the orchestrator's policy poll
@@ -260,7 +260,9 @@ pub async fn run_networking(
                      Policy binary paths will be matched literally."
                     );
                     if let Some(tunnel) = &resolve_tunnel {
-                        tunnel.accept_initial_generation(resolve_engine.current_generation());
+                        let _ = resolve_engine.with_current_generation(0, |generation| {
+                            tunnel.accept_initial_generation(generation);
+                        });
                     }
                     let _ = engine_ready_tx.send(true);
                     return;
@@ -278,8 +280,16 @@ pub async fn run_networking(
                             attempt = attempt,
                             "Container filesystem accessible, resolving policy binary symlinks"
                         );
-                        match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                            Ok(()) => {
+                        match resolve_engine
+                            .reload_from_proto_with_pid_and_generation(&resolve_proto, pid)
+                        {
+                            Ok(generation) => {
+                                if let Some(tunnel) = &resolve_tunnel {
+                                    let _ =
+                                        resolve_engine.with_current_generation(generation, |_| {
+                                            tunnel.reconcile_policy(&resolve_proto, generation);
+                                        });
+                                }
                                 info!(
                                     pid = pid,
                                     "Policy binary symlink resolution complete \
@@ -287,14 +297,17 @@ pub async fn run_networking(
                                 );
                             }
                             Err(e) => {
+                                if let Some(tunnel) = &resolve_tunnel {
+                                    let _ =
+                                        resolve_engine.with_current_generation(0, |generation| {
+                                            tunnel.accept_initial_generation(generation);
+                                        });
+                                }
                                 warn!(
                                     "Failed to rebuild OPA engine with symlink resolution \
                                  (non-fatal, falling back to literal path matching): {e}"
                                 );
                             }
-                        }
-                        if let Some(tunnel) = &resolve_tunnel {
-                            tunnel.accept_initial_generation(resolve_engine.current_generation());
                         }
                         let _ = engine_ready_tx.send(true);
                         return;
@@ -313,14 +326,18 @@ pub async fn run_networking(
                  (run 'readlink -f <path>' inside the sandbox)"
                 );
                 if let Some(tunnel) = &resolve_tunnel {
-                    tunnel.accept_initial_generation(resolve_engine.current_generation());
+                    let _ = resolve_engine.with_current_generation(0, |generation| {
+                        tunnel.accept_initial_generation(generation);
+                    });
                 }
                 let _ = engine_ready_tx.send(true);
             });
         } else {
             // No process supervisor — PID will never arrive, skip symlink resolution.
             if let Some(tunnel) = &tunnel {
-                tunnel.accept_initial_generation(engine.current_generation());
+                let _ = engine.with_current_generation(0, |generation| {
+                    tunnel.accept_initial_generation(generation);
+                });
             }
             let _ = engine_ready_tx.send(true);
         }
@@ -517,7 +534,7 @@ pub async fn run_networking(
 
     Ok(Networking {
         proxy: proxy_handle,
-        _tunnel: tunnel,
+        tunnel,
         ca_file_paths,
         policy_local_ctx,
         #[cfg(target_os = "linux")]

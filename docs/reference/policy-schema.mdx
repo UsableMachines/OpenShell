@@ -144,7 +144,7 @@ process:
 
 **Category:** Dynamic
 
-A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+A map of named network policy entries. Each entry declares a set of endpoints and, for workload traffic, a set of binaries. Only the listed binaries are permitted to connect to workload endpoints. A rule containing only a `wireguard-udp` endpoint is the exception: it may omit `binaries` because it authorizes only the supervisor's outer UDP socket. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
 
 ### Customer appliance tunnel
 
@@ -198,7 +198,7 @@ Each entry in the `network_policies` map has the following fields:
 |---|---|---|---|
 | `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
 | `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
-| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+| `binaries` | list of binary objects | Conditional | Required for workload endpoints. May be omitted when the rule contains only a `wireguard-udp` endpoint; that endpoint authorizes only the supervisor's UDP socket. |
 
 ### Endpoint Object
 

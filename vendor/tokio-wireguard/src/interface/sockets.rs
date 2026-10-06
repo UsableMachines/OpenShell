@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use std::sync::Arc;
 
-use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
+use parking_lot::{ArcMutexGuard, RawMutex};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{tcp, udp, Socket},
@@ -63,10 +63,9 @@ impl<T> SocketsInner<T> {
 
     fn register(&mut self, socket: crate::Shared<T>) {
         let slot = self.sockets.iter_mut().enumerate().find_map(|(i, s)| {
-            match Arc::get_mut(s).map(Mutex::get_mut) {
-                Some(..) => None,
-                None => Some(i),
-            }
+            // Reuse only a slot whose previous socket has no external owner.
+            // Replacing a live slot disconnects its listener or stream.
+            Arc::get_mut(s).map(|_| i)
         });
 
         if let Some(slot) = slot.and_then(|s| self.sockets.get_mut(s)) {

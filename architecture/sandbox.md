@@ -238,9 +238,9 @@ before the dial. CONNECT keeps its existing sequence: endpoint authorization
 and address validation precede the TCP dial; TLS interception and request
 inspection follow establishment. A `wireguard-udp` endpoint authorizes only
 the supervisor's exact appliance socket and cannot authorize workload TCP.
-The first implementation binds one tunnel and one inner endpoint to the
-initial policy generation. A later policy generation requires a sandbox
-restart for tunnel traffic; dials fail closed rather than using a stale route.
+The first implementation binds one tunnel and one inner endpoint. Policy
+reloads retain tunnel traffic when that configuration and its key are unchanged;
+changes revoke new tunnel dials until sandbox restart.
 
 In proxy-required networks, the supervisor chains upstream TLS tunnels through
 a corporate forward proxy with HTTP CONNECT instead of connecting directly,
