@@ -645,6 +645,7 @@ pub async fn run_sandbox(
                 sandbox_id: sandbox_id.clone(),
                 trusted_ssh_socket_path: std::path::PathBuf::from(trusted_ssh_socket_path),
                 control_publisher: sidecar_control_publisher.clone(),
+                tunnel: networking.as_ref().and_then(|n| n.tunnel.clone()),
             },
         );
     }
@@ -1359,6 +1360,7 @@ struct SidecarEntrypointHandler {
     sandbox_id: Option<String>,
     trusted_ssh_socket_path: std::path::PathBuf,
     control_publisher: Option<sidecar_control::Publisher>,
+    tunnel: Option<Arc<openshell_supervisor_network::TunnelManager>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1375,6 +1377,7 @@ fn spawn_sidecar_entrypoint_handler(
             sandbox_id,
             trusted_ssh_socket_path,
             control_publisher,
+            tunnel,
         } = handler;
         let mut session_started = false;
         let mut session_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -1455,7 +1458,7 @@ fn spawn_sidecar_entrypoint_handler(
             if let (Some(engine), Some(proto)) = (opa_engine.as_ref(), retained_proto.as_ref()) {
                 match engine.reload_from_proto_with_pid_and_generation(proto, started.pid) {
                     Ok(generation) => {
-                        if let Some(tunnel) = networking.as_ref().and_then(|n| n.tunnel.as_ref()) {
+                        if let Some(tunnel) = tunnel.as_ref() {
                             let _ = engine.with_current_generation(generation, |_| {
                                 tunnel.reconcile_policy(proto, generation);
                             });
