@@ -77,7 +77,11 @@ fn b64_encode(bytes: &[u8]) -> String {
 }
 
 fn b64_decode(input: &str) -> Option<[u8; 32]> {
-    let input: String = input.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    let input: String = input
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let mut out = Vec::new();
     let mut buf: u32 = 0;
     let mut bits = 0u32;
@@ -118,14 +122,24 @@ impl Appliance {
     }
 
     fn build_interface(&self, peers: &[PublicKey]) -> std::io::Result<Interface> {
-        let client_allowed: std::net::IpAddr = format!("{}.1", self.inner_addr.rsplit_once('.').map(|(p, _)| p).unwrap_or("10.80.0"))
-            .parse()
-            .expect("client address");
+        let client_allowed: std::net::IpAddr = format!(
+            "{}.1",
+            self.inner_addr
+                .rsplit_once('.')
+                .map(|(p, _)| p)
+                .unwrap_or("10.80.0")
+        )
+        .parse()
+        .expect("client address");
         let peers = peers
             .iter()
             .map(|public| Peer {
                 endpoint: None,
-                allowed_ips: vec![format!("{}/32", client_allowed).parse().expect("client allowed_ips net")],
+                allowed_ips: vec![
+                    format!("{}/32", client_allowed)
+                        .parse()
+                        .expect("client allowed_ips net"),
+                ],
                 public_key: *public,
                 persistent_keepalive: None,
             })
@@ -133,7 +147,9 @@ impl Appliance {
         Interface::new(Config {
             interface: InterfaceConfig {
                 private_key: self.server_secret.clone(),
-                address: format!("{}/32", self.inner_addr).parse().expect("inner addr"),
+                address: format!("{}/32", self.inner_addr)
+                    .parse()
+                    .expect("inner addr"),
                 listen_port: Some(self.wg_port),
                 mtu: Some(1280),
             },
@@ -184,8 +200,7 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ADMIN_PORT);
-    let inner_prefix =
-        std::env::var("INNER_PREFIX").unwrap_or_else(|_| "10.80.0".to_string());
+    let inner_prefix = std::env::var("INNER_PREFIX").unwrap_or_else(|_| "10.80.0".to_string());
 
     let (server_secret, _server_public) = tokio_wireguard::x25519::keypair();
     let appliance = Arc::new(Appliance::new(server_secret, wg_port, &inner_prefix));
@@ -232,17 +247,11 @@ async fn main() {
                                 let key = body
                                     .split("\"public_key\"")
                                     .nth(1)
-                                    .and_then(|rest| {
-                                        rest.split('"').nth(1).map(str::to_string)
-                                    })
+                                    .and_then(|rest| rest.split('"').nth(1).map(str::to_string))
                                     .unwrap_or_default();
                                 match b64_decode(&key) {
                                     Some(raw) => {
-                                        appliance
-                                            .peers
-                                            .lock()
-                                            .await
-                                            .push(PublicKey::from(raw));
+                                        appliance.peers.lock().await.push(PublicKey::from(raw));
                                         match appliance.rebuild().await {
                                             Ok(()) => (
                                                 "200 OK",
@@ -263,7 +272,10 @@ async fn main() {
                                     ),
                                 }
                             } else {
-                                ("400 Bad Request", "{\"error\":\"public_key required\"}".to_string())
+                                (
+                                    "400 Bad Request",
+                                    "{\"error\":\"public_key required\"}".to_string(),
+                                )
                             };
                             let response = format!(
                                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
