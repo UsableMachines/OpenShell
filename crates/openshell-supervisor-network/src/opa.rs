@@ -1955,6 +1955,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.tls.is_empty() {
                         ep["tls"] = e.tls.clone().into();
                     }
+                    if !e.upstream_ca_pem.is_empty() {
+                        ep["upstream_ca_pem"] = e.upstream_ca_pem.clone().into();
+                    }
                     if !e.enforcement.is_empty() {
                         ep["enforcement"] = e.enforcement.clone().into();
                     }
@@ -4958,6 +4961,97 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn endpoint_ca_survives_proto_to_opa_selection_without_l7_protocol() {
+        let mut policy = test_proto();
+        let ca_pem = crate::l7::tls::SandboxCa::generate()
+            .unwrap()
+            .cert_pem()
+            .to_string();
+        let endpoint = &mut policy
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints[0];
+        endpoint.upstream_ca_pem = ca_pem.clone();
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine.query_endpoint_config(&input).unwrap().unwrap();
+        assert_eq!(
+            get_str(&config, "upstream_ca_pem").as_deref(),
+            Some(ca_pem.as_str())
+        );
+    }
+
+    #[test]
+    fn endpoint_ca_survives_full_egress_authorization_decision() {
+        // The CONNECT handler reads the supplemental upstream CA from
+        // `EgressAuthorization::endpoint_configs`; this exercises the whole
+        // proto -> OPA data -> egress_authorization chain, not just
+        // query_endpoint_config.
+        let mut policy = test_proto();
+        let ca_pem = crate::l7::tls::SandboxCa::generate()
+            .unwrap()
+            .cert_pem()
+            .to_string();
+        policy.network_policies.insert(
+            "ca_lane".to_string(),
+            NetworkPolicyRule {
+                name: "ca_lane".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "10.43.156.92".to_string(),
+                    port: 443,
+                    upstream_ca_pem: ca_pem.clone(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        let input = NetworkInput {
+            host: "10.43.156.92".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(
+            matches!(authorization.action, NetworkAction::Allow { .. }),
+            "expected allow, got {:?}",
+            authorization.action
+        );
+        let config = authorization
+            .endpoint_configs
+            .first()
+            .expect("endpoint_configs must carry the matched endpoint");
+        let extracted = match config {
+            regorus::Value::Object(fields) => fields
+                .get(&regorus::Value::String("upstream_ca_pem".into()))
+                .map(|value| match value {
+                    regorus::Value::String(s) => s.as_ref().to_string(),
+                    _ => String::new(),
+                }),
+            _ => None,
+        }
+        .unwrap_or_default();
+        assert_eq!(
+            extracted, ca_pem,
+            "upstream_ca_pem must survive into the egress decision endpoint_configs"
+        );
     }
 
     #[test]

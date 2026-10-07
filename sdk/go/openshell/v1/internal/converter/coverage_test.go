@@ -180,6 +180,7 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"ports":                           true,
 		"protocol":                        true,
 		"tls":                             true,
+		"upstream_ca_pem":                 true,
 		"enforcement":                     true,
 		"access":                          true,
 		"rules":                           true,

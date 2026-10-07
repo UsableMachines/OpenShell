@@ -487,6 +487,58 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
         .collect())
 }
 
+/// Connect a gateway client for a unary policy-local RPC, addressing a fleet
+/// replica rather than the configured endpoint.
+///
+/// The configured endpoint is the headless Service when a fleet is
+/// configured — a discovery address the gateway's serving certificate
+/// deliberately omits, so dialling it fails the TLS handshake. Address a
+/// replica instead, like every other unary RPC this sandbox makes (see
+/// `flush_proposals_to_gateway` in the sandbox crate).
+///
+/// `sandbox_key` only picks which replicas this call warms; any replica can
+/// serve these store reads, so the sandbox *name* this caller has is fine.
+async fn connect_gateway_for_rpc(
+    endpoint: &str,
+    sandbox_key: &str,
+) -> std::result::Result<openshell_core::grpc_client::CachedOpenShellClient, (u16, serde_json::Value)>
+{
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let Some(target) =
+            openshell_core::gateway_fleet::unary_endpoint(endpoint, sandbox_key, attempt).await
+        else {
+            last_error = Some((
+                503,
+                error_payload(
+                    "gateway_unavailable",
+                    "gateway fleet membership is not resolved yet; retry shortly".to_string(),
+                ),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            continue;
+        };
+        match openshell_core::grpc_client::CachedOpenShellClient::connect(&target).await {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                last_error = Some((
+                    502,
+                    error_payload("gateway_connect_failed", error.to_string()),
+                ));
+                if attempt + 1 < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        (
+            503,
+            error_payload("gateway_unavailable", "no gateway endpoint".to_string()),
+        )
+    }))
+}
+
 async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_json::Value) {
     let Some(endpoint) = ctx.gateway_endpoint.as_deref() else {
         return (
@@ -528,21 +580,11 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         Err(error) => return (400, error_payload("invalid_proposal", error)),
     };
 
-    let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
-        Ok(client) => {
-            client.set_workspace(workspace);
-            client
-        }
-        Err(error) => {
-            return (
-                502,
-                serde_json::json!({
-                    "error": "gateway_connect_failed",
-                    "detail": error.to_string()
-                }),
-            );
-        }
+    let client = match connect_gateway_for_rpc(endpoint, sandbox_name).await {
+        Ok(client) => client,
+        Err((status, error)) => return (status, error),
     };
+    client.set_workspace(workspace);
 
     // Pre-compute the audit summaries before handing `chunks` to the
     // gateway client (which consumes the vec). The summaries pair up with
@@ -994,9 +1036,7 @@ async fn open_lookup_session(
             ),
         ));
     }
-    let client = openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint)
-        .await
-        .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
+    let client = connect_gateway_for_rpc(endpoint, sandbox_name).await?;
     client.set_workspace(workspace);
     Ok(LookupSession {
         client,
@@ -1138,6 +1178,16 @@ fn network_endpoint_from_json(
     if endpoint.host.trim().is_empty() {
         return Err("endpoint.host is required".to_string());
     }
+    if endpoint.upstream_ca_pem.as_deref() == Some("") {
+        return Err("upstream_ca_pem cannot be empty".to_string());
+    }
+    if endpoint
+        .upstream_ca_pem
+        .as_deref()
+        .is_some_and(|pem| !openshell_policy::validate_upstream_ca_pem(pem))
+    {
+        return Err("upstream_ca_pem must contain at least one usable PEM certificate".to_string());
+    }
     if let Some(reason) =
         openshell_policy::agent_authored_transport_rejection(&endpoint.protocol, &endpoint.tls)
     {
@@ -1199,6 +1249,7 @@ fn network_endpoint_from_json(
         port,
         protocol: endpoint.protocol,
         tls: endpoint.tls,
+        upstream_ca_pem: endpoint.upstream_ca_pem.unwrap_or_default(),
         enforcement: endpoint.enforcement,
         access: endpoint.access,
         rules,
@@ -1370,6 +1421,8 @@ struct NetworkEndpointJson {
     #[serde(default)]
     tls: String,
     #[serde(default)]
+    upstream_ca_pem: Option<String>,
+    #[serde(default)]
     enforcement: String,
     #[serde(default)]
     access: String,
@@ -1479,6 +1532,179 @@ mod tests {
         assert_eq!(
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
             "/user/repos"
+        );
+    }
+
+    #[test]
+    fn proposal_ca_bundle_is_preserved_and_validated() {
+        let cert = rcgen::generate_simple_self_signed(vec!["api.example.test".into()]).unwrap();
+        let pem = cert.cert.pem();
+        let proposal = |ca: &str, protocol: &str, tls: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "operations": [{"addRule": {
+                    "ruleName": "internal_api",
+                    "rule": {"endpoints": [{
+                        "host": "api.example.test", "port": 443,
+                        "protocol": protocol, "tls": tls,
+                        "access": "full",
+                        "upstream_ca_pem": ca
+                    }]}
+                }}]
+            }))
+            .unwrap()
+        };
+        let chunks = proposal_chunks_from_body(&proposal(&pem, "rest", "terminate")).unwrap();
+        assert_eq!(
+            chunks[0].proposed_rule.as_ref().unwrap().endpoints[0].upstream_ca_pem,
+            pem
+        );
+        for invalid in [
+            "",
+            "garbage",
+            "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----",
+        ] {
+            assert!(proposal_chunks_from_body(&proposal(invalid, "rest", "terminate")).is_err());
+        }
+        let cert_with_key =
+            format!("{pem}-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----");
+        assert!(proposal_chunks_from_body(&proposal(&cert_with_key, "rest", "terminate")).is_err());
+        for (protocol, tls) in [("tcp", "terminate"), ("rest", "skip")] {
+            assert!(proposal_chunks_from_body(&proposal(&pem, protocol, tls)).is_err());
+        }
+        let other_pem = rcgen::generate_simple_self_signed(vec!["api.example.test".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let overlapping = serde_json::to_vec(&serde_json::json!({
+            "operations": [{"addRule": {
+                "ruleName": "internal_api",
+                "rule": {"endpoints": [
+                    {"host": "api.example.test", "port": 443, "access": "full", "upstream_ca_pem": pem},
+                    {"host": "api.example.test", "port": 443, "access": "full", "upstream_ca_pem": other_pem}
+                ]}
+            }}]
+        })).unwrap();
+        let chunk = proposal_chunks_from_body(&overlapping).unwrap().remove(0);
+        let result = openshell_policy::merge_policy(
+            ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            },
+            &[openshell_policy::PolicyMergeOp::AddRule {
+                rule_name: chunk.rule_name,
+                rule: chunk.proposed_rule.unwrap(),
+            }],
+        );
+        let error = result.expect_err("overlapping destinations cannot carry conflicting CAs");
+        assert!(error.to_string().contains("upstream_ca_pem"));
+    }
+
+    /// Exercise the advisor wire rule through merge and the supervisor's
+    /// upstream verifier, with no trust added to an unrelated endpoint.
+    #[tokio::test]
+    async fn proposed_ca_dials_only_its_selected_destination() {
+        use crate::l7::tls::{
+            CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config,
+            tls_connect_upstream, tls_terminate_client,
+        };
+        use crate::opa::{NetworkInput, OpaEngine};
+        use openshell_policy::{PolicyMergeOp, merge_policy};
+
+        let customer_ca = SandboxCa::generate().unwrap();
+        let pem = customer_ca.cert_pem().to_string();
+        let server = Arc::new(ProxyTlsState::new(
+            CertCache::new(customer_ca),
+            build_upstream_client_config("").unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let _ = tls_terminate_client(stream, &server, "private.example.test").await;
+                });
+            }
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "operations": [{"addRule": {
+                "ruleName": "private_api",
+                "rule": {"binaries": [{"path": "/usr/bin/curl"}], "endpoints": [{
+                    "host": "private.example.test", "port": 443,
+                    "access": "full", "upstream_ca_pem": pem
+                }, {
+                    "host": "other.example.test", "port": 443,
+                    "access": "full"
+                }]}
+            }}]
+        }))
+        .unwrap();
+        let chunk = proposal_chunks_from_body(&body).unwrap().remove(0);
+        let proposed = chunk.proposed_rule.unwrap();
+        let merged = merge_policy(
+            ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            },
+            &[PolicyMergeOp::AddRule {
+                rule_name: chunk.rule_name,
+                rule: proposed,
+            }],
+        )
+        .unwrap()
+        .policy;
+        let engine = OpaEngine::from_proto(&merged).unwrap();
+        let selected_ca = |host: &str| {
+            let config = engine
+                .query_endpoint_config(&NetworkInput {
+                    host: host.into(),
+                    port: 443,
+                    binary_path: PathBuf::from("/usr/bin/curl"),
+                    binary_sha256: "unused".into(),
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                })
+                .unwrap();
+            match config {
+                Some(regorus::Value::Object(fields)) => fields
+                    .get(&regorus::Value::String("upstream_ca_pem".into()))
+                    .and_then(|value| match value {
+                        regorus::Value::String(value) => Some(value.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                None => String::new(),
+                _ => panic!("expected endpoint config object"),
+            }
+        };
+        let selected_pem = selected_ca("private.example.test");
+        assert_eq!(selected_pem, pem);
+        assert!(selected_ca("other.example.test").is_empty());
+
+        let client = ProxyTlsState::new(
+            CertCache::new(SandboxCa::generate().unwrap()),
+            build_upstream_client_config("").unwrap(),
+        )
+        .with_upstream_roots("")
+        .unwrap();
+        let scoped = client.endpoint_upstream_config(&selected_pem).unwrap();
+        tls_connect_upstream(
+            tokio::net::TcpStream::connect(address).await.unwrap(),
+            "private.example.test",
+            &scoped,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tls_connect_upstream(
+                tokio::net::TcpStream::connect(address).await.unwrap(),
+                "private.example.test",
+                client.upstream_config(),
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -2082,6 +2308,36 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "should return immediately, not poll-and-wait; took {elapsed:?}"
         );
+    }
+
+    /// A destination-only reload is insufficient for a CA proposal. The
+    /// in-process policy update completes the wait once the CA is installed.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_ca_proposal_requires_ca_bearing_reload() {
+        let pem = crate::l7::tls::SandboxCa::generate()
+            .unwrap()
+            .cert_pem()
+            .to_string();
+        let mut proposed = proposed_curl_rule_for_github();
+        proposed.endpoints[0].upstream_ca_pem = pem;
+        let mut initial = proposed.clone();
+        initial.endpoints[0].upstream_ca_pem.clear();
+        let ctx = Arc::new(PolicyLocalContext::new(
+            Some(policy_with_rule(initial)),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        ));
+        let reloads = Arc::clone(&ctx);
+        let covering = proposed.clone();
+        let install = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            reloads.set_current_policy(policy_with_rule(covering)).await;
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        assert!(wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await);
+        install.await.unwrap();
     }
 
     #[tokio::test]

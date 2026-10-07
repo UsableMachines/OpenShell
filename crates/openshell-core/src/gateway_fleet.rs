@@ -259,6 +259,83 @@ fn member_score(member: &str, sandbox_id: &str) -> u64 {
     u64::from_be_bytes(score)
 }
 
+/// Split a gateway endpoint URL into the scheme and port to reuse when
+/// addressing individual replicas.
+///
+/// A replica is dialed at the same scheme and port as the configured
+/// endpoint, differing only in host — the fleet is uniform by construction,
+/// being one Deployment behind one Service.
+#[must_use]
+pub fn endpoint_shape(endpoint: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    let host_and_port = rest.split('/').next().unwrap_or(rest);
+    let port = host_and_port.rsplit_once(':')?.1.parse::<u16>().ok()?;
+    Some((scheme.to_string(), port))
+}
+
+/// Prefix a resolved member address (`host:port`) with the configured scheme.
+#[must_use]
+pub fn member_endpoint(scheme: &str, member: &str) -> String {
+    format!("{scheme}://{member}")
+}
+
+/// A gateway endpoint for a unary RPC, addressed at a fleet replica.
+///
+/// The configured endpoint is not a fallback when a fleet is configured: it
+/// is then the headless `Service`, which is deliberately absent from the
+/// gateway's serving certificate, so dialling it fails hostname
+/// verification. This resolves membership itself and addresses a subset
+/// member directly; `attempt` rotates through the subset so a replica that
+/// has since died costs one attempt rather than every attempt. Any replica
+/// can serve a unary store read, so a caller whose hash key differs from
+/// another caller's still reaches a working replica.
+///
+/// Single-endpoint mode — no fleet configured, or an endpoint whose scheme
+/// and port cannot be reused — is the one case where the configured endpoint
+/// *is* a single gateway, and then it is returned unchanged.
+///
+/// `None` means membership could not be resolved. Callers are retry loops, so
+/// that costs one backoff.
+pub async fn unary_endpoint(
+    configured_endpoint: &str,
+    sandbox_id: &str,
+    attempt: usize,
+) -> Option<String> {
+    let Some((scheme, port)) = endpoint_shape(configured_endpoint) else {
+        return Some(configured_endpoint.to_string());
+    };
+    let Some(fleet) = FleetConfig::from_env(port) else {
+        return Some(configured_endpoint.to_string());
+    };
+
+    let members = match resolve_members(&fleet.dns_name, port).await {
+        Ok(members) if !members.is_empty() => members,
+        Ok(_) => {
+            tracing::warn!(
+                fleet_dns_name = %fleet.dns_name,
+                "gateway fleet resolved to no endpoints; cannot address a replica yet"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                fleet_dns_name = %fleet.dns_name,
+                error = %error,
+                "could not resolve the gateway fleet; cannot address a replica yet"
+            );
+            return None;
+        }
+    };
+
+    // The subset this sandbox's sessions would use, so a unary RPC warms the
+    // same replicas rather than a third set. Any replica can serve a store
+    // read, so falling back to the full membership is harmless.
+    let subset = subset_for(sandbox_id, &members, fleet.subset_size);
+    let pool = if subset.is_empty() { members } else { subset };
+
+    Some(member_endpoint(&scheme, &pool[attempt % pool.len()]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +601,103 @@ mod tests {
                 "unexpected member {member}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unary_endpoint_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fleet_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: test-process scoped and serialized by ENV_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Single-endpoint mode — no fleet configured — returns the configured
+    /// endpoint unchanged, so callers without a fleet keep working.
+    //
+    // The ENV_LOCK guard is held across the await on purpose: `FleetConfig` is
+    // read from the process environment inside `unary_endpoint`, so the
+    // mutation this test makes must stay serialized with every other
+    // env-reading test for the duration of the call.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unary_endpoint_without_fleet_returns_configured_endpoint() {
+        let _guard = fleet_env_lock();
+        let _fleet = EnvVarGuard::set(FLEET_DNS_NAME_ENV, "");
+
+        let got = unary_endpoint("https://openshell.sandbox.svc:8080", "sbx", 0)
+            .await
+            .expect("single-endpoint mode always resolves");
+        assert_eq!(got, "https://openshell.sandbox.svc:8080");
+    }
+
+    /// An endpoint whose scheme/port cannot be reused cannot be re-addressed
+    /// at a replica, so it is returned unchanged rather than dropped. The
+    /// fleet being configured is what makes this the pass-through path that
+    /// matters: with no fleet the same return happens for a different reason.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unary_endpoint_passes_through_an_endpoint_it_cannot_rebuild() {
+        let _guard = fleet_env_lock();
+        let _fleet = EnvVarGuard::set(
+            FLEET_DNS_NAME_ENV,
+            "openshell-headless.sandbox.svc.cluster.local",
+        );
+        let _size = EnvVarGuard::set(FLEET_SUBSET_SIZE_ENV, "2");
+
+        let got = unary_endpoint("openshell", "sbx", 0)
+            .await
+            .expect("unrebuildable endpoints are passed through, not dropped");
+        assert_eq!(got, "openshell");
+    }
+
+    /// `endpoint_shape`/`member_endpoint` round-trip: a rebuilt replica
+    /// address keeps the configured scheme and port and differs only in
+    /// host.
+    #[test]
+    fn endpoint_shape_round_trips_with_member_endpoint() {
+        let (scheme, port) = endpoint_shape("https://openshell.sandbox.svc:8080").unwrap();
+        assert_eq!(scheme, "https");
+        assert_eq!(port, 8080);
+        assert_eq!(
+            member_endpoint(&scheme, "10-42-0-7.openshell-headless.ns.svc:8080"),
+            "https://10-42-0-7.openshell-headless.ns.svc:8080"
+        );
+        assert_eq!(endpoint_shape("https://openshell"), None);
+        assert_eq!(endpoint_shape("openshell:8080"), None);
     }
 }
