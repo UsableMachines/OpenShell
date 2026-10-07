@@ -1432,6 +1432,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         protocol: endpoint.protocol.clone(),
         tls: endpoint.tls.clone(),
         upstream_ca_pem: String::new(),
+        tunnel_id: String::new(),
         enforcement: endpoint.enforcement.clone(),
         access: endpoint.access.clone(),
         rules: endpoint

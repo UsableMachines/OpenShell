@@ -120,7 +120,10 @@ impl PolicyLocalContext {
         workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self {
-            current_policy: Arc::new(RwLock::new(current_policy.map(Arc::new))),
+            current_policy: Arc::new(RwLock::new(current_policy.map(|mut policy| {
+                redact_tunnels(&mut policy);
+                Arc::new(policy)
+            }))),
             agent_proposals,
             gateway_endpoint,
             sandbox_name,
@@ -129,10 +132,11 @@ impl PolicyLocalContext {
         }
     }
 
-    pub async fn set_current_policy(&self, policy: ProtoSandboxPolicy) {
+    pub async fn set_current_policy(&self, mut policy: ProtoSandboxPolicy) {
         // Every successful reload receives a distinct Arc, including an
         // identical policy installed again. Waiters use pointer identity to
         // decide whether the installed snapshot needs another coverage scan.
+        redact_tunnels(&mut policy);
         *self.current_policy.write().await = Some(Arc::new(policy));
     }
 
@@ -148,6 +152,16 @@ impl PolicyLocalContext {
     #[must_use]
     pub fn agent_proposals_enabled(&self) -> bool {
         self.agent_proposals.enabled()
+    }
+}
+
+/// Keep supervisor tunnel configuration out of workload policy introspection.
+fn redact_tunnels(policy: &mut ProtoSandboxPolicy) {
+    policy.tunnels.clear();
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.tunnel_id.clear();
+        }
     }
 }
 
@@ -1250,6 +1264,7 @@ fn network_endpoint_from_json(
         protocol: endpoint.protocol,
         tls: endpoint.tls,
         upstream_ca_pem: endpoint.upstream_ca_pem.unwrap_or_default(),
+        tunnel_id: String::new(),
         enforcement: endpoint.enforcement,
         access: endpoint.access,
         rules,
@@ -1470,6 +1485,35 @@ struct L7DenyRuleJson {
 mod tests {
     use super::*;
     use openshell_core::proposals::AgentProposals;
+
+    #[test]
+    fn tunnel_configuration_is_hidden_from_policy_introspection() {
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.tunnels.insert(
+            "customer".into(),
+            openshell_core::proto::NetworkTunnel {
+                private_key_env_key: "WG_PRIVATE_KEY".into(),
+                ..Default::default()
+            },
+        );
+        policy.network_policies.insert(
+            "inner".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    tunnel_id: "customer".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        redact_tunnels(&mut policy);
+        assert!(policy.tunnels.is_empty());
+        assert!(
+            policy.network_policies["inner"].endpoints[0]
+                .tunnel_id
+                .is_empty()
+        );
+    }
 
     fn test_workspace_rx() -> tokio::sync::watch::Receiver<String> {
         tokio::sync::watch::channel(String::new()).1

@@ -868,6 +868,7 @@ fn basic_auth_header(credential: &str) -> Result<String, String> {
 enum UpstreamStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    Tunnel(tokio_wireguard::TcpStream),
 }
 
 impl AsyncRead for UpstreamStream {
@@ -879,6 +880,7 @@ impl AsyncRead for UpstreamStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
             Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            Self::Tunnel(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -892,6 +894,7 @@ impl AsyncWrite for UpstreamStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
             Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            Self::Tunnel(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -903,6 +906,7 @@ impl AsyncWrite for UpstreamStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
             Self::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Tunnel(s) => Pin::new(s).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -910,6 +914,7 @@ impl AsyncWrite for UpstreamStream {
         match self {
             Self::Plain(s) => s.is_write_vectored(),
             Self::Tls(s) => s.is_write_vectored(),
+            Self::Tunnel(s) => s.is_write_vectored(),
         }
     }
 
@@ -917,6 +922,7 @@ impl AsyncWrite for UpstreamStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_flush(cx),
             Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Self::Tunnel(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -924,6 +930,7 @@ impl AsyncWrite for UpstreamStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Self::Tunnel(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -964,6 +971,12 @@ impl PrefixedStream {
         Self::new(inner, Vec::new())
     }
 
+    /// Wrap a supervisor-owned userspace `WireGuard` TCP stream.
+    #[must_use]
+    pub fn from_tunnel(inner: tokio_wireguard::TcpStream) -> Self {
+        Self::over(UpstreamStream::Tunnel(inner), Vec::new())
+    }
+
     /// Wrap an already-established upstream connection (plain or TLS-wrapped
     /// proxy), replaying `prefix` before further reads.
     fn over(inner: UpstreamStream, prefix: Vec<u8>) -> Self {
@@ -986,6 +999,7 @@ impl PrefixedStream {
         match &self.inner {
             UpstreamStream::Plain(s) => s.peer_addr(),
             UpstreamStream::Tls(s) => s.get_ref().0.peer_addr(),
+            UpstreamStream::Tunnel(s) => s.peer_addr(),
         }
     }
 

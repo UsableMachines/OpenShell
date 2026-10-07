@@ -108,6 +108,7 @@ endpoint_policy_for_request if {
 endpoint_allowed(policy, network) if {
 	some endpoint
 	endpoint := policy.endpoints[_]
+	lower(object.get(endpoint, "protocol", "")) != "wireguard-udp"
 	not contains(endpoint.host, "*")
 	lower(endpoint.host) == lower(network.host)
 	endpoint.ports[_] == network.port
@@ -119,6 +120,7 @@ endpoint_allowed(policy, network) if {
 endpoint_allowed(policy, network) if {
 	some endpoint
 	endpoint := policy.endpoints[_]
+	lower(object.get(endpoint, "protocol", "")) != "wireguard-udp"
 	contains(endpoint.host, "*")
 	glob.match(lower(endpoint.host), ["."], lower(network.host))
 	endpoint.ports[_] == network.port
@@ -130,6 +132,7 @@ endpoint_allowed(policy, network) if {
 endpoint_allowed(policy, network) if {
 	some endpoint
 	endpoint := policy.endpoints[_]
+	lower(object.get(endpoint, "protocol", "")) != "wireguard-udp"
 	object.get(endpoint, "host", "") == ""
 	count(object.get(endpoint, "allowed_ips", [])) > 0
 	endpoint.ports[_] == network.port
@@ -974,6 +977,7 @@ network_middlewares := object.get(data, "network_middlewares", {})
 _policy_has_exact_declared_endpoint(policy) if {
 	some ep
 	ep := policy.endpoints[_]
+	lower(object.get(ep, "protocol", "")) != "wireguard-udp"
 	not object.get(ep, "advisor_proposed", false)
 	not contains(ep.host, "*")
 	lower(ep.host) == lower(input.network.host)
@@ -989,6 +993,7 @@ exact_declared_endpoint_host if {
 
 # Hosted endpoint: exact host match + port in ports list.
 endpoint_matches_request(ep, network) if {
+	lower(object.get(ep, "protocol", "")) != "wireguard-udp"
 	not contains(ep.host, "*")
 	lower(ep.host) == lower(network.host)
 	ep.ports[_] == network.port
@@ -996,6 +1001,7 @@ endpoint_matches_request(ep, network) if {
 
 # Hosted endpoint: glob host match + port in ports list.
 endpoint_matches_request(ep, network) if {
+	lower(object.get(ep, "protocol", "")) != "wireguard-udp"
 	contains(ep.host, "*")
 	glob.match(lower(ep.host), ["."], lower(network.host))
 	ep.ports[_] == network.port
@@ -1003,6 +1009,7 @@ endpoint_matches_request(ep, network) if {
 
 # Hostless endpoint with allowed_ips: match on port only.
 endpoint_matches_request(ep, network) if {
+	lower(object.get(ep, "protocol", "")) != "wireguard-udp"
 	object.get(ep, "host", "") == ""
 	count(object.get(ep, "allowed_ips", [])) > 0
 	ep.ports[_] == network.port
@@ -1038,6 +1045,10 @@ endpoint_has_extended_config(ep) if {
 
 endpoint_has_extended_config(ep) if {
 	ep.tls
+}
+
+endpoint_has_extended_config(ep) if {
+	ep.tunnel_id
 }
 
 endpoint_has_extended_config(ep) if {

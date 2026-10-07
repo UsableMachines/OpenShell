@@ -1958,6 +1958,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.upstream_ca_pem.is_empty() {
                         ep["upstream_ca_pem"] = e.upstream_ca_pem.clone().into();
                     }
+                    if !e.tunnel_id.is_empty() {
+                        ep["tunnel_id"] = e.tunnel_id.clone().into();
+                    }
                     if !e.enforcement.is_empty() {
                         ep["enforcement"] = e.enforcement.clone().into();
                     }
@@ -2252,6 +2255,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 )]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
@@ -2321,6 +2325,7 @@ mod tests {
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         }
     }
@@ -3418,6 +3423,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
@@ -3957,6 +3963,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -4029,6 +4036,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -4106,6 +4114,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5295,6 +5304,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5353,6 +5363,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5412,6 +5423,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5473,6 +5485,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -5533,6 +5546,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
 
@@ -6452,6 +6466,97 @@ process:
     }
 
     #[test]
+    fn tunneled_inner_endpoint_uses_normal_policy_and_outer_udp_is_not_workload_egress() {
+        use openshell_core::proto::NetworkTunnel;
+        let mut proto = test_proto();
+        proto.tunnels.insert(
+            "customer".into(),
+            NetworkTunnel {
+                endpoint_host: "198.51.100.20".into(),
+                endpoint_udp_port: 51820,
+                peer_public_key: vec![7; 32],
+                private_key_env_key: "OPENSHELL_WG_PRIVATE_KEY".into(),
+                local_address: "10.80.0.1/32".into(),
+                allowed_inner_cidrs: vec!["10.80.0.2/32".into()],
+                ..Default::default()
+            },
+        );
+        proto.network_policies.insert(
+            "appliance".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "198.51.100.20".into(),
+                    port: 51820,
+                    ports: vec![51820],
+                    protocol: "wireguard-udp".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        proto.network_policies.insert(
+            "orders".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "10.80.0.2".into(),
+                    port: 8080,
+                    ports: vec![8080],
+                    allowed_ips: vec!["10.80.0.2".into()],
+                    tunnel_id: "customer".into(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/claude".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let engine = OpaEngine::from_proto(&proto).expect("tunnel policy");
+        let input = |host: &str, port: u16, binary: &str| NetworkInput {
+            host: host.into(),
+            port,
+            binary_path: binary.into(),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(matches!(
+            engine
+                .evaluate_network_action(&input("10.80.0.2", 8080, "/usr/local/bin/claude"))
+                .unwrap(),
+            NetworkAction::Allow { .. }
+        ));
+        assert!(matches!(
+            engine
+                .evaluate_network_action(&input("10.80.0.2", 8080, "/usr/bin/python3"))
+                .unwrap(),
+            NetworkAction::Deny { .. }
+        ));
+        assert!(matches!(
+            engine
+                .evaluate_network_action(&input("10.80.0.2", 8081, "/usr/local/bin/claude"))
+                .unwrap(),
+            NetworkAction::Deny { .. }
+        ));
+        assert!(matches!(
+            engine
+                .evaluate_network_action(&input("198.51.100.20", 51820, "/usr/local/bin/claude"))
+                .unwrap(),
+            NetworkAction::Deny { .. }
+        ));
+        let endpoint_only =
+            OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
+                .expect("endpoint-only tunnel policy");
+        assert!(matches!(
+            endpoint_only
+                .evaluate_network_action(&input("198.51.100.20", 51820, "/usr/local/bin/claude"))
+                .unwrap(),
+            NetworkAction::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn network_action_with_dev_policy() {
         let engine = test_engine();
         // claude direct to api.anthropic.com → allow (explicit match)
@@ -6924,6 +7029,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -6979,6 +7085,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -7050,6 +7157,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
@@ -7281,6 +7389,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            tunnels: HashMap::default(),
             network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();

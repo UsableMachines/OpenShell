@@ -228,6 +228,20 @@ handled by the inference interception path:
 External inference endpoints that do not use `inference.local` are treated like
 ordinary network traffic and must be allowed by policy.
 
+For an explicitly configured customer appliance, the supervisor owns one
+userspace WireGuard interface. The workload receives neither its key nor a
+tunnel network interface. A private IPv4 destination remains an ordinary
+network endpoint: the explicit proxy authorizes its host and port, checks its
+exact `allowed_ips` entry, then selects the named tunnel at the upstream dial
+boundary. HTTP forward requests still pass L7 rules and credential rewriting
+before the dial. CONNECT keeps its existing sequence: endpoint authorization
+and address validation precede the TCP dial; TLS interception and request
+inspection follow establishment. A `wireguard-udp` endpoint authorizes only
+the supervisor's exact appliance socket and cannot authorize workload TCP.
+The first implementation binds one tunnel and one inner endpoint to the
+initial policy generation. A later policy generation requires a sandbox
+restart for tunnel traffic; dials fail closed rather than using a stale route.
+
 In proxy-required networks, the supervisor chains upstream TLS tunnels through
 a corporate forward proxy with HTTP CONNECT instead of connecting directly,
 once policy and SSRF checks pass. Only TLS (CONNECT) egress is chained:

@@ -2165,7 +2165,7 @@ fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .map_or(headers.len(), |pos| pos);
+        .unwrap_or(headers.len());
     let mut out = Vec::with_capacity(headers.len() + name.len() + value.len() + 4);
     out.extend_from_slice(&headers[..split]);
     out.extend_from_slice(b"\r\n");

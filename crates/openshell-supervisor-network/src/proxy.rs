@@ -13,6 +13,7 @@ use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 #[cfg(target_os = "linux")]
 use crate::policy_dns::{MappingLookupError, PolicyEndpointId, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
+use crate::tunnel::TunnelManager;
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
@@ -53,6 +54,9 @@ use self::egress::{
 };
 
 const MAX_HEADER_BYTES: usize = 8192;
+tokio::task_local! {
+    pub(crate) static TUNNEL_MANAGER: Option<Arc<TunnelManager>>;
+}
 const TUNNEL_PROTOCOL_PEEK_BYTES: usize = crate::l7::rest::HTTP2_PRIOR_KNOWLEDGE_PREFACE.len();
 #[cfg(not(test))]
 const TUNNEL_PROTOCOL_PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -256,6 +260,7 @@ impl ProxyHandle {
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         sandbox_id: Option<&str>,
+        tunnel_manager: Option<Arc<TunnelManager>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -397,26 +402,31 @@ impl ProxyHandle {
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
+                        let tunnel = tunnel_manager.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
-                            if let Err(err) = handle_tcp_connection(
-                                stream,
-                                opa,
-                                cache,
-                                spid,
-                                tls,
-                                inf,
-                                policy_local,
-                                proposals,
-                                gw,
-                                up_proxy,
-                                credentials,
-                                resolver,
-                                dynamic_credentials,
-                                dtx,
-                                atx,
-                            )
-                            .await
+                            if let Err(err) = TUNNEL_MANAGER
+                                .scope(
+                                    tunnel,
+                                    handle_tcp_connection(
+                                        stream,
+                                        opa,
+                                        cache,
+                                        spid,
+                                        tls,
+                                        inf,
+                                        policy_local,
+                                        proposals,
+                                        gw,
+                                        up_proxy,
+                                        credentials,
+                                        resolver,
+                                        dynamic_credentials,
+                                        dtx,
+                                        atx,
+                                    ),
+                                )
+                                .await
                             {
                                 let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                                     .activity(ActivityId::Fail)
@@ -509,6 +519,7 @@ impl TransparentTcpHandle {
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         sandbox_id: Option<&str>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
+        tunnel: Option<Arc<TunnelManager>>,
     ) -> Result<Self> {
         let upstream_proxy = Arc::new(
             UpstreamProxyConfig::from_args(upstream_proxy_args, sandbox_id)
@@ -524,6 +535,7 @@ impl TransparentTcpHandle {
             let denial_tx = denial_tx.clone();
             let activity_tx = activity_tx.clone();
             let upstream_proxy = upstream_proxy.clone();
+            let tunnel = tunnel.clone();
             let mut engine_ready = engine_ready.clone();
             joins.push(tokio::spawn(async move {
                 if tokio::time::timeout(
@@ -550,6 +562,7 @@ impl TransparentTcpHandle {
                     let denial_tx = denial_tx.clone();
                     let activity_tx = activity_tx.clone();
                     let upstream_proxy = upstream_proxy.clone();
+                    let tunnel = tunnel.clone();
                     tokio::spawn(async move {
                         if let Err(error) = handle_transparent_tcp_connection(
                             stream,
@@ -561,6 +574,7 @@ impl TransparentTcpHandle {
                             denial_tx,
                             activity_tx,
                             upstream_proxy,
+                            tunnel,
                         )
                         .await
                         {
@@ -602,6 +616,7 @@ async fn handle_transparent_tcp_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+    tunnel: Option<Arc<TunnelManager>>,
 ) -> Result<()> {
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
@@ -728,6 +743,15 @@ async fn handle_transparent_tcp_connection(
         crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
     }
     let approved_real_ip_candidates = connector.addrs().to_vec();
+    if transparent_tunnel_route_refused(
+        query_tunnel_id(&decision).as_deref(),
+        &approved_real_ip_candidates,
+        tunnel.as_deref(),
+    ) {
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+        emit_activity(&activity_tx, true, "transparent_tcp_tunnel_unsupported");
+        return Ok(());
+    }
     generation_guard.ensure_current()?;
     let mut upstream =
         dial_transparent_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
@@ -2101,8 +2125,9 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    let tunnel_id = query_tunnel_id(&decision);
     let upstream_result = tokio::select! {
-        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs()) => Some(result),
+        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs(), tunnel_id.as_deref(), decision.policy_generation) => Some(result),
         () = connect_generation_guard.wait_until_stale() => None,
     };
     let Some(upstream_result) = upstream_result else {
@@ -4039,13 +4064,49 @@ fn validate_declared_endpoint_resolved_addrs(
 /// Both paths return a [`upstream_proxy::PrefixedStream`]: for proxied
 /// dials it replays any tunneled bytes that arrived in the same read as the
 /// CONNECT response; for direct dials it is a plain passthrough.
-async fn dial_upstream(
+pub(crate) async fn dial_upstream(
     upstream_proxy: &Option<UpstreamProxyConfig>,
     host_lc: &str,
     raw_host_lc: &str,
     port: u16,
     addrs: &[SocketAddr],
+    tunnel_id: Option<&str>,
+    policy_generation: u64,
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    if let Some(id) = tunnel_id {
+        let manager = TUNNEL_MANAGER
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "tunnel unavailable")
+            })?;
+        let [address] = addrs else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "tunnel requires one validated address",
+            ));
+        };
+        return manager
+            .dial(id, *address, policy_generation)
+            .await
+            .map(upstream_proxy::PrefixedStream::from_tunnel);
+    }
+    if TUNNEL_MANAGER
+        .try_with(|manager| {
+            manager.as_ref().is_some_and(|tunnel| {
+                addrs
+                    .iter()
+                    .any(|address| tunnel.owns_destination(*address))
+            })
+        })
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "tunneled destination lacks route selection",
+        ));
+    }
     if let Some(cfg) = upstream_proxy.as_ref() {
         return match cfg.decision(host_lc, port, addrs) {
             upstream_proxy::ProxyDecision::Proxy(endpoint) => {
@@ -4252,6 +4313,31 @@ fn query_allowed_ips(decision: &EgressDecision) -> Vec<String> {
         .first()
         .map(|config| endpoint_config_string_array(config, "allowed_ips"))
         .unwrap_or_default()
+}
+
+/// Return the tunnel selected by the authorized inner endpoint snapshot.
+fn query_tunnel_id(decision: &EgressDecision) -> Option<String> {
+    decision.endpoint.policy_configs.first().and_then(|config| {
+        let regorus::Value::Object(fields) = config else {
+            return None;
+        };
+        match fields.get(&regorus::Value::String("tunnel_id".into())) {
+            Some(regorus::Value::String(id)) if !id.is_empty() => Some(id.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// Transparent TCP has no phase-1 tunnel transport. Refuse a selected route
+/// and any stale policy decision that would dial its inner address directly.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn transparent_tunnel_route_refused(
+    tunnel_id: Option<&str>,
+    approved: &[SocketAddr],
+    tunnel: Option<&TunnelManager>,
+) -> bool {
+    tunnel_id.is_some_and(|id| !id.is_empty())
+        || tunnel.is_some_and(|manager| approved.iter().any(|addr| manager.owns_destination(*addr)))
 }
 
 fn endpoint_config_string_array(config: &regorus::Value, key: &str) -> Vec<String> {
@@ -4547,7 +4633,7 @@ fn canonicalize_forward_host_header(raw: &[u8], authority: &str) -> Result<Vec<u
 /// strips proxy hop-by-hop headers, injects `Connection: close` and `Via`.
 ///
 /// Returns the rewritten request bytes (headers + any overflow body bytes).
-fn rewrite_forward_request(
+pub(crate) fn rewrite_forward_request(
     raw: &[u8],
     used: usize,
     path: &str,
@@ -5975,6 +6061,8 @@ async fn handle_forward_proxy(
         &raw_host_lc,
         port,
         connector.addrs(),
+        query_tunnel_id(&decision).as_deref(),
+        decision.policy_generation,
     )
     .await;
     let mut upstream = match dial_result {
@@ -6393,6 +6481,7 @@ mod tests {
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -6927,6 +7016,8 @@ network_policies:
             "api.example.com.",
             443,
             &[], // addrs unused in the hostname branch
+            None,
+            0,
         )
         .await
         .unwrap();
@@ -10985,6 +11076,58 @@ network_policies:
 
     // --- rewrite_forward_request tests ---
 
+    #[test]
+    fn forward_rewrite_rejects_forged_supervisor_tunnel_key_placeholders() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            TestHashMap::from([
+                ("OPENSHELL_WG_PRIVATE_KEY".into(), "never-send-this".into()),
+                ("API_TOKEN".into(), "allowed-token".into()),
+            ]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+        );
+        let generic = state.resolver().unwrap();
+        let endpoint = state
+            .resolver_for_endpoint("api.example.test", 80, "/p")
+            .unwrap();
+        for resolver in [generic.as_ref(), endpoint.as_ref()] {
+            for token in [
+                "openshell:resolve:env:OPENSHELL_WG_PRIVATE_KEY",
+                "openshell:resolve:env:v1_OPENSHELL_WG_PRIVATE_KEY",
+                "xOPENSHELL-RESOLVE-ENV-OPENSHELL_WG_PRIVATE_KEY",
+            ] {
+                let raw = format!(
+                    "GET http://api.example.test/p HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer {token}\r\n\r\n"
+                );
+                assert!(
+                    rewrite_forward_request(
+                        raw.as_bytes(),
+                        raw.len(),
+                        "/p",
+                        "api.example.test",
+                        Some(resolver),
+                        false
+                    )
+                    .is_err()
+                );
+            }
+            let raw = b"GET http://api.example.test/p HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\n\r\n";
+            let rewritten = rewrite_forward_request(
+                raw,
+                raw.len(),
+                "/p",
+                "api.example.test",
+                Some(resolver),
+                false,
+            )
+            .unwrap();
+            assert!(
+                String::from_utf8_lossy(&rewritten).contains("Authorization: Bearer allowed-token")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn forward_proxy_injects_token_grant_before_rewriting_request() {
         let (ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
@@ -12277,6 +12420,240 @@ network_policies:
             denial_stages.push(event.denial_stage);
         }
         (response, denial_stages)
+    }
+
+    /// Exercise the explicit forward handler, endpoint-scoped credential
+    /// rewriting, and the selected userspace tunnel in one request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_handler_injects_credentials_over_customer_tunnel() {
+        use openshell_core::proto::{
+            NetworkEndpoint, NetworkPolicyRule, NetworkTunnel, SandboxPolicy,
+            StaticCredentialBinding, StaticCredentialEndpointBinding,
+        };
+        use tokio_wireguard::config::{Config, Interface as WgInterfaceConfig, Peer};
+        use tokio_wireguard::interface::Interface;
+
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+
+        let (server_private, server_public) = tokio_wireguard::x25519::keypair();
+        let (client_private, client_public) = tokio_wireguard::x25519::keypair();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        drop(udp);
+        let appliance = Interface::new(Config {
+            interface: WgInterfaceConfig {
+                private_key: server_private,
+                address: "10.80.0.2/32".parse().unwrap(),
+                listen_port: Some(udp_port),
+                mtu: Some(1280),
+            },
+            peers: vec![Peer {
+                endpoint: None,
+                allowed_ips: vec!["10.80.0.1/32".parse().unwrap()],
+                public_key: client_public,
+                persistent_keepalive: None,
+            }],
+        })
+        .unwrap();
+        let appliance_listener = tokio_wireguard::TcpListener::bind("10.80.0.2:8080", &appliance)
+            .await
+            .unwrap();
+        let mut policy = SandboxPolicy::default();
+        policy.tunnels.insert(
+            "customer".into(),
+            NetworkTunnel {
+                endpoint_host: "127.0.0.1".into(),
+                endpoint_udp_port: u32::from(udp_port),
+                peer_public_key: server_public.as_bytes().to_vec(),
+                private_key_env_key: "OPENSHELL_WG_PRIVATE_KEY".into(),
+                local_address: "10.80.0.1/32".into(),
+                allowed_inner_cidrs: vec!["10.80.0.2/32".into()],
+                ..Default::default()
+            },
+        );
+        policy.network_policies.insert(
+            "outer".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "127.0.0.1".into(),
+                    port: u32::from(udp_port),
+                    ports: vec![u32::from(udp_port)],
+                    protocol: "wireguard-udp".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy.network_policies.insert(
+            "inner".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "10.80.0.2".into(),
+                    port: 8080,
+                    ports: vec![8080],
+                    allowed_ips: vec!["10.80.0.2".into()],
+                    tunnel_id: "customer".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let credentials = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([
+                (
+                    "OPENSHELL_WG_PRIVATE_KEY".into(),
+                    base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        client_private.to_bytes(),
+                    ),
+                ),
+                ("API_TOKEN".into(), "appliance-secret".into()),
+            ]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".into(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "10.80.0.2".into(),
+                        port: 8080,
+                        path: "/p".into(),
+                    }],
+                    credential_identity: "provider:API_TOKEN".into(),
+                    workload_credential_handle: String::new(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .unwrap();
+        let manager = Arc::new(TunnelManager::new(&policy, &credentials).unwrap().unwrap());
+        let exe = std::env::current_exe().unwrap();
+        let data = format!(
+            "network_policies:\n  inner:\n    endpoints:\n      - host: 10.80.0.2\n        port: 8080\n        ports: [8080]\n        allowed_ips: [10.80.0.2]\n        tunnel_id: customer\n    binaries:\n      - path: \"{}\"\n",
+            exe.display()
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data).unwrap(),
+        );
+        manager.accept_initial_generation(engine.current_generation());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+            socket.write_all(b"GET http://10.80.0.2:8080/p HTTP/1.1\r\nHost: 10.80.0.2:8080\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (server, _) = listener.accept().await.unwrap();
+        let handler = Box::pin(TUNNEL_MANAGER.scope(
+            Some(Arc::clone(&manager)),
+            handle_tcp_connection(
+                server,
+                Arc::clone(&engine),
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                None,
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                Some(credentials.clone()),
+                credentials.resolver(),
+                None,
+                None,
+                None,
+            ),
+        ));
+        let appliance_request = Box::pin(async {
+            let (mut stream, _) = appliance_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "forward request ended before headers");
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            request
+        });
+        let (allow_result, request, response) = tokio::time::timeout(
+            Duration::from_secs(20),
+            Box::pin(async { tokio::join!(handler, appliance_request, client) }),
+        )
+        .await
+        .expect("forward tunnel request timed out");
+        allow_result.expect("forward handler");
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.contains("Authorization: Bearer appliance-secret"));
+        assert!(!request.contains("openshell:resolve:env:"));
+        assert!(String::from_utf8_lossy(&response.unwrap()).contains("200 OK"));
+
+        let denied_listener = tokio_wireguard::TcpListener::bind("10.80.0.2:8081", &appliance)
+            .await
+            .unwrap();
+        let denied_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let denied_proxy_port = denied_proxy.local_addr().unwrap().port();
+        let denied_client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(("127.0.0.1", denied_proxy_port))
+                .await
+                .unwrap();
+            socket
+                .write_all(b"GET http://10.80.0.2:8081/p HTTP/1.1\r\nHost: 10.80.0.2:8081\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (denied_server, _) = denied_proxy.accept().await.unwrap();
+        let denied_handler = Box::pin(TUNNEL_MANAGER.scope(
+            Some(manager),
+            handle_tcp_connection(
+                denied_server,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                None,
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Arc::new(None),
+                Some(credentials.clone()),
+                credentials.resolver(),
+                None,
+                None,
+                None,
+            ),
+        ));
+        let (denied_result, denied_response) = tokio::time::timeout(
+            Duration::from_secs(10),
+            Box::pin(async { tokio::join!(denied_handler, denied_client) }),
+        )
+        .await
+        .expect("denied forward request timed out");
+        denied_result.expect("denied forward handler");
+        assert!(String::from_utf8_lossy(&denied_response.unwrap()).starts_with("HTTP/1.1 403"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), denied_listener.accept())
+                .await
+                .is_err(),
+            "policy-denied destination must never reach the appliance"
+        );
+        appliance.close();
     }
 
     /// End-to-end regression for the gator finding on PR #2162: with no TLS

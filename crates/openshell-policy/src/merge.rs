@@ -308,6 +308,12 @@ pub enum PolicyMergeError {
         host: String,
         port: u32,
     },
+    /// Overlapping endpoints cannot silently change their tunnel route.
+    TunnelRouteConflict {
+        operation_index: usize,
+        host: String,
+        port: u32,
+    },
     /// Newly added binary scope would inherit an existing endpoint
     /// authorization that the incoming rule did not declare.
     NewBinaryWouldInheritAuthorization {
@@ -432,6 +438,14 @@ impl std::fmt::Display for PolicyMergeError {
             } => write!(
                 f,
                 "merge operation {operation_index} cannot change upstream_ca_pem for {host}:{port}; replace the endpoint policy"
+            ),
+            Self::TunnelRouteConflict {
+                operation_index,
+                host,
+                port,
+            } => write!(
+                f,
+                "merge operation {operation_index} cannot change tunnel route for {host}:{port}"
             ),
             Self::NewBinaryWouldInheritAuthorization {
                 operation_index,
@@ -673,6 +687,9 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
     // `endpoints_overlap` only ever merges endpoints that already agree on
     // both, so a difference here is a different endpoint, not an unmet request.
     if !loaded.host.eq_ignore_ascii_case(&proposed.host) || loaded.path != proposed.path {
+        return false;
+    }
+    if loaded.tunnel_id != proposed.tunnel_id {
         return false;
     }
 
@@ -1311,6 +1328,7 @@ fn is_authorization_inheritance_conflict(error: &PolicyMergeError) -> bool {
         // contracts stay ambiguous however they are split.
         PolicyMergeError::McpContractConflict { .. }
         | PolicyMergeError::UpstreamCaConflict { .. }
+        | PolicyMergeError::TunnelRouteConflict { .. }
         | PolicyMergeError::ConflictingInspectionContracts { .. } => false,
 
         // Reports an unsupported or missing state in the policy the fold
@@ -1427,6 +1445,14 @@ fn merge_endpoint(
         .find(|port| incoming_ports.contains(port))
         .or_else(|| incoming_ports.first().copied())
         .unwrap_or(0);
+
+    if existing.tunnel_id != incoming.tunnel_id {
+        return Err(PolicyMergeError::TunnelRouteConflict {
+            operation_index,
+            host,
+            port,
+        });
+    }
 
     let promotes_l4_to_mcp = promotes_l4_endpoint_to_mcp(existing, incoming);
     ensure_mcp_contract_compatible(existing, incoming, operation_index, &host, port)?;

@@ -256,7 +256,8 @@ pub async fn run_sandbox(
             bootstrap.provider_env_revision,
             bootstrap.provider_child_env.clone(),
         );
-        (provider_credentials, bootstrap.provider_child_env.clone())
+        let provider_env = provider_credentials.snapshot().child_env.clone();
+        (provider_credentials, provider_env)
     } else {
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
@@ -4751,6 +4752,31 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_key_is_absent_from_main_and_sidecar_bootstrap_environments() {
+        let env = std::collections::HashMap::from([
+            ("OPENSHELL_WG_PRIVATE_KEY".to_string(), "secret".to_string()),
+            ("ORDINARY_CONFIG".to_string(), "visible".to_string()),
+        ]);
+        let network_credentials = ProviderCredentialState::from_environment(
+            1,
+            env.clone(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        let provider_env = network_credentials.child_env_with_gcp_resolved();
+        let main_env = provider_env.clone();
+        let sidecar_bootstrap_env = provider_env.clone();
+        assert!(!main_env.contains_key("OPENSHELL_WG_PRIVATE_KEY"));
+        assert!(!sidecar_bootstrap_env.contains_key("OPENSHELL_WG_PRIVATE_KEY"));
+        assert!(main_env.contains_key("ORDINARY_CONFIG"));
+
+        let process_credentials = ProviderCredentialState::from_child_env_snapshot(1, env);
+        let process_provider_env = process_credentials.snapshot().child_env.clone();
+        assert!(!process_provider_env.contains_key("OPENSHELL_WG_PRIVATE_KEY"));
+        assert!(process_provider_env.contains_key("ORDINARY_CONFIG"));
+    }
 
     #[test]
     fn transparent_tcp_capability_requires_exact_driver_marker() {
