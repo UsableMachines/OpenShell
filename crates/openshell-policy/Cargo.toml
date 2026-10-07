@@ -18,6 +18,11 @@ serde_json = { workspace = true }
 serde_yml = { workspace = true }
 miette = { workspace = true }
 prost-types = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true }

@@ -1898,12 +1898,10 @@ async fn handle_tcp_connection(
         emit_activity(&activity_tx, true, "connect_policy");
         respond(
             &mut client,
-            &build_json_error_response_with_reason(
-                403,
-                "Forbidden",
-                "policy_denied",
+            &build_policy_deny_response(
                 &format!("CONNECT {host_lc}:{port} not permitted by policy"),
-                &deny_reason,
+                Some(&deny_reason),
+                agent_proposals.enabled(),
             ),
         )
         .await?;
@@ -1920,6 +1918,7 @@ async fn handle_tcp_connection(
                     port,
                     activity_tx.as_ref(),
                     error,
+                    agent_proposals.enabled(),
                 )
                 .await?;
                 return Ok(());
@@ -2090,8 +2089,15 @@ async fn handle_tcp_connection(
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
     {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            error,
+            agent_proposals.enabled(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2111,14 +2117,22 @@ async fn handle_tcp_connection(
                 connect_generation_guard.captured_generation(),
                 connect_generation_guard.current_generation(),
             ),
+            agent_proposals.enabled(),
         )
         .await?;
         return Ok(());
     };
     let mut upstream = upstream_result.into_diagnostic()?;
     if let Err(error) = connect_generation_guard.ensure_current() {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            error,
+            agent_proposals.enabled(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2219,8 +2233,24 @@ async fn handle_tcp_connection(
             let tls_result = async {
                 let mut tls_client =
                     crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                let endpoint_ca = decision
+                    .endpoint
+                    .policy_configs
+                    .first()
+                    .and_then(|config| match config {
+                        regorus::Value::Object(fields) => {
+                            fields.get(&regorus::Value::String("upstream_ca_pem".into()))
+                        }
+                        _ => None,
+                    })
+                    .and_then(|value| match value {
+                        regorus::Value::String(value) => Some(value.as_ref()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                let upstream_config = tls.endpoint_upstream_config(endpoint_ca)?;
                 let mut tls_upstream =
-                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
+                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, &upstream_config)
                         .await?;
                 let Some(relay_context) =
                     relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
@@ -3428,6 +3458,7 @@ async fn reject_stale_connect_policy(
     port: u16,
     activity_tx: Option<&ActivitySender>,
     error: miette::Report,
+    agent_proposals_enabled: bool,
 ) -> Result<()> {
     warn!(
         host,
@@ -3439,11 +3470,10 @@ async fn reject_stale_connect_policy(
     emit_activity_simple(activity_tx, true, "policy_stale");
     respond(
         client,
-        &build_json_error_response(
-            403,
-            "Forbidden",
-            "policy_denied",
+        &build_policy_deny_response(
             &format!("CONNECT {host}:{port} not permitted because policy changed"),
+            None,
+            agent_proposals_enabled,
         ),
     )
     .await
@@ -5007,11 +5037,10 @@ async fn handle_forward_proxy(
             emit_activity_simple(activity_tx, true, "forward_policy");
             respond(
                 client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
+                &build_policy_deny_response(
                     &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                    None,
+                    agent_proposals.enabled(),
                 ),
             )
             .await?;
@@ -5049,11 +5078,10 @@ async fn handle_forward_proxy(
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
+                &build_policy_deny_response(
                     &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                    None,
+                    agent_proposals.enabled(),
                 ),
             )
             .await?;
@@ -5131,6 +5159,7 @@ async fn handle_forward_proxy(
         .as_ref()
         .map(|ctx| ctx.workspace())
         .unwrap_or_default();
+    let agent_proposals_enabled = agent_proposals.enabled();
     let mut l7_ctx = relay::http_context(
         &decision,
         provider_credentials,
@@ -5173,11 +5202,10 @@ async fn handle_forward_proxy(
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
+                &build_policy_deny_response(
                     &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                    None,
+                    agent_proposals_enabled,
                 ),
             )
             .await?;
@@ -5198,13 +5226,12 @@ async fn handle_forward_proxy(
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
                     client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "policy_denied",
+                    &build_policy_deny_response(
                         &format!(
                             "{method} {host_lc}:{port}{telemetry_path} not permitted by policy"
                         ),
+                        None,
+                        agent_proposals_enabled,
                     ),
                 )
                 .await?;
@@ -5229,13 +5256,12 @@ async fn handle_forward_proxy(
             emit_activity_simple(activity_tx, true, "l7_policy");
             respond(
                 client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
+                &build_policy_deny_response(
                     &format!(
                         "{method} {host_lc}:{port}{telemetry_path} did not match an L7 endpoint path"
                     ),
+                    None,
+                    agent_proposals_enabled,
                 ),
             )
             .await?;
@@ -5561,13 +5587,12 @@ async fn handle_forward_proxy(
             );
             respond(
                 client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
+                &build_policy_deny_response(
                     &format!(
                         "{method} {host_lc}:{port}{telemetry_path} denied by L7 policy: {reason}"
                     ),
+                    None,
+                    agent_proposals_enabled,
                 ),
             )
             .await?;
@@ -5663,11 +5688,10 @@ async fn handle_forward_proxy(
         emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
             client,
-            &build_json_error_response(
-                403,
-                "Forbidden",
-                "policy_denied",
+            &build_policy_deny_response(
                 &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                None,
+                agent_proposals_enabled,
             ),
         )
         .await?;
@@ -5697,11 +5721,10 @@ async fn handle_forward_proxy(
         );
         respond(
             client,
-            &build_json_error_response(
-                403,
-                "Forbidden",
-                "policy_denied",
+            &build_policy_deny_response(
                 &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                None,
+                agent_proposals_enabled,
             ),
         )
         .await?;
@@ -5925,11 +5948,10 @@ async fn handle_forward_proxy(
         }
         respond(
             client,
-            &build_json_error_response(
-                403,
-                "Forbidden",
-                "policy_denied",
+            &build_policy_deny_response(
                 &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
+                None,
+                agent_proposals_enabled,
             ),
         )
         .await?;
@@ -6013,11 +6035,10 @@ async fn handle_forward_proxy(
         }
         respond(
             client,
-            &build_json_error_response(
-                403,
-                "Forbidden",
-                "policy_denied",
+            &build_policy_deny_response(
                 &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                None,
+                agent_proposals_enabled,
             ),
         )
         .await?;
@@ -6192,11 +6213,7 @@ async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
 /// Returns bytes ready to write to the client socket.  The body is a JSON
 /// object with `error` and `detail` fields, matching the format used by the
 /// L7 deny path in `l7/rest.rs`.
-fn build_json_error_response(status: u16, status_text: &str, error: &str, detail: &str) -> Vec<u8> {
-    let body = serde_json::json!({
-        "error": error,
-        "detail": detail,
-    });
+fn build_json_body_response(status: u16, status_text: &str, body: serde_json::Value) -> Vec<u8> {
     let body_str = body.to_string();
     format!(
         "HTTP/1.1 {status} {status_text}\r\n\
@@ -6211,32 +6228,34 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
     .into_bytes()
 }
 
-fn build_json_error_response_with_reason(
-    status: u16,
-    status_text: &str,
-    error: &str,
+fn build_json_error_response(status: u16, status_text: &str, error: &str, detail: &str) -> Vec<u8> {
+    build_json_body_response(
+        status,
+        status_text,
+        serde_json::json!({
+            "error": error,
+            "detail": detail,
+        }),
+    )
+}
+
+/// Build a policy denial with optional decision reason and advisor guidance.
+fn build_policy_deny_response(
     detail: &str,
-    reason: &str,
+    reason: Option<&str>,
+    agent_proposals_enabled: bool,
 ) -> Vec<u8> {
     let mut body = serde_json::json!({
-        "error": error,
+        "error": "policy_denied",
         "detail": detail,
     });
-    if !reason.is_empty() {
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
         body["reason"] = serde_json::json!(reason);
     }
-    let body_str = body.to_string();
-    format!(
-        "HTTP/1.1 {status} {status_text}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body_str.len(),
-        body_str,
-    )
-    .into_bytes()
+    if let Some(guidance) = crate::policy_local::agent_guidance_for(agent_proposals_enabled) {
+        body["agent_guidance"] = serde_json::json!(guidance);
+    }
+    build_json_body_response(403, "Forbidden", body)
 }
 
 fn build_middleware_deny_response(
@@ -6962,13 +6981,58 @@ network_policies:
     }
 
     #[test]
+    fn policy_deny_response_points_at_policy_local_when_advisor_enabled() {
+        let response =
+            build_policy_deny_response("GET host.example:443/ not permitted by policy", None, true);
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "policy_denied");
+        let guidance = body["agent_guidance"].as_str().expect("guidance present");
+        assert!(guidance.contains("policy.local"), "guidance: {guidance}");
+        assert!(guidance.contains("policy_advisor"), "guidance: {guidance}");
+
+        let response = build_policy_deny_response(
+            "CONNECT host.example:443 not permitted by policy",
+            Some("binary '/usr/bin/curl' not allowed in policy 'allow_api'"),
+            true,
+        );
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "policy_denied");
+        assert!(body["reason"].as_str().unwrap().contains("not allowed"));
+        assert!(
+            body["agent_guidance"]
+                .as_str()
+                .unwrap()
+                .contains("policy.local")
+        );
+    }
+
+    #[test]
+    fn policy_deny_response_omits_guidance_when_advisor_disabled() {
+        let response = build_policy_deny_response(
+            "GET host.example:443/ not permitted by policy",
+            None,
+            false,
+        );
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "policy_denied");
+        assert!(body.get("agent_guidance").is_none());
+    }
+
+    #[test]
     fn policy_deny_response_includes_reason() {
-        let response = build_json_error_response_with_reason(
-            403,
-            "Forbidden",
-            "policy_denied",
+        let response = build_policy_deny_response(
             "CONNECT api.example.com:443 not permitted by policy",
-            "binary '/usr/bin/node' not allowed in policy 'allow_api' (ancestors: [/usr/local/bin/claude])",
+            Some(
+                "binary '/usr/bin/node' not allowed in policy 'allow_api' (ancestors: [/usr/local/bin/claude])",
+            ),
+            false,
         );
         let response = String::from_utf8(response).expect("UTF-8 error response");
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
@@ -6988,12 +7052,10 @@ network_policies:
 
     #[test]
     fn policy_deny_response_omits_empty_reason() {
-        let response = build_json_error_response_with_reason(
-            403,
-            "Forbidden",
-            "policy_denied",
+        let response = build_policy_deny_response(
             "CONNECT api.example.com:443 not permitted by policy",
-            "",
+            Some(""),
+            false,
         );
         let response = String::from_utf8(response).expect("UTF-8 error response");
         let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
