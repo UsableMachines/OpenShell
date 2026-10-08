@@ -13257,10 +13257,7 @@ mod tests {
             policy.network_policies["internal_api"].endpoints[0].upstream_ca_pem,
             pem
         );
-        assert!(openshell_policy::policy_covers_rule(
-            &policy,
-            &proposed_rule
-        ));
+        assert!(policy_covers_rule(&policy, &proposed_rule));
         policy
             .network_policies
             .get_mut("internal_api")
@@ -13268,10 +13265,7 @@ mod tests {
             .endpoints[0]
             .upstream_ca_pem
             .clear();
-        assert!(!openshell_policy::policy_covers_rule(
-            &policy,
-            &proposed_rule
-        ));
+        assert!(!policy_covers_rule(&policy, &proposed_rule));
     }
 
     #[tokio::test]
