@@ -4358,6 +4358,9 @@ dependencies = [
  "noyalib",
  "openshell-core",
  "prost-types",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
 ]

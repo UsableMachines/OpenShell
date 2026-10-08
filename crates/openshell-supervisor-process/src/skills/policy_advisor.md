@@ -40,6 +40,12 @@ The sandbox-local policy API is reachable at `http://policy.local`:
 The proposal body takes an `intent_summary` and one or more `addRule`
 operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
 
+For a self-signed internal HTTPS service, include `upstream_ca_pem` as a PEM
+certificate bundle string on its exact host:port endpoint. Obtain the CA from
+the service owner; never submit a private key. Keep normal TLS inspection
+enabled. A supplemental CA always requires developer review, including in
+auto mode. Retry only after approval and `policy_reloaded: true`.
+
 ## Workflow
 
 1. Read the denial response body. Use `layer`, `method`, `path`, `host`,

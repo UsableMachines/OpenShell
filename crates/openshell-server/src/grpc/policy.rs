@@ -6048,6 +6048,15 @@ fn generate_security_notes(rule: &NetworkPolicyRule) -> String {
     for endpoint in &rule.endpoints {
         let host = endpoint.host.to_lowercase();
 
+        // Supplemental roots change which upstream identities this sandbox
+        // trusts. Require human review even when the prover finds no reach or
+        // capability delta; auto mode must never silently approve a CA change.
+        if !endpoint.upstream_ca_pem.is_empty() {
+            notes.push(format!(
+                "Endpoint '{host}' adds a supplemental upstream CA and requires review."
+            ));
+        }
+
         if endpoint.allow_uninspected_credentials {
             notes.push(format!(
                 "Endpoint '{host}' explicitly allows credentials on traffic OpenShell cannot inspect or rewrite."
@@ -6355,6 +6364,7 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         }
         openshell_policy::PolicyMergeError::InvalidInputPolicy { .. }
         | openshell_policy::PolicyMergeError::McpContractConflict { .. }
+        | openshell_policy::PolicyMergeError::UpstreamCaConflict { .. }
         | openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
         | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
             ..
@@ -7123,6 +7133,20 @@ mod tests {
             }],
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn security_notes_flag_supplemental_ca() {
+        let rule = NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.test".into(),
+                port: 443,
+                upstream_ca_pem: "-----BEGIN CERTIFICATE-----\nreviewed separately\n".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(generate_security_notes(&rule).contains("supplemental upstream CA"));
     }
 
     fn mcp_policy_with_versions(versions: &[&str]) -> ProtoSandboxPolicy {
@@ -13141,6 +13165,113 @@ mod tests {
                 .security_notes
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
+    }
+
+    /// A reviewed CA proposal enters the sandbox-owned policy and reload
+    /// coverage must include its trust bundle, not just the destination.
+    #[tokio::test]
+    async fn approved_agent_ca_proposal_persists_and_requires_ca_reload() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-agent-ca";
+        let sandbox_name = "agent-ca";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        seed_sandbox_approval_mode(&state, sandbox_name, "auto").await;
+        let pem = rcgen::generate_simple_self_signed(vec!["api.example.test".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let proposed_rule = NetworkPolicyRule {
+            name: "internal_api".into(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.test".into(),
+                port: 443,
+                upstream_ca_pem: pem.clone(),
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".into(),
+                ..Default::default()
+            }],
+        };
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.into(),
+                analysis_mode: "agent_authored".into(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "internal_api".into(),
+                    proposed_rule: Some(proposed_rule.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.into(),
+                workspace: "default".into(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk = &draft.chunks[0];
+        assert_eq!(chunk.status, "pending");
+        assert!(chunk.security_notes.contains("supplemental upstream CA"));
+        assert_eq!(
+            chunk.proposed_rule.as_ref().unwrap().endpoints[0].upstream_ca_pem,
+            pem
+        );
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                name: sandbox_name.into(),
+                chunk_id: chunk.id.clone(),
+                workspace: "default".into(),
+                review_token: chunk.review_token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let stored = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut policy = ProtoSandboxPolicy::decode(stored.policy_payload.as_slice()).unwrap();
+        assert_eq!(
+            policy.network_policies["internal_api"].endpoints[0].upstream_ca_pem,
+            pem
+        );
+        assert!(openshell_policy::policy_covers_rule(
+            &policy,
+            &proposed_rule
+        ));
+        policy
+            .network_policies
+            .get_mut("internal_api")
+            .unwrap()
+            .endpoints[0]
+            .upstream_ca_pem
+            .clear();
+        assert!(!openshell_policy::policy_covers_rule(
+            &policy,
+            &proposed_rule
+        ));
     }
 
     #[tokio::test]

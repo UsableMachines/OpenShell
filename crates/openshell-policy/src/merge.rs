@@ -302,6 +302,12 @@ pub enum PolicyMergeError {
         /// Rendered effective contract the operation asked for.
         incoming: String,
     },
+    /// An overlapping endpoint already trusts a different supplemental CA.
+    UpstreamCaConflict {
+        operation_index: usize,
+        host: String,
+        port: u32,
+    },
     /// Newly added binary scope would inherit an existing endpoint
     /// authorization that the incoming rule did not declare.
     NewBinaryWouldInheritAuthorization {
@@ -418,6 +424,14 @@ impl std::fmt::Display for PolicyMergeError {
             } => write!(
                 f,
                 "merge operation {operation_index} cannot combine MCP contracts at {host}:{port}: existing {existing}, incoming {incoming}"
+            ),
+            Self::UpstreamCaConflict {
+                operation_index,
+                host,
+                port,
+            } => write!(
+                f,
+                "merge operation {operation_index} cannot change upstream_ca_pem for {host}:{port}; replace the endpoint policy"
             ),
             Self::NewBinaryWouldInheritAuthorization {
                 operation_index,
@@ -673,6 +687,9 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
         return false;
     }
     if !proposed.tls.is_empty() && effective_tls(&loaded.tls) != effective_tls(&proposed.tls) {
+        return false;
+    }
+    if !proposed.upstream_ca_pem.is_empty() && loaded.upstream_ca_pem != proposed.upstream_ca_pem {
         return false;
     }
     if !proposed.enforcement.is_empty()
@@ -1293,6 +1310,7 @@ fn is_authorization_inheritance_conflict(error: &PolicyMergeError) -> bool {
         // inspection contract per host and port rather than per rule, so two
         // contracts stay ambiguous however they are split.
         PolicyMergeError::McpContractConflict { .. }
+        | PolicyMergeError::UpstreamCaConflict { .. }
         | PolicyMergeError::ConflictingInspectionContracts { .. } => false,
 
         // Reports an unsupported or missing state in the policy the fold
@@ -1461,6 +1479,19 @@ fn merge_endpoint(
         },
         warnings,
     );
+    if existing.upstream_ca_pem.is_empty() {
+        existing
+            .upstream_ca_pem
+            .clone_from(&incoming.upstream_ca_pem);
+    } else if !incoming.upstream_ca_pem.is_empty()
+        && existing.upstream_ca_pem != incoming.upstream_ca_pem
+    {
+        return Err(PolicyMergeError::UpstreamCaConflict {
+            operation_index,
+            host,
+            port,
+        });
+    }
 
     if !incoming.rules.is_empty() {
         expand_existing_access(existing, &host, port, warnings)?;
@@ -1727,6 +1758,9 @@ fn adopt_unset_retained_fields(
     }
     if adopted.tls.is_empty() {
         adopted.tls.clone_from(&merged.tls);
+    }
+    if adopted.upstream_ca_pem.is_empty() {
+        adopted.upstream_ca_pem.clone_from(&merged.upstream_ca_pem);
     }
     if adopted.enforcement.is_empty() {
         adopted.enforcement.clone_from(&merged.enforcement);
@@ -2216,8 +2250,8 @@ mod tests {
 
     use super::{
         ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp,
-        PolicyMergeWarning, canonical_ports, canonicalize_advisor_add_rule, generated_rule_name,
-        merge_policy, policy_covers_rule,
+        PolicyMergeWarning, adopt_unset_retained_fields, canonical_ports,
+        canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
     };
     use crate::{restrictive_default_policy, validate_sandbox_policy};
     use openshell_core::{
@@ -3697,6 +3731,90 @@ mod tests {
         assert_eq!(endpoint.enforcement, "enforce");
         assert_eq!(endpoint.rules.len(), 1);
         assert_eq!(rule.binaries.len(), 2);
+    }
+
+    #[test]
+    fn add_rule_preserves_requested_upstream_ca_and_coverage() {
+        let pem = rcgen::generate_simple_self_signed(vec!["api.example.com".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let existing = rule_with_authorizations(
+            "api",
+            vec![endpoint("api.example.com", 443)],
+            &["/usr/bin/client"],
+        );
+        let mut incoming_endpoint = endpoint("api.example.com", 443);
+        incoming_endpoint.upstream_ca_pem = pem.clone();
+        let incoming =
+            rule_with_authorizations("api", vec![incoming_endpoint], &["/usr/bin/client"]);
+        let merged = merge_policy(
+            policy_with_rule("api", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "api".into(),
+                rule: incoming.clone(),
+            }],
+        )
+        .unwrap()
+        .policy;
+        assert_eq!(
+            merged.network_policies["api"].endpoints[0].upstream_ca_pem,
+            pem
+        );
+        assert!(policy_covers_rule(&merged, &incoming));
+        let mut without_ca = merged;
+        without_ca
+            .network_policies
+            .get_mut("api")
+            .unwrap()
+            .endpoints[0]
+            .upstream_ca_pem
+            .clear();
+        assert!(!policy_covers_rule(&without_ca, &incoming));
+    }
+
+    #[test]
+    fn add_rule_rejects_conflicting_upstream_ca_without_exposing_pem() {
+        let first = rcgen::generate_simple_self_signed(vec!["api.example.com".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let second = rcgen::generate_simple_self_signed(vec!["api.example.com".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let mut existing_endpoint = endpoint("api.example.com", 443);
+        existing_endpoint.upstream_ca_pem = first.clone();
+        let mut incoming_endpoint = endpoint("api.example.com", 443);
+        incoming_endpoint.upstream_ca_pem = second.clone();
+        let existing =
+            rule_with_authorizations("api", vec![existing_endpoint], &["/usr/bin/client"]);
+        let incoming =
+            rule_with_authorizations("api", vec![incoming_endpoint], &["/usr/bin/client"]);
+        let error = merge_policy(
+            policy_with_rule("api", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "api".into(),
+                rule: incoming,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, PolicyMergeError::UpstreamCaConflict { .. }));
+        let message = error.to_string();
+        assert!(message.contains("upstream_ca_pem"));
+        assert!(!message.contains(&first));
+        assert!(!message.contains(&second));
+    }
+
+    #[test]
+    fn inheritance_adopts_unset_upstream_ca() {
+        let declared = endpoint("api.example.com", 443);
+        let mut merged = declared.clone();
+        merged.upstream_ca_pem = "retained-ca".into();
+        assert_eq!(
+            adopt_unset_retained_fields(&declared, &merged).upstream_ca_pem,
+            "retained-ca"
+        );
     }
 
     #[test]
