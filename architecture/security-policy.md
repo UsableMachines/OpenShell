@@ -142,6 +142,13 @@ flag defaults to `false` and is security-flagged in policy approval flows.
 Incremental merges only ever add the flag to a matching endpoint; clearing it
 requires removing the endpoint or replacing the policy.
 
+TLS endpoints may specify `upstream_ca_pem` in their policy. The supervisor
+adds that PEM certificate bundle only to the selected endpoint's upstream
+rustls verifier, alongside its normal roots. CONNECT still terminates client
+TLS and uses the parsed HTTP relay, so credential rewrite, middleware, and
+redaction retain their normal boundary. Policy validation rejects this field
+on `tls: skip` and `protocol: tcp` endpoints, which do not use the verifier.
+
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
 placeholders require rewrite. REST bodies can continue streaming when body
