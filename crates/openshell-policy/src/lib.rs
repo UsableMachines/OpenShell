@@ -14,6 +14,7 @@ mod l7_validate;
 mod merge;
 mod middleware;
 
+use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::net::IpAddr;
@@ -28,8 +29,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::mcp::{DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, NetworkTunnel,
+    ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -67,6 +68,38 @@ struct PolicyFile {
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_middlewares: BTreeMap<String, middleware::NetworkMiddlewareConfigDef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    tunnels: BTreeMap<String, NetworkTunnelDef>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkTunnelDef {
+    endpoint_host: String,
+    endpoint_udp_port: u16,
+    peer_public_key: String,
+    private_key_env_key: String,
+    local_address: String,
+    allowed_inner_cidrs: Vec<String>,
+    #[serde(default)]
+    mtu: u32,
+    #[serde(default)]
+    keepalive_seconds: u32,
+}
+
+impl fmt::Debug for NetworkTunnelDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetworkTunnelDef")
+            .field("endpoint_host", &self.endpoint_host)
+            .field("endpoint_udp_port", &self.endpoint_udp_port)
+            .field("peer_public_key", &"[redacted]")
+            .field("private_key_env_key", &self.private_key_env_key)
+            .field("local_address", &self.local_address)
+            .field("allowed_inner_cidrs", &self.allowed_inner_cidrs)
+            .field("mtu", &self.mtu)
+            .field("keepalive_seconds", &self.keepalive_seconds)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,6 +164,8 @@ struct NetworkEndpointDef {
     tls: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upstream_ca_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    tunnel_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     enforcement: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -810,6 +845,28 @@ fn yaml_mcp_method(
 }
 
 fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
+    let tunnels = raw
+        .tunnels
+        .into_iter()
+        .map(|(name, tunnel)| {
+            let peer_public_key = base64::engine::general_purpose::STANDARD
+                .decode(&tunnel.peer_public_key)
+                .map_err(|_| miette::miette!("invalid WireGuard public key encoding"))?;
+            Ok((
+                name,
+                NetworkTunnel {
+                    endpoint_host: tunnel.endpoint_host,
+                    endpoint_udp_port: u32::from(tunnel.endpoint_udp_port),
+                    peer_public_key,
+                    private_key_env_key: tunnel.private_key_env_key,
+                    local_address: tunnel.local_address,
+                    allowed_inner_cidrs: tunnel.allowed_inner_cidrs,
+                    mtu: tunnel.mtu,
+                    keepalive_seconds: tunnel.keepalive_seconds,
+                },
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     let network_middlewares = middleware::into_proto(raw.network_middlewares)
         .into_diagnostic()
         .wrap_err("failed to convert network middleware config")?;
@@ -848,6 +905,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             protocol: protocol.clone(),
                             tls: e.tls,
                             upstream_ca_pem: e.upstream_ca_pem.unwrap_or_default(),
+                            tunnel_id: e.tunnel_id,
                             enforcement: e.enforcement,
                             access: e.access,
                             rules: allow_rules
@@ -929,6 +987,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
         }),
         network_policies,
         network_middlewares,
+        tunnels,
     })
 }
 
@@ -1018,6 +1077,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             tls: e.tls.clone(),
                             upstream_ca_pem: (!e.upstream_ca_pem.is_empty())
                                 .then(|| e.upstream_ca_pem.clone()),
+                            tunnel_id: e.tunnel_id.clone(),
                             enforcement: e.enforcement.clone(),
                             access: e.access.clone(),
                             rules,
@@ -1070,6 +1130,26 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         .collect();
 
     let network_middlewares = middleware::from_proto(&policy.network_middlewares);
+    let tunnels = policy
+        .tunnels
+        .iter()
+        .map(|(name, tunnel)| {
+            (
+                name.clone(),
+                NetworkTunnelDef {
+                    endpoint_host: tunnel.endpoint_host.clone(),
+                    endpoint_udp_port: u16::try_from(tunnel.endpoint_udp_port).unwrap_or(u16::MAX),
+                    peer_public_key: base64::engine::general_purpose::STANDARD
+                        .encode(&tunnel.peer_public_key),
+                    private_key_env_key: tunnel.private_key_env_key.clone(),
+                    local_address: tunnel.local_address.clone(),
+                    allowed_inner_cidrs: tunnel.allowed_inner_cidrs.clone(),
+                    mtu: tunnel.mtu,
+                    keepalive_seconds: tunnel.keepalive_seconds,
+                },
+            )
+        })
+        .collect();
 
     PolicyFile {
         version: policy.version,
@@ -1078,6 +1158,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         process,
         network_policies,
         network_middlewares,
+        tunnels,
     }
 }
 
@@ -1287,6 +1368,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         process: None,
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
+        tunnels: HashMap::default(),
     }
 }
 
@@ -1354,6 +1436,8 @@ pub enum PolicyViolation {
     },
     /// A network endpoint uses a wildcard shape that does not match runtime semantics.
     InvalidHostWildcard { policy_name: String, host: String },
+    /// Supervisor tunnel configuration is incomplete or ambiguous.
+    InvalidTunnelConfig { reason: String },
     /// `credential_signing` is set but `signing_service` is missing.
     MissingSigningService { policy_name: String, host: String },
     /// `credential_signing` has an unrecognized value.
@@ -1505,6 +1589,9 @@ impl fmt::Display for PolicyViolation {
                      middle DNS label wildcards must be the entire label '*' and recursive '**' \
                      is only allowed as the entire first label"
                 )
+            }
+            Self::InvalidTunnelConfig { reason } => {
+                write!(f, "invalid tunnel configuration: {reason}")
             }
             Self::MissingSigningService { policy_name, host } => {
                 write!(
@@ -1750,6 +1837,14 @@ fn validate_sandbox_policy_with_mcp_presence(
                 violations.push(PolicyViolation::MissingEndpointHost {
                     policy_name: name.clone(),
                 });
+            } else if explicit_tcp && !ep.tunnel_id.is_empty() {
+                if ep.host.parse::<std::net::Ipv4Addr>().is_err() {
+                    violations.push(PolicyViolation::InvalidTcpEndpointHost {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                        reason: "tunneled TCP endpoint must be an exact IPv4 literal".to_string(),
+                    });
+                }
             } else if explicit_tcp {
                 if ep.host.parse::<IpAddr>().is_ok() {
                     violations.push(PolicyViolation::TcpEndpointIpLiteral {
@@ -1979,11 +2074,108 @@ fn validate_sandbox_policy_with_mcp_presence(
     }
 
     violations.extend(middleware::validate(policy));
+    validate_tunnel_policy(policy, &mut violations);
 
     if violations.is_empty() {
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+/// Validate the single `WireGuard` route before policy persistence or delivery.
+fn validate_tunnel_policy(policy: &SandboxPolicy, violations: &mut Vec<PolicyViolation>) {
+    let single_port = |endpoint: &NetworkEndpoint| match endpoint.ports.as_slice() {
+        [] if endpoint.port != 0 => Some(endpoint.port),
+        [port] if endpoint.port == 0 || endpoint.port == *port => Some(*port),
+        _ => None,
+    };
+    let mut fail = |reason: &str| {
+        violations.push(PolicyViolation::InvalidTunnelConfig {
+            reason: reason.to_string(),
+        });
+    };
+    let endpoints: Vec<_> = policy
+        .network_policies
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .collect();
+    let inner: Vec<_> = endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.tunnel_id.is_empty())
+        .collect();
+    let outer: Vec<_> = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.protocol == "wireguard-udp")
+        .collect();
+    if policy.tunnels.is_empty() {
+        if !inner.is_empty() || !outer.is_empty() {
+            fail("tunnel endpoints require a named tunnel");
+        }
+        return;
+    }
+    if policy.tunnels.len() != 1 || inner.len() != 1 || outer.len() != 1 {
+        fail("phase 1 requires one tunnel, one inner endpoint, and one appliance UDP endpoint");
+        return;
+    }
+    let (id, tunnel) = policy.tunnels.iter().next().expect("one tunnel");
+    let inner = *inner[0];
+    let outer = *outer[0];
+    let Ok(inner_ip) = inner.host.parse::<std::net::Ipv4Addr>() else {
+        fail("inner endpoint must be an exact IPv4 literal");
+        return;
+    };
+    let Ok(route) = tunnel
+        .allowed_inner_cidrs
+        .first()
+        .map_or("", String::as_str)
+        .parse::<ipnet::Ipv4Net>()
+    else {
+        fail("inner route must be a valid IPv4 CIDR");
+        return;
+    };
+    if id.is_empty()
+        || inner.tunnel_id != *id
+        || tunnel.allowed_inner_cidrs.len() != 1
+        || route.prefix_len() == 0
+        || !route.contains(&inner_ip)
+        || inner.allowed_ips != [inner_ip.to_string()]
+        || single_port(inner).is_none()
+    {
+        fail("inner endpoint must have one exact allowed IP and port within its named route");
+    }
+    if tunnel.endpoint_host.parse::<std::net::Ipv4Addr>().is_err()
+        || tunnel.endpoint_udp_port == 0
+        || tunnel.endpoint_udp_port > u16::MAX.into()
+        || outer.host != tunnel.endpoint_host
+        || outer.host.contains('*')
+        || single_port(outer) != Some(tunnel.endpoint_udp_port)
+        || !outer.tunnel_id.is_empty()
+    {
+        fail("appliance must have one exact IPv4 UDP endpoint policy");
+    }
+    if tunnel.peer_public_key.len() != 32
+        || !tunnel.private_key_env_key.starts_with("OPENSHELL_WG_")
+        || tunnel.private_key_env_key.len() == "OPENSHELL_WG_".len()
+        || !tunnel
+            .private_key_env_key
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        || tunnel.local_address.parse::<ipnet::Ipv4Net>().is_err()
+        || (tunnel.mtu != 0 && !(1200..=1420).contains(&tunnel.mtu))
+        || (tunnel.keepalive_seconds != 0 && !(5..=120).contains(&tunnel.keepalive_seconds))
+    {
+        fail("WireGuard peer parameters are invalid");
+    }
+    if endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.host == inner.host && single_port(endpoint) == single_port(inner)
+        })
+        .count()
+        != 1
+    {
+        fail("inner destination host and port must not have competing endpoint rules");
     }
 }
 
@@ -3887,6 +4079,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            tunnels: HashMap::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -4345,6 +4538,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            tunnels: HashMap::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -4361,6 +4555,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            tunnels: HashMap::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -4433,6 +4628,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             network_middlewares: HashMap::default(),
+            tunnels: HashMap::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -4487,6 +4683,42 @@ network_policies:
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![443]);
         assert_eq!(ep.port, 443);
+    }
+
+    #[test]
+    fn tunnel_policy_accepts_scalar_ports_for_inner_and_outer_endpoints() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+tunnels:
+  customer:
+    endpoint_host: 198.51.100.20
+    endpoint_udp_port: 51820
+    peer_public_key: AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+    private_key_env_key: OPENSHELL_WG_PRIVATE_KEY
+    local_address: 10.80.0.1/32
+    allowed_inner_cidrs: [10.80.0.2/32]
+network_policies:
+  transport:
+    endpoints:
+      - { host: 198.51.100.20, port: 51820, protocol: wireguard-udp }
+  service:
+    endpoints:
+      - { host: 10.80.0.2, port: 8080, allowed_ips: [10.80.0.2], tunnel_id: customer }
+    binaries:
+      - { path: /usr/bin/example-app }
+",
+        )
+        .expect("scalar-port tunnel policy");
+        assert_eq!(
+            policy.network_policies["transport"].endpoints[0].ports,
+            [51820]
+        );
+        assert_eq!(
+            policy.network_policies["service"].endpoints[0].ports,
+            [8080]
+        );
+        validate_sandbox_policy(&policy).expect("valid tunnel policy");
     }
 
     #[test]

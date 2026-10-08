@@ -15,9 +15,8 @@ use super::{
     resolve_and_reject_internal,
 };
 use ipnet::IpNet;
-use openshell_core::net::{connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip};
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use std::net::{IpAddr, SocketAddr};
-use tokio::net::TcpStream;
 
 /// Address-validation mode selected from the current endpoint configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,11 +241,8 @@ pub(crate) fn filter_resolved_addresses(
 
 /// Validated, but not yet opened, upstream destination.
 ///
-/// The explicit proxy adapter controls when `connect` is called so CONNECT and
-/// forward HTTP retain their current upstream-dial timing during the refactor.
+/// The explicit proxy adapter controls the upstream dial after validation.
 pub(crate) struct UpstreamConnector {
-    host: String,
-    port: u16,
     addrs: Vec<SocketAddr>,
 }
 
@@ -255,25 +251,8 @@ impl UpstreamConnector {
         &self.addrs
     }
 
-    /// Opens the connection with `TCP_NODELAY` set: this is the upstream dial
-    /// boundary for latency-sensitive proxied request/response traffic, where
-    /// Nagle would stall sub-MSS writes on delayed ACKs.
-    pub(crate) async fn connect(&self) -> std::io::Result<TcpStream> {
-        tracing::debug!(
-            host = %self.host,
-            port = self.port,
-            address_count = self.addrs.len(),
-            "Opening validated upstream connection"
-        );
-        connect_tcp_nodelay_best_effort(self.addrs.as_slice()).await
-    }
-
-    pub(crate) fn new(host: &str, port: u16, addrs: Vec<SocketAddr>) -> Self {
-        Self {
-            host: host.to_string(),
-            port,
-            addrs,
-        }
+    pub(crate) const fn new(addrs: Vec<SocketAddr>) -> Self {
+        Self { addrs }
     }
 }
 
@@ -332,7 +311,7 @@ pub(crate) async fn validate_destination(
             .collect(),
     };
 
-    Ok(UpstreamConnector::new(host, port, addrs))
+    Ok(UpstreamConnector::new(addrs))
 }
 
 #[cfg(test)]
@@ -347,19 +326,6 @@ mod tests {
             sandbox_entrypoint_pid: 0,
             plan,
         }
-    }
-
-    /// Regression test: the shared upstream dial boundary sets `TCP_NODELAY`.
-    #[tokio::test]
-    async fn upstream_connector_sets_tcp_nodelay() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
-
-        let connector = UpstreamConnector::new("127.0.0.1", addr.port(), vec![addr]);
-        let stream = connector.connect().await.expect("connect");
-        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 
     #[tokio::test]

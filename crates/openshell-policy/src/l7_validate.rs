@@ -150,7 +150,8 @@ pub fn validate_l7_endpoint_semantics(ep: &L7EndpointFields<'_>) -> Vec<String> 
     let is_jsonrpc = matches!(l7_protocol, Some(L7Protocol::JsonRpc));
 
     // 1. Unknown protocol
-    if !protocol.is_empty() && l7_protocol.is_none() && !explicit_tcp {
+    if !protocol.is_empty() && l7_protocol.is_none() && !explicit_tcp && protocol != "wireguard-udp"
+    {
         errors.push(format!(
             "unknown protocol '{protocol}' (expected tcp, rest, websocket, graphql, sql, json-rpc, or mcp)"
         ));

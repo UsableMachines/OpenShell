@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "4e71d82c4dac3989cd2a4b814144e3ae3dda6613"
+  },
+  "path_in_vcs": "crates/tokio-wireguard"
+}

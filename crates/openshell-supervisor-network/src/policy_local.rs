@@ -151,6 +151,16 @@ impl PolicyLocalContext {
     }
 }
 
+/// Keep supervisor tunnel configuration out of workload policy introspection.
+fn redact_tunnels(policy: &mut ProtoSandboxPolicy) {
+    policy.tunnels.clear();
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.tunnel_id.clear();
+        }
+    }
+}
+
 pub async fn handle_forward_request<S>(
     ctx: &PolicyLocalContext,
     method: &str,
@@ -296,7 +306,9 @@ async fn current_policy_response(ctx: &PolicyLocalContext) -> (u16, serde_json::
         );
     };
 
-    match openshell_policy::serialize_sandbox_policy(&policy) {
+    let mut visible_policy = policy.as_ref().clone();
+    redact_tunnels(&mut visible_policy);
+    match openshell_policy::serialize_sandbox_policy(&visible_policy) {
         Ok(policy_yaml) => (
             200,
             serde_json::json!({
@@ -412,8 +424,8 @@ fn read_recent_denial_lines(log_dir: &Path, limit: usize) -> Vec<String> {
 
 /// Replace any `?<query>` substring with `?[redacted]` to keep query-string
 /// secrets out of the agent's view. Walks per Unicode scalar value so multi-byte
-/// content is safe. A query is everything from `?` until the next whitespace or
-/// `]` (the shorthand format uses `[...]` for context tags).
+/// content is safe. A query is everything from `?` until the next whitespace.
+/// Preserve a trailing `]` that closes a shorthand context tag.
 fn redact_query_strings(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
@@ -421,13 +433,16 @@ fn redact_query_strings(line: &str) -> String {
         if c == '?' {
             out.push('?');
             out.push_str("[redacted]");
-            // Consume until whitespace or `]` (preserved as the next token's
-            // boundary by writing it back out).
+            let mut query = String::new();
             for next in chars.by_ref() {
-                if next.is_whitespace() || next == ']' {
+                if next.is_whitespace() {
                     out.push(next);
                     break;
                 }
+                query.push(next);
+            }
+            if query.ends_with(']') {
+                out.push(']');
             }
         } else {
             out.push(c);
@@ -1250,6 +1265,7 @@ fn network_endpoint_from_json(
         protocol: endpoint.protocol,
         tls: endpoint.tls,
         upstream_ca_pem: endpoint.upstream_ca_pem.unwrap_or_default(),
+        tunnel_id: String::new(),
         enforcement: endpoint.enforcement,
         access: endpoint.access,
         rules,
@@ -1470,6 +1486,35 @@ struct L7DenyRuleJson {
 mod tests {
     use super::*;
     use openshell_core::proposals::AgentProposals;
+
+    #[test]
+    fn tunnel_configuration_is_hidden_from_policy_introspection() {
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.tunnels.insert(
+            "customer".into(),
+            openshell_core::proto::NetworkTunnel {
+                private_key_env_key: "WG_PRIVATE_KEY".into(),
+                ..Default::default()
+            },
+        );
+        policy.network_policies.insert(
+            "inner".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    tunnel_id: "customer".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        redact_tunnels(&mut policy);
+        assert!(policy.tunnels.is_empty());
+        assert!(
+            policy.network_policies["inner"].endpoints[0]
+                .tunnel_id
+                .is_empty()
+        );
+    }
 
     fn test_workspace_rx() -> tokio::sync::watch::Receiver<String> {
         tokio::sync::watch::channel(String::new()).1
@@ -1929,6 +1974,15 @@ mod tests {
     }
 
     #[test]
+    fn redact_query_strings_removes_query_after_internal_bracket() {
+        let line = "2026-05-06T17:02:00.000Z OCSF HTTP:PUT [MED] DENIED PUT http://api.github.com/x [policy:p engine:opa] [reason:FORWARD denied PUT api.github.com:443/x?token=prefix]secret-suffix]";
+        let redacted = redact_query_strings(line);
+        assert!(!redacted.contains("prefix"));
+        assert!(!redacted.contains("secret-suffix"));
+        assert!(redacted.contains("[reason:FORWARD denied PUT api.github.com:443/x?[redacted]]"));
+    }
+
+    #[test]
     fn redact_query_strings_handles_multibyte_chars() {
         let line = "ÜLÅUTF8 ? secret-x [policy:p]";
         // No `?<nonspace>` here, so no redaction — but must not panic.
@@ -2308,6 +2362,54 @@ mod tests {
             elapsed < std::time::Duration::from_millis(200),
             "should return immediately, not poll-and-wait; took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn tunnel_policy_stays_valid_for_coverage_but_is_hidden_from_introspection() {
+        let mut policy = openshell_policy::parse_sandbox_policy(
+            r"
+version: 1
+tunnels:
+  customer:
+    endpoint_host: 198.51.100.20
+    endpoint_udp_port: 51820
+    peer_public_key: AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+    private_key_env_key: OPENSHELL_WG_PRIVATE_KEY
+    local_address: 10.80.0.1/32
+    allowed_inner_cidrs: [10.80.0.2/32]
+network_policies:
+  transport:
+    endpoints:
+      - { host: 198.51.100.20, port: 51820, protocol: wireguard-udp }
+  service:
+    endpoints:
+      - { host: 10.80.0.2, port: 8080, allowed_ips: [10.80.0.2], tunnel_id: customer }
+    binaries:
+      - { path: /usr/bin/example-app }
+",
+        )
+        .unwrap();
+        let proposed = proposed_curl_rule_for_github();
+        policy
+            .network_policies
+            .insert(proposed.name.clone(), proposed.clone());
+        let ctx = PolicyLocalContext::new(
+            Some(policy),
+            None,
+            None,
+            AgentProposals::new(true),
+            test_workspace_rx(),
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await);
+
+        let (status, payload) = current_policy_response(&ctx).await;
+        assert_eq!(status, 200);
+        let visible = payload["policy_yaml"].as_str().unwrap();
+        assert!(!visible.contains("private_key_env_key"));
+        assert!(!visible.contains("tunnel_id"));
+        assert!(visible.contains("api.github.com"));
     }
 
     /// A destination-only reload is insufficient for a CA proposal. The

@@ -21,6 +21,7 @@ landlock: { ... }
 process: { ... }
 network_policies: { ... }
 network_middlewares: { ... }
+tunnels: { ... }
 ```
 
 | Field | Type | Required | Category | Description |
@@ -31,6 +32,7 @@ network_middlewares: { ... }
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 | `network_middlewares` | map | No | Dynamic | Attaches ordered middleware by destination host; each implementation's manifest selects its supported HTTP and WebSocket operations. |
+| `tunnels` | map | No | Static | Names one supervisor-owned customer-appliance WireGuard connection. Phase 1 requires sandbox restart after policy changes. |
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
@@ -142,7 +144,51 @@ process:
 
 **Category:** Dynamic
 
-A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+A map of named network policy entries. Each entry declares a set of endpoints and, for workload traffic, a set of binaries. Only the listed binaries are permitted to connect to workload endpoints. A rule containing only a `wireguard-udp` endpoint is the exception: it may omit `binaries` because it authorizes only the supervisor's outer UDP socket. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+
+### Customer appliance tunnel
+
+Phase 1 supports one named tunnel and one private IPv4 literal destination. The tunnel is a supervisor transport; the workload receives no tunnel interface or key. The appliance needs a reachable WireGuard UDP listener and a peer entry for the supervisor's public key and local tunnel address. The application must provision the private key as a sandbox-scoped provider credential before the sandbox starts, then set `private_key_env_key` to its environment key. The key name must start with `OPENSHELL_WG_` and continue with uppercase letters, digits, or underscores. The supervisor removes that key from the workload environment.
+
+| `tunnels.<name>` field | Type | Description |
+|---|---|---|
+| `endpoint_host` | IPv4 literal | Exact public appliance address. |
+| `endpoint_udp_port` | integer | Exact WireGuard UDP port, 1 through 65535. |
+| `peer_public_key` | base64 string | Raw 32-byte WireGuard public key of the appliance. |
+| `private_key_env_key` | string | Supervisor-only provider credential environment key containing the base64-encoded raw 32-byte private key. No private key bytes appear in policy. |
+| `local_address` | IPv4 CIDR | Supervisor address inside the tunnel. |
+| `allowed_inner_cidrs` | one-item list | IPv4 route containing the inner endpoint; default routes are refused. |
+| `mtu` | integer | Optional, defaults to 1280; range 1200–1420. |
+| `keepalive_seconds` | integer | Optional, defaults to 25; range 5–120. |
+
+Add an exact `protocol: wireguard-udp` endpoint for `endpoint_host` and `endpoint_udp_port`. This endpoint only permits the supervisor's UDP socket; it never grants workload TCP access. Add a separate inner endpoint with an IPv4 `host`, one `port`, `allowed_ips` containing exactly that IPv4 address, and `tunnel_id` equal to the tunnel name. The inner endpoint's protocol, TLS mode, L7 rules, credential binding, and `upstream_ca_pem` still govern traffic. A tunnel failure refuses the connection without a direct fallback. WireGuard authenticates the appliance public key and does not use a CA.
+
+```yaml
+tunnels:
+  customer:
+    endpoint_host: 198.51.100.20
+    endpoint_udp_port: 51820
+    peer_public_key: AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+    private_key_env_key: OPENSHELL_WG_PRIVATE_KEY
+    local_address: 10.80.0.1/32
+    allowed_inner_cidrs: [10.80.0.2/32]
+network_policies:
+  appliance_transport:
+    endpoints:
+      - host: 198.51.100.20
+        port: 51820
+        protocol: wireguard-udp
+  appliance_service:
+    endpoints:
+      - host: 10.80.0.2
+        port: 8080
+        allowed_ips: [10.80.0.2]
+        tunnel_id: customer
+    binaries:
+      - path: /usr/bin/example-app
+```
+
+The example uses scalar `port`; policy parsing and the OPA adapter normalize it to a one-element `ports` list. The `wireguard-udp` entry is supervisor-only even if a binary is listed under its policy rule.
 
 ### Network Policy Entry
 
@@ -152,7 +198,7 @@ Each entry in the `network_policies` map has the following fields:
 |---|---|---|---|
 | `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
 | `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
-| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+| `binaries` | list of binary objects | Conditional | Required for workload endpoints. May be omitted when the rule contains only a `wireguard-udp` endpoint; that endpoint authorizes only the supervisor's UDP socket. |
 
 ### Endpoint Object
 
@@ -163,9 +209,10 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `host` | string | Conditional | Hostname or IP address. Required for `protocol: tcp`; transparent TCP requires a valid DNS hostname and rejects literal IPs. A non-TCP proxy endpoint may omit `host` only when `allowed_ips` supplies the destination constraint. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. Prefer exact hosts for `protocol: tcp`: a wildcard authorizes DNS queries for all matching names and can provide a DNS-label exfiltration channel. |
 | `port` | integer | Yes | TCP port number. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
-| `protocol` | string | No | Set to `tcp` with a valid DNS hostname to allow native TCP clients through policy DNS and transparent capture without payload inspection. Omit the field for L4 passthrough through an explicit proxy, including legacy hostless `allowed_ips` endpoints. Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, `mcp` for MCP Streamable HTTP request inspection, or `json-rpc` for generic JSON-RPC-over-HTTP method inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
+| `protocol` | string | No | Set to `tcp` with a valid DNS hostname to allow native TCP clients through policy DNS and transparent capture without payload inspection. Omit the field for L4 passthrough through an explicit proxy, including legacy hostless `allowed_ips` endpoints. Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, `mcp` for MCP Streamable HTTP request inspection, or `json-rpc` for generic JSON-RPC-over-HTTP method inspection. `wireguard-udp` is reserved for the exact supervisor-owned appliance socket and never authorizes workload traffic. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Provider-credentialed endpoints require an inspected protocol unless `allow_uninspected_credentials` is explicitly set. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. Provider-credentialed endpoints reject `tls: skip` unless `allow_uninspected_credentials` is explicitly set. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `upstream_ca_pem` | string | No | PEM-encoded CA certificate bundle trusted only for the supervisor's TLS connection to this endpoint. Use a YAML block scalar containing one or more `-----BEGIN CERTIFICATE-----` blocks. The supervisor adds these certificates to its normal system roots for this endpoint only; it still terminates client TLS, inspects requests, and rewrites credentials. Cannot be combined with `tls: skip` or `protocol: tcp`. Do not include private keys. |
+| `tunnel_id` | string | No | Name of the supervisor tunnel used for this inner IPv4 destination after endpoint authorization. Phase 1 allows one inner endpoint and one port. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. Not valid on `protocol: mcp` or `protocol: json-rpc`; MCP uses explicit rules unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile, and JSON-RPC always uses explicit rules. |
 | `rules` | list of allow rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |

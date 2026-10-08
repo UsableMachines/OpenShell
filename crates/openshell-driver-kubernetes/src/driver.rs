@@ -1982,26 +1982,9 @@ impl KubernetesComputeDriver {
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let selector = self.sandbox_lookup_selector(sandbox_id);
-        let list = tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            lookup_api
-                .api
-                .list(&ListParams::default().labels(&selector)),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(format!(
-                "timed out after {}s waiting for Kubernetes API",
-                KUBE_API_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(KubernetesDriverError::from_kube)?;
-        let object = list
-            .items
-            .into_iter()
-            .next()
-            .ok_or(KubernetesDriverError::NotFound)?;
+        let object = self
+            .resolve_operating_state_object(&lookup_api, sandbox_id)
+            .await?;
         let namespace = object
             .metadata
             .namespace
@@ -2059,6 +2042,82 @@ impl KubernetesComputeDriver {
             namespace,
             stop_timeout,
         ))
+    }
+
+    /// Resolve the Sandbox CR an operating-state patch (stop/start) must act
+    /// on. Direct-mode sandboxes carry the gateway labels, so the id-label
+    /// selector finds them. In claim mode the bound Sandbox is pool-generated
+    /// and carries no gateway labels — the id label lives on the SandboxClaim,
+    /// and `claim.status.sandbox.name` names the bound CR (the same resolution
+    /// get_sandbox and delete_sandbox already do for claims). Without this,
+    /// stop/start on a claimed sandbox always failed with NotFound.
+    async fn resolve_operating_state_object(
+        &self,
+        lookup_api: &AgentSandboxApi,
+        sandbox_id: &str,
+    ) -> Result<DynamicObject, KubernetesDriverError> {
+        let selector = self.sandbox_lookup_selector(sandbox_id);
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api.api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        if let Some(object) = list.items.into_iter().next() {
+            return Ok(object);
+        }
+        if !self.is_claim_mode() {
+            return Err(KubernetesDriverError::NotFound);
+        }
+        let claim_api = self.claim_api();
+        let claims = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            claim_api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        let claim = claims
+            .items
+            .into_iter()
+            .next()
+            .ok_or(KubernetesDriverError::NotFound)?;
+        let bound_name = claim
+            .data
+            .get("status")
+            .and_then(|status| status.get("sandbox"))
+            .and_then(|sandbox| sandbox.get("name"))
+            .and_then(|name| name.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                KubernetesDriverError::Message(
+                    "sandbox claim is not bound to a sandbox yet".to_string(),
+                )
+            })?;
+        let object = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api.api.get(&bound_name),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        Ok(object)
     }
 
     #[tracing::instrument(

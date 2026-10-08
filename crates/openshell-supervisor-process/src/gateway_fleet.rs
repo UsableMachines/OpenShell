@@ -58,7 +58,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use openshell_core::gateway_fleet::{FleetConfig, resolve_members, subset_for};
+use openshell_core::gateway_fleet::{
+    FleetConfig, endpoint_shape, member_endpoint, resolve_members, subset_for,
+};
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::{debug, info, warn};
 
@@ -136,56 +138,7 @@ pub async fn unary_endpoint(
     sandbox_id: &str,
     attempt: usize,
 ) -> Option<String> {
-    let Some((scheme, port)) = endpoint_shape(configured_endpoint) else {
-        return Some(configured_endpoint.to_string());
-    };
-    let Some(fleet) = FleetConfig::from_env(port) else {
-        return Some(configured_endpoint.to_string());
-    };
-
-    let members = match resolve_members(&fleet.dns_name, port).await {
-        Ok(members) if !members.is_empty() => members,
-        Ok(_) => {
-            warn!(
-                fleet_dns_name = %fleet.dns_name,
-                "gateway fleet resolved to no endpoints; cannot address a replica yet"
-            );
-            return None;
-        }
-        Err(error) => {
-            warn!(
-                fleet_dns_name = %fleet.dns_name,
-                error = %error,
-                "could not resolve the gateway fleet; cannot address a replica yet"
-            );
-            return None;
-        }
-    };
-
-    // The subset this sandbox's sessions will use, so a policy fetch warms the
-    // same replicas rather than a third set. Any replica can serve it — it is a
-    // store read — so falling back to the full membership is harmless.
-    let subset = subset_for(sandbox_id, &members, fleet.subset_size);
-    let pool = if subset.is_empty() { members } else { subset };
-
-    Some(member_endpoint(&scheme, &pool[attempt % pool.len()]))
-}
-
-/// Split a gateway endpoint URL into the scheme and port to reuse when
-/// addressing individual replicas.
-///
-/// A replica is dialed at the same scheme and port as the configured
-/// endpoint, differing only in host — the fleet is uniform by construction,
-/// being one Deployment behind one Service.
-fn endpoint_shape(endpoint: &str) -> Option<(String, u16)> {
-    let (scheme, rest) = endpoint.split_once("://")?;
-    let host_and_port = rest.split('/').next().unwrap_or(rest);
-    let port = host_and_port.rsplit_once(':')?.1.parse::<u16>().ok()?;
-    Some((scheme.to_string(), port))
-}
-
-fn member_endpoint(scheme: &str, member: &str) -> String {
-    format!("{scheme}://{member}")
+    openshell_core::gateway_fleet::unary_endpoint(configured_endpoint, sandbox_id, attempt).await
 }
 
 /// One held session, and when it should be given up.

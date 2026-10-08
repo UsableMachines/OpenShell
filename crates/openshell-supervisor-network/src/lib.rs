@@ -19,6 +19,8 @@ pub mod proxy;
 pub mod run;
 pub mod sigv4;
 mod token_grant;
+mod tunnel;
+pub use tunnel::TunnelManager;
 pub mod upstream_proxy;
 
 #[cfg(test)]
