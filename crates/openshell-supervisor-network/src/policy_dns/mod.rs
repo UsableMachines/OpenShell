@@ -602,6 +602,46 @@ landlock: { compatibility: best_effort }
 process: { run_as_user: sandbox, run_as_group: sandbox }
 ";
 
+    const NO_TCP_POLICY: &str = r"
+network_policies: {}
+filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
+landlock: { compatibility: best_effort }
+process: { run_as_user: sandbox, run_as_group: sandbox }
+";
+
+    #[tokio::test]
+    async fn no_tcp_policy_has_no_mapping_until_reload_adds_endpoint() {
+        let service = service(NO_TCP_POLICY, vec!["10.2.3.4".parse().unwrap()]);
+        let now = Instant::now();
+        assert!(matches!(
+            service
+                .answer_query("db.example", AddressFamily::Ipv4, now)
+                .await,
+            Err(PolicyDnsError::Ineligible)
+        ));
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            service
+                .store
+                .lookup("198.18.0.1".parse().unwrap(), 5432, 0, now),
+            Err(MappingLookupError::Missing)
+        ));
+
+        service
+            .policy
+            .reload(include_str!("../../data/sandbox-policy.rego"), BASE_POLICY)
+            .unwrap();
+        let answer = service
+            .answer_query("db.example", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service
+            .store
+            .lookup(answer.address, 5432, answer.policy_generation, now)
+            .unwrap();
+        assert_eq!(mapping.record.normalized_name.as_str(), "db.example");
+    }
+
     #[tokio::test]
     async fn refuses_ineligible_name_before_upstream_resolution() {
         let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);

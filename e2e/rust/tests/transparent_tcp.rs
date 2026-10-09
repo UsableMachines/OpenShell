@@ -88,6 +88,19 @@ fn write_policy() -> Result<NamedTempFile, String> {
     )
 }
 
+fn write_policy_without_tcp() -> Result<NamedTempFile, String> {
+    let full = write_policy()?;
+    let text = std::fs::read_to_string(full.path()).map_err(|error| error.to_string())?;
+    let static_fields = text
+        .split_once("network_policies:\n")
+        .ok_or("TCP policy has no network_policies section")?
+        .0;
+    let mut file = NamedTempFile::new().map_err(|error| error.to_string())?;
+    write!(file, "{static_fields}network_policies: {{}}\n").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())?;
+    Ok(file)
+}
+
 fn write_policy_for(host: &str) -> Result<NamedTempFile, String> {
     write_policy_for_identity(host, "sandbox", "sandbox", &[], &[FIXTURE_PORT])
 }
@@ -367,4 +380,69 @@ print('transparent-tcp-e2e-ok')
     assert!(logs.contains("transparent_tcp_port_mismatch"), "{logs}");
 
     sandbox.cleanup().await;
+}
+
+#[tokio::test]
+async fn native_tcp_endpoint_added_after_sandbox_start_carries_traffic() {
+    if !is_e2e_driver("docker") && !is_e2e_driver("podman") {
+        return;
+    }
+
+    let fixture = SupportContainer::start_python(
+        FIXTURE_ALIAS,
+        &format!(
+            r#"import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', {FIXTURE_PORT}))
+s.listen()
+while True:
+  c, _ = s.accept()
+  c.sendall(b'hot-reload-tcp-ok:' + c.recv(1024))
+  c.close()
+"#
+        ),
+        FIXTURE_PORT,
+    )
+    .await
+    .expect("start TCP fixture");
+    let initial = write_policy_without_tcp().expect("write initial policy");
+    let updated = write_policy().expect("write updated policy");
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &["--policy", initial.path().to_str().unwrap(), "--no-tty"],
+        &["sh", "-c", "echo Ready; sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create sandbox without TCP endpoints");
+
+    run_cli(&[
+        "policy",
+        "set",
+        &sandbox.name,
+        "--policy",
+        updated.path().to_str().unwrap(),
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await
+    .expect("reload policy with TCP endpoint");
+
+    let script = format!(
+        r#"import socket
+with socket.create_connection(({FIXTURE_ALIAS:?}, {FIXTURE_PORT}), timeout=10) as conn:
+    conn.sendall(b'probe')
+    assert conn.recv(1024) == b'hot-reload-tcp-ok:probe'
+print('hot-reload-tcp-ok')
+"#
+    );
+    let output = sandbox
+        .exec(&["python3", "-c", &script])
+        .await
+        .expect("connect after policy reload");
+    assert!(output.contains("hot-reload-tcp-ok"), "{output}");
+
+    sandbox.cleanup().await;
+    drop(fixture);
 }

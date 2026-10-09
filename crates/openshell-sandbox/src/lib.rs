@@ -438,7 +438,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     let transparent_tcp_capable = false;
     #[cfg(target_os = "linux")]
-    let transparent_runtime = if transparent_tcp_requested {
+    // Install the static fence before any TCP endpoint is approved so a later
+    // policy reload only needs to publish its dynamic DNS mapping.
+    let transparent_runtime = if transparent_tcp_requested
+        || (transparent_tcp_capable && netns.is_some())
+    {
         if !transparent_tcp_capable {
             ocsf_emit!(
                 ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -5448,6 +5452,58 @@ network_policies:
         assert!(report.2.contains("previous policy remains active"));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn poll_accepts_first_tcp_expansion_with_startup_substrate() {
+        let v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let v2 = settings_poll_result(
+            Some(proto_tcp_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        assert!(
+            engine
+                .policy_dns_eligibility_snapshot()
+                .unwrap()
+                .endpoints
+                .is_empty()
+        );
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let mut ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        ctx.transparent_tcp = TransparentTcpReloadState {
+            capable: true,
+            substrate_ready: true,
+        };
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(
+            engine
+                .policy_dns_eligibility_snapshot()
+                .unwrap()
+                .endpoints
+                .len(),
+            1
+        );
         handle.abort();
     }
 
