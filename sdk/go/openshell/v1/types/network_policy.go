@@ -17,11 +17,13 @@ type NetworkPolicyRule struct {
 // as used in sandbox network policy rules. This is distinct from [NetworkEndpoint]
 // which is the simplified profile-level endpoint (Host, Port, Protocol only).
 type PolicyNetworkEndpoint struct {
-	Host                         string
-	Port                         uint32
-	Ports                        []uint32
-	Protocol                     string
-	TLS                          string
+	Host     string
+	Port     uint32
+	Ports    []uint32
+	Protocol string
+	TLS      string
+	// UpstreamCAPEM adds trust anchors only for this endpoint's upstream TLS connection.
+	UpstreamCAPEM                string
 	Enforcement                  string
 	Access                       string
 	Rules                        []L7Rule

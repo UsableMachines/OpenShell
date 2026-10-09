@@ -23,6 +23,7 @@ func TestNetworkPolicyRuleFromProto(t *testing.T) {
 				Port:                         443,
 				Protocol:                     "rest",
 				Tls:                          "strict",
+				UpstreamCaPem:                "test-ca-pem",
 				Enforcement:                  "enforce",
 				Access:                       "allow",
 				Ports:                        []uint32{80, 443},
@@ -102,6 +103,7 @@ func TestNetworkPolicyRuleFromProto(t *testing.T) {
 	assert.Equal(t, uint32(443), ep.Port)
 	assert.Equal(t, "rest", ep.Protocol)
 	assert.Equal(t, "strict", ep.TLS)
+	assert.Equal(t, "test-ca-pem", ep.UpstreamCAPEM)
 	assert.Equal(t, "enforce", ep.Enforcement)
 	assert.Equal(t, "allow", ep.Access)
 	assert.Equal(t, []uint32{80, 443}, ep.Ports)
@@ -182,6 +184,7 @@ func TestNetworkPolicyRuleRoundTrip(t *testing.T) {
 				Port:                         8080,
 				Protocol:                     "graphql",
 				TLS:                          "permissive",
+				UpstreamCAPEM:                "roundtrip-ca-pem",
 				Enforcement:                  "audit",
 				Access:                       "allow",
 				Ports:                        []uint32{8080, 8443},
@@ -257,6 +260,7 @@ func TestNetworkPolicyRuleRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Endpoints[0].Port, roundTrip.Endpoints[0].Port)
 	assert.Equal(t, original.Endpoints[0].Protocol, roundTrip.Endpoints[0].Protocol)
 	assert.Equal(t, original.Endpoints[0].TLS, roundTrip.Endpoints[0].TLS)
+	assert.Equal(t, original.Endpoints[0].UpstreamCAPEM, roundTrip.Endpoints[0].UpstreamCAPEM)
 	assert.Equal(t, original.Endpoints[0].Enforcement, roundTrip.Endpoints[0].Enforcement)
 	assert.Equal(t, original.Endpoints[0].Access, roundTrip.Endpoints[0].Access)
 	assert.Equal(t, original.Endpoints[0].Ports, roundTrip.Endpoints[0].Ports)

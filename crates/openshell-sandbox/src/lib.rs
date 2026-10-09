@@ -674,17 +674,23 @@ pub async fn run_sandbox(
         let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
         let denial_workspace_gate = workspace_rx.clone();
         let denial_workspace_rx = workspace_rx.clone();
+        // Fleet subset routing hashes the sandbox UUID, matching the
+        // supervisor sessions; the name fallback covers sandboxes that only
+        // have a name.
+        let agg_id = sandbox_id.clone().unwrap_or_else(|| agg_name.clone());
 
         tokio::spawn(async move {
             aggregator
                 .run(
                     |summaries| {
                         let endpoint = agg_endpoint.clone();
+                        let sandbox_id = agg_id.clone();
                         let sandbox_name = agg_name.clone();
                         let workspace = denial_workspace_rx.borrow().clone();
                         async move {
                             if let Err(e) = flush_proposals_to_gateway(
                                 &endpoint,
+                                &sandbox_id,
                                 &sandbox_name,
                                 &workspace,
                                 summaries,
@@ -719,17 +725,21 @@ pub async fn run_sandbox(
         let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
         let activity_workspace_gate = workspace_rx.clone();
         let activity_workspace_rx = workspace_rx.clone();
+        // Same fleet routing identity as the denial flush.
+        let agg_id = sandbox_id.clone().unwrap_or_else(|| agg_name.clone());
 
         tokio::spawn(async move {
             aggregator
                 .run(
                     move |summary| {
                         let endpoint = agg_endpoint.clone();
+                        let sandbox_id = agg_id.clone();
                         let sandbox_name = agg_name.clone();
                         let workspace = activity_workspace_rx.borrow().clone();
                         async move {
                             if let Err(e) = flush_activity_to_gateway(
                                 &endpoint,
+                                &sandbox_id,
                                 &sandbox_name,
                                 &workspace,
                                 summary,
@@ -1506,15 +1516,13 @@ fn process_policy_for_topology(
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
 async fn flush_proposals_to_gateway(
     endpoint: &str,
+    sandbox_id: &str,
     sandbox_name: &str,
     workspace: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialSummary, L7RequestSample};
-
-    let client = CachedOpenShellClient::connect(endpoint).await?;
-    client.set_workspace(workspace.to_string());
 
     let proto_summaries: Vec<DenialSummary> = summaries
         .into_iter()
@@ -1560,15 +1568,32 @@ async fn flush_proposals_to_gateway(
         "Flushed denial analysis to gateway"
     );
 
-    client
-        .submit_policy_analysis(
-            sandbox_name,
-            proto_summaries,
-            proposals,
-            Vec::new(),
-            "mechanistic",
-        )
-        .await?;
+    // The configured endpoint is the headless Service — a discovery address
+    // the gateway's serving certificate deliberately omits, so dialling it
+    // fails the TLS handshake. Address a fleet replica instead, like every
+    // other unary RPC this sandbox makes.
+    grpc_retry_on_fleet("Denial analysis flush", endpoint, sandbox_id, |target| {
+        // Cloned per attempt: the retry calls this more than once.
+        let workspace = workspace.to_string();
+        let sandbox_name = sandbox_name.to_string();
+        let proto_summaries = proto_summaries.clone();
+        let proposals = proposals.clone();
+        async move {
+            let client = CachedOpenShellClient::connect(&target).await?;
+            client.set_workspace(workspace);
+            client
+                .submit_policy_analysis(
+                    &sandbox_name,
+                    proto_summaries,
+                    proposals,
+                    Vec::new(),
+                    "mechanistic",
+                )
+                .await?;
+            Ok(())
+        }
+    })
+    .await?;
 
     Ok(())
 }
@@ -1576,15 +1601,13 @@ async fn flush_proposals_to_gateway(
 /// Flush an anonymous activity summary to the gateway via `SubmitPolicyAnalysis`.
 async fn flush_activity_to_gateway(
     endpoint: &str,
+    sandbox_id: &str,
     sandbox_name: &str,
     workspace: &str,
     summary: activity_aggregator::FlushableActivitySummary,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
-
-    let client = CachedOpenShellClient::connect(endpoint).await?;
-    client.set_workspace(workspace.to_string());
 
     let proto_summary = NetworkActivitySummary {
         network_activity_count: summary.network_activity_count,
@@ -1606,15 +1629,29 @@ async fn flush_activity_to_gateway(
         "Flushed activity summary to gateway"
     );
 
-    client
-        .submit_policy_analysis(
-            sandbox_name,
-            Vec::new(),
-            Vec::new(),
-            vec![proto_summary],
-            "activity",
-        )
-        .await?;
+    // Same fleet contract as the denial flush: the configured endpoint is a
+    // discovery address, never dialled.
+    grpc_retry_on_fleet("Activity summary flush", endpoint, sandbox_id, |target| {
+        // Cloned per attempt: the retry calls this more than once.
+        let workspace = workspace.to_string();
+        let sandbox_name = sandbox_name.to_string();
+        let proto_summary = proto_summary.clone();
+        async move {
+            let client = CachedOpenShellClient::connect(&target).await?;
+            client.set_workspace(workspace);
+            client
+                .submit_policy_analysis(
+                    &sandbox_name,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![proto_summary],
+                    "activity",
+                )
+                .await?;
+            Ok(())
+        }
+    })
+    .await?;
 
     Ok(())
 }
@@ -3484,7 +3521,18 @@ async fn report_initial_policy_failure(
     }) else {
         return;
     };
-    let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
+    // Fleet-addressed like every other unary RPC: the configured endpoint is
+    // a discovery address the serving certificate deliberately omits.
+    let client = match grpc_retry_on_fleet(
+        "Initial policy failure connect",
+        endpoint,
+        sandbox_id,
+        |target| async move {
+            openshell_core::grpc_client::CachedOpenShellClient::connect(&target).await
+        },
+    )
+    .await
+    {
         Ok(client) => client,
         Err(e) => {
             warn!(error = %e, "Failed to connect to report initial policy failure");

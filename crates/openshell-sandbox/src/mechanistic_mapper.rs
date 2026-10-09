@@ -142,7 +142,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             }
         };
 
-        let binaries: Vec<NetworkBinary> = if binary.is_empty() {
+        let binaries: Vec<NetworkBinary> = if is_unknown_binary(binary) {
             vec![]
         } else {
             let mut proposal_binary = NetworkBinary {
@@ -169,7 +169,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         let confidence = compute_confidence(total_count, *port as u16, is_ssrf);
 
         // Generate rationale.
-        let binary_list = if binary.is_empty() {
+        let binary_list = if is_unknown_binary(binary) {
             "unknown binary".to_string()
         } else {
             short_binary_name(binary)
@@ -425,6 +425,18 @@ fn short_binary_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// The network supervisor emits `"-"` as the binary placeholder when the
+/// connecting process's executable could not be resolved (the same
+/// convention as the OCSF activity feed). A placeholder must never be copied
+/// into a proposed rule's `binaries` list: a literal `-` binary path renders
+/// the serialized policy YAML ambiguous (`path: -` parses as a block-sequence
+/// indicator), breaking every consumer that round-trips the policy through
+/// YAML — the gateway prover validation, which rejects the proposal as
+/// "validation unavailable", and the sandbox's `policy.local` reload.
+fn is_unknown_binary(binary: &str) -> bool {
+    binary.is_empty() || binary == "-"
+}
+
 /// Check if a destination host is always-blocked.
 ///
 /// For literal IP hosts, checks against [`is_always_blocked_ip`].
@@ -546,6 +558,60 @@ mod tests {
 
         // Proposals never include allowed_ips (two-step approval flow).
         assert!(rule.endpoints[0].allowed_ips.is_empty());
+    }
+
+    #[test]
+    fn test_generate_proposals_placeholder_binary_is_unknown() {
+        // The supervisor emits "-" when the connecting process's executable
+        // could not be resolved. The mapper must treat it as "unknown" —
+        // copying the placeholder into the rule breaks the gateway prover,
+        // whose YAML round-trip cannot re-parse `path: -` (block-sequence
+        // indicator), and poisons the sandbox policy on approval.
+        let summaries = vec![DenialSummary {
+            sandbox_id: "test".to_string(),
+            host: "example.com".to_string(),
+            port: 443,
+            binary: "-".to_string(),
+            ancestors: vec![],
+            deny_reason: "no matching policy".to_string(),
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            count: 3,
+            suppressed_count: 0,
+            total_count: 3,
+            sample_cmdlines: vec![],
+            binary_sha256: String::new(),
+            persistent: false,
+            denial_stage: "connect".to_string(),
+            l7_request_samples: vec![],
+            l7_inspection_active: false,
+        }];
+
+        let proposals = generate_proposals(&summaries);
+        assert_eq!(proposals.len(), 1);
+        let rule = proposals[0].proposed_rule.as_ref().unwrap();
+        assert!(
+            rule.binaries.is_empty(),
+            "placeholder binary must not enter the rule"
+        );
+        assert!(proposals[0].rationale.contains("unknown binary"));
+
+        // The proposed rule must survive the same serialize → parse
+        // round-trip the gateway prover runs on the merged policy.
+        let merged = openshell_policy::merge_policy(
+            openshell_core::proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            },
+            &[openshell_policy::PolicyMergeOp::AddRule {
+                rule_name: proposals[0].rule_name.clone(),
+                rule: rule.clone(),
+            }],
+        )
+        .expect("merge")
+        .policy;
+        let yaml = openshell_policy::serialize_sandbox_policy(&merged).expect("serialize");
+        openshell_policy::parse_sandbox_policy(&yaml).expect("policy YAML must round-trip");
     }
 
     #[test]

@@ -139,6 +139,8 @@ impl CertCache {
 pub struct ProxyTlsState {
     cert_cache: CertCache,
     upstream_config: Arc<ClientConfig>,
+    upstream_roots: Option<rustls::RootCertStore>,
+    endpoint_configs: Mutex<HashMap<String, Arc<ClientConfig>>>,
 }
 
 impl ProxyTlsState {
@@ -147,7 +149,15 @@ impl ProxyTlsState {
         Self {
             cert_cache,
             upstream_config,
+            upstream_roots: None,
+            endpoint_configs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Attach the same system roots used by the default upstream config.
+    pub fn with_upstream_roots(mut self, system_ca_bundle: &str) -> Result<Self> {
+        self.upstream_roots = Some(build_upstream_root_store(system_ca_bundle)?);
+        Ok(self)
     }
 
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
@@ -164,6 +174,257 @@ impl ProxyTlsState {
     /// Returns a reference to the upstream client config.
     pub fn upstream_config(&self) -> &Arc<ClientConfig> {
         &self.upstream_config
+    }
+
+    /// Return an endpoint-only upstream verifier with system roots plus its CA.
+    /// The PEM content is the cache key, so changed policy content cannot reuse
+    /// an old verifier; the bounded cache avoids retaining removed policies.
+    pub fn endpoint_upstream_config(&self, pem: &str) -> Result<Arc<ClientConfig>> {
+        if pem.is_empty() {
+            return Ok(Arc::clone(&self.upstream_config));
+        }
+        let mut cache = self
+            .endpoint_configs
+            .lock()
+            .map_err(|_| miette!("endpoint TLS config cache lock poisoned"))?;
+        if let Some(config) = cache.get(pem) {
+            return Ok(Arc::clone(config));
+        }
+        let mut roots = self
+            .upstream_roots
+            .clone()
+            .ok_or_else(|| miette!("system upstream roots unavailable"))?;
+        let (added, ignored) = load_pem_certs_into_store(&mut roots, pem);
+        if added == 0 || ignored > 0 {
+            return Err(miette!(
+                "endpoint upstream CA contains no usable certificates or malformed certificates"
+            ));
+        }
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let config = Arc::new(config);
+        if cache.len() >= MAX_CACHED_CERTS {
+            cache.clear();
+        }
+        cache.insert(pem.to_string(), Arc::clone(&config));
+        Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_ca_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn client_config_with_test_ca(pem: &str) -> Arc<ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        assert_eq!(load_pem_certs_into_store(&mut roots, pem), (1, 0));
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn endpoint_ca_trust_is_scoped_to_its_upstream_config() {
+        let upstream_ca = SandboxCa::generate().unwrap();
+        #[cfg(feature = "bundled-ca-roots")]
+        let system_ca = SandboxCa::generate().unwrap();
+        #[cfg(feature = "bundled-ca-roots")]
+        let system_pem = system_ca.cert_pem().to_string();
+        #[cfg(not(feature = "bundled-ca-roots"))]
+        let system_pem = String::new();
+        let server = Arc::new(ProxyTlsState::new(
+            CertCache::new(upstream_ca),
+            build_upstream_client_config("").unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pem = server.cert_cache.ca.cert_pem().to_string();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let _ = tls_terminate_client(stream, &server, "private.example.test").await;
+                });
+            }
+        });
+        let client = ProxyTlsState::new(
+            CertCache::new(SandboxCa::generate().unwrap()),
+            build_upstream_client_config(&system_pem).unwrap(),
+        )
+        .with_upstream_roots(&system_pem)
+        .unwrap();
+        let scoped = client.endpoint_upstream_config(&pem).unwrap();
+        let stream = TcpStream::connect(address).await.unwrap();
+        tls_connect_upstream(stream, "private.example.test", &scoped)
+            .await
+            .expect("endpoint CA should verify upstream");
+        let stream = TcpStream::connect(address).await.unwrap();
+        assert!(
+            tls_connect_upstream(stream, "private.example.test", client.upstream_config())
+                .await
+                .is_err(),
+            "default upstream config must not trust endpoint CA"
+        );
+        assert!(Arc::ptr_eq(
+            &scoped,
+            &client.endpoint_upstream_config(&pem).unwrap()
+        ));
+        assert!(!client.upstream_roots.as_ref().unwrap().roots.is_empty());
+
+        #[cfg(feature = "bundled-ca-roots")]
+        {
+            let system_server = Arc::new(ProxyTlsState::new(
+                CertCache::new(system_ca),
+                build_upstream_client_config("").unwrap(),
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let _ =
+                        tls_terminate_client(stream, &system_server, "system.example.test").await;
+                }
+            });
+            let stream = TcpStream::connect(address).await.unwrap();
+            tls_connect_upstream(stream, "system.example.test", client.upstream_config())
+                .await
+                .expect("default config must retain system roots");
+            let stream = TcpStream::connect(address).await.unwrap();
+            tls_connect_upstream(stream, "system.example.test", &scoped)
+                .await
+                .expect("endpoint config must retain system roots");
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_ca_keeps_tls_termination_and_credential_relay() {
+        use crate::l7::relay::{L7EvalContext, relay_passthrough_with_credentials};
+        use crate::opa::OpaEngine;
+        use openshell_core::secrets::SecretResolver;
+
+        let proxy_ca = SandboxCa::generate().unwrap();
+        let proxy_pem = proxy_ca.cert_pem().to_string();
+        let upstream_ca = SandboxCa::generate().unwrap();
+        let upstream_pem = upstream_ca.cert_pem().to_string();
+        let upstream_state = ProxyTlsState::new(
+            CertCache::new(upstream_ca),
+            build_upstream_client_config("").unwrap(),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = upstream_listener.accept().await.unwrap();
+            let mut tls = tls_terminate_client(socket, &upstream_state, "api.example.test")
+                .await
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut buf = [0u8; 512];
+                let n = tokio::time::timeout(std::time::Duration::from_secs(3), tls.read(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    n > 0 && request.len() + n <= 2048,
+                    "HTTP request headers incomplete or too large"
+                );
+                request.extend_from_slice(&buf[..n]);
+            }
+            captured_tx
+                .send(String::from_utf8_lossy(&request).to_string())
+                .unwrap();
+            tls.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("API_TOKEN".to_string(), "real-secret".to_string())).collect(),
+        );
+        let placeholder = child_env.get("API_TOKEN").unwrap().clone();
+        let proxy_state = ProxyTlsState::new(
+            CertCache::new(proxy_ca),
+            build_upstream_client_config("").unwrap(),
+        )
+        .with_upstream_roots("")
+        .unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (client, _) = proxy_listener.accept().await.unwrap();
+            let mut client_tls = tls_terminate_client(client, &proxy_state, "api.example.test")
+                .await
+                .unwrap();
+            let upstream = TcpStream::connect(upstream_addr).await.unwrap();
+            let config = proxy_state.endpoint_upstream_config(&upstream_pem).unwrap();
+            let mut upstream_tls = tls_connect_upstream(upstream, "api.example.test", &config)
+                .await
+                .unwrap();
+            let engine = OpaEngine::from_strings(
+                include_str!("../../data/sandbox-policy.rego"),
+                "network_policies: {}\n",
+            )
+            .unwrap();
+            let guard = engine
+                .generation_guard(engine.current_generation())
+                .unwrap();
+            let ctx = L7EvalContext {
+                host: "api.example.test".into(),
+                port: 443,
+                request_default_port: Some(443),
+                secret_resolver: resolver.map(Arc::new),
+                ..Default::default()
+            };
+            relay_passthrough_with_credentials(
+                &mut client_tls,
+                &mut upstream_tls,
+                &ctx,
+                &guard,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let client_config = client_config_with_test_ca(&proxy_pem);
+        let socket = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut client_tls = tls_connect_upstream(socket, "api.example.test", &client_config)
+            .await
+            .unwrap();
+        client_tls.write_all(format!("GET / HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(3), captured_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            request.contains("Authorization: Bearer real-secret"),
+            "upstream received: {request:?}"
+        );
+        assert!(!request.contains(&placeholder));
+        let mut response = [0u8; 256];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client_tls.read(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 204"));
+        drop(client_tls);
+        tokio::time::timeout(std::time::Duration::from_secs(3), proxy_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 

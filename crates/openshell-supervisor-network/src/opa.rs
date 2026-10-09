@@ -1955,6 +1955,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.tls.is_empty() {
                         ep["tls"] = e.tls.clone().into();
                     }
+                    if !e.upstream_ca_pem.is_empty() {
+                        ep["upstream_ca_pem"] = e.upstream_ca_pem.clone().into();
+                    }
                     if !e.enforcement.is_empty() {
                         ep["enforcement"] = e.enforcement.clone().into();
                     }
@@ -4958,6 +4961,35 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn endpoint_ca_survives_proto_to_opa_selection_without_l7_protocol() {
+        let mut policy = test_proto();
+        let ca_pem = crate::l7::tls::SandboxCa::generate()
+            .unwrap()
+            .cert_pem()
+            .to_string();
+        let endpoint = &mut policy
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints[0];
+        endpoint.upstream_ca_pem = ca_pem.clone();
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine.query_endpoint_config(&input).unwrap().unwrap();
+        assert_eq!(
+            get_str(&config, "upstream_ca_pem").as_deref(),
+            Some(ca_pem.as_str())
+        );
     }
 
     #[test]
