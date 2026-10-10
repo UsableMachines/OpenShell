@@ -1384,6 +1384,18 @@ async fn require_current_proposal_evaluation(
     chunk: &DraftChunkRecord,
     supplied_review_token: Option<&str>,
 ) -> Result<ProposalEvaluation, Status> {
+    if chunk.rule_name.starts_with("advisor_ca_") {
+        let rule = decode_draft_chunk_rule(chunk)?;
+        if rule.as_ref().is_none_or(|rule| {
+            rule.endpoints.len() != 1
+                || rule.endpoints[0].host.contains('*')
+                || rule.endpoints[0].upstream_ca_pem.is_empty()
+        }) {
+            return Err(Status::failed_precondition(
+                "verified upstream_ca_pem for one exact host is required before approval",
+            ));
+        }
+    }
     if !chunk.review_token.is_empty()
         && supplied_review_token.is_some_and(|token| token != chunk.review_token)
     {
@@ -4386,14 +4398,12 @@ pub(super) async fn handle_submit_policy_analysis(
         }
 
         let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
-        if req.analysis_mode == "agent_authored"
-            && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
-                openshell_policy::agent_authored_transport_rejection(
-                    &endpoint.protocol,
-                    &endpoint.tls,
-                )
-            })
-        {
+        if matches!(
+            req.analysis_mode.as_str(),
+            "agent_authored" | "gateway_event"
+        ) && let Some(reason) = rule_ref.endpoints.iter().find_map(|endpoint| {
+            openshell_policy::agent_authored_transport_rejection(&endpoint.protocol, &endpoint.tls)
+        }) {
             rejected += 1;
             rejection_reasons.push(format!("chunk '{}': {reason}", chunk.rule_name));
             continue;
@@ -4478,7 +4488,21 @@ pub(super) async fn handle_submit_policy_analysis(
                 None,
             );
         }
-        if req.analysis_mode != "mechanistic" && !evaluation.application_error.is_empty() {
+        let awaiting_ca = req.analysis_mode == "gateway_event"
+            && chunk.stage == "upstream_tls"
+            && rule_ref
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.upstream_ca_pem.is_empty());
+        if awaiting_ca {
+            evaluation.application_error =
+                "verified upstream_ca_pem required before approval".to_string();
+            evaluation.review_token.clear();
+        }
+        if req.analysis_mode != "mechanistic"
+            && !awaiting_ca
+            && !evaluation.application_error.is_empty()
+        {
             rejected += 1;
             rejection_reasons.push(format!(
                 "chunk '{}': {}",
@@ -4605,6 +4629,7 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
+            && req.analysis_mode != "gateway_event"
             && let Err(err) = Box::pin(auto_approve_chunk(
                 state,
                 &effective_id,
@@ -13278,6 +13303,64 @@ mod tests {
             .upstream_ca_pem
             .clear();
         assert!(!policy_covers_rule(&policy, &proposed_rule));
+    }
+
+    #[tokio::test]
+    async fn gateway_tls_event_waits_for_verified_ca_even_in_auto_mode() {
+        let state = test_server_state().await;
+        let sandbox_name = "gateway-ca-event";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-gateway-ca",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        seed_sandbox_approval_mode(&state, sandbox_name, "auto").await;
+        let rule = NetworkPolicyRule {
+            name: "advisor_ca_internal_443".into(),
+            endpoints: vec![NetworkEndpoint {
+                host: "internal.example.test".into(),
+                port: 443,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.into(),
+                analysis_mode: "gateway_event".into(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: rule.name.clone(),
+                    proposed_rule: Some(rule),
+                    stage: "upstream_tls".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let id = response.accepted_chunk_ids[0].clone();
+        let draft = state.store.get_draft_chunk(&id).await.unwrap().unwrap();
+        assert_eq!(draft.status, "pending");
+        let error = handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                name: sandbox_name.into(),
+                chunk_id: id,
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message().contains("upstream_ca_pem"));
     }
 
     #[tokio::test]

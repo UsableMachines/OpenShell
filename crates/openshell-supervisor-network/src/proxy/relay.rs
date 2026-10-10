@@ -38,6 +38,7 @@ pub(super) struct RelayContext<'a> {
 }
 
 /// Build the request-processing context shared by CONNECT and forward HTTP.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn http_context(
     decision: &EgressDecision,
     provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
@@ -46,6 +47,7 @@ pub(super) fn http_context(
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     workspace: String,
+    policy_local: Option<Arc<crate::policy_local::PolicyLocalContext>>,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
@@ -89,6 +91,7 @@ pub(super) fn http_context(
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
         agent_proposals,
         workspace,
+        policy_local,
     }
 }
 
@@ -358,6 +361,7 @@ mod tests {
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
+            policy_local: None,
         }
     }
 

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
@@ -28,7 +28,7 @@ pub use openshell_core::container_paths::POLICY_ADVISOR_SKILL_PATH as SKILL_PATH
 
 /// Human-readable guidance for agents that are more likely to follow plain
 /// instructions than structured next-step JSON alone.
-pub const AGENT_GUIDANCE: &str = "OpenShell blocked this request with sandbox policy. If the user's task still needs this network action, do not stop here: read /etc/openshell/skills/policy_advisor.md (or $HOME/.claude/skills/policy-advisor/policy_advisor.md in a non-root sandbox), submit the narrowest policy proposal to http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then retry the original request.";
+pub const AGENT_GUIDANCE: &str = "The supervisor observed this failure and submits a pending proposal automatically when possible. Read advisor.proposal_id in this response, tell the user what failed, and wait at http://policy.local/v1/proposals/{proposal_id}/wait?timeout=300. Retry only after approval and policy_reloaded: true. If proposal_id is null, report that no proposal was confirmed.";
 
 /// Routes served by the in-sandbox policy advisor API.
 ///
@@ -91,6 +91,7 @@ pub struct PolicyLocalContext {
     sandbox_name: Option<String>,
     shorthand_log_dir: PathBuf,
     workspace_rx: tokio::sync::watch::Receiver<String>,
+    auto_proposals: Mutex<HashMap<(String, u16), String>>,
 }
 
 impl PolicyLocalContext {
@@ -126,6 +127,7 @@ impl PolicyLocalContext {
             sandbox_name,
             shorthand_log_dir,
             workspace_rx,
+            auto_proposals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -148,6 +150,133 @@ impl PolicyLocalContext {
     #[must_use]
     pub fn agent_proposals_enabled(&self) -> bool {
         self.agent_proposals.enabled()
+    }
+
+    /// Persist an event observed by the supervisor before returning the failure
+    /// to the client. Holding the lock through submission makes concurrent
+    /// failures for one endpoint share the same card in this sandbox session.
+    pub async fn propose_for_event(
+        &self,
+        host: &str,
+        port: u16,
+        binary: &str,
+        tls_ca: bool,
+        l7: Option<(&str, &str)>,
+    ) -> Option<String> {
+        if !self.agent_proposals.enabled()
+            || host.is_empty()
+            || port == 0
+            || matches!(
+                host.to_ascii_lowercase().as_str(),
+                "localhost" | "localhost."
+            )
+            || openshell_core::net::is_known_metadata_hostname(host)
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(openshell_core::net::is_always_blocked_ip)
+        {
+            return None;
+        }
+        let key = (host.to_ascii_lowercase(), port);
+        let mut pending = self.auto_proposals.lock().await;
+        let endpoint = self.gateway_endpoint.as_deref()?;
+        let sandbox_name = self.sandbox_name.as_deref()?;
+        let workspace = self.workspace();
+        if workspace.is_empty() {
+            return None;
+        }
+        let client = connect_gateway_for_rpc(endpoint, sandbox_name).await.ok()?;
+        client.set_workspace(workspace);
+        if let Some(id) = pending.get(&key) {
+            let chunks = client.get_draft_policy(sandbox_name, "").await.ok()?;
+            if chunks
+                .iter()
+                .any(|chunk| chunk.id == *id && chunk.status == "pending")
+            {
+                return Some(id.clone());
+            }
+            pending.remove(&key);
+        }
+        let prefix = if tls_ca {
+            "advisor_ca"
+        } else {
+            "advisor_destination"
+        };
+        let rule_name = format!("{prefix}_{}_{}", key.0.replace(['.', '-'], "_"), port);
+        let l7_path = l7.map(|(_, path)| path.split('?').next().unwrap_or(path));
+        let rule = NetworkPolicyRule {
+            name: rule_name.clone(),
+            endpoints: vec![NetworkEndpoint {
+                host: key.0.clone(),
+                port: u32::from(port),
+                ports: vec![u32::from(port)],
+                advisor_proposed: true,
+                protocol: if l7.is_some() {
+                    "rest".into()
+                } else {
+                    String::new()
+                },
+                enforcement: if l7.is_some() {
+                    "enforce".into()
+                } else {
+                    String::new()
+                },
+                rules: l7
+                    .zip(l7_path)
+                    .map_or_else(Vec::new, |((method, _), path)| {
+                        vec![L7Rule {
+                            allow: Some(L7Allow {
+                                method: method.to_string(),
+                                path: path.to_string(),
+                                ..Default::default()
+                            }),
+                        }]
+                    }),
+                ..Default::default()
+            }],
+            binaries: if binary.is_empty() || binary == "-" {
+                vec![]
+            } else {
+                vec![NetworkBinary {
+                    path: binary.to_string(),
+                    ..Default::default()
+                }]
+            },
+        };
+        let rationale = if tls_ca {
+            format!(
+                "Upstream TLS certificate verification failed for {}:{port}. Supply the service owner's CA PEM in upstream_ca_pem before approval.",
+                key.0
+            )
+        } else {
+            format!("Sandbox policy denied access to {}:{port}.", key.0)
+        };
+        let chunk = PolicyChunk {
+            rule_name,
+            proposed_rule: Some(rule),
+            rationale,
+            stage: if tls_ca {
+                "upstream_tls"
+            } else {
+                "policy_denied"
+            }
+            .into(),
+            security_notes: if tls_ca {
+                "CA trust must be limited to this exact host and port; reviewer must supply a verified PEM.".into()
+            } else {
+                "Review destination and preserve baseline IP restrictions.".into()
+            },
+            confidence: 1.0,
+            ..Default::default()
+        };
+        let response = client
+            .submit_policy_analysis(sandbox_name, vec![], vec![chunk], vec![], "gateway_event")
+            .await
+            .ok()?;
+        let id = response.accepted_chunk_ids.into_iter().next()?;
+        emit_policy_propose_event(&id, &format!("supervisor_event {}:{port}", key.0));
+        pending.insert(key, id.clone());
+        Some(id)
     }
 }
 
@@ -272,10 +401,9 @@ pub fn agent_next_steps(agent_proposals_enabled: bool) -> serde_json::Value {
             "url": format!("http://{host}{ROUTE_DENIALS}?last=5"),
         },
         {
-            "action": "submit_proposal",
-            "method": "POST",
-            "url": format!("http://{host}{ROUTE_PROPOSALS}"),
-            "body_type": "PolicyMergeOperation",
+            "action": "wait_for_approval",
+            "method": "GET",
+            "url_template": format!("http://{host}{ROUTE_PROPOSALS}/{{proposal_id}}/wait?timeout=300"),
         },
     ])
 }
@@ -1993,7 +2121,7 @@ mod tests {
             .filter_map(|v| v.get("action").and_then(serde_json::Value::as_str))
             .collect();
         assert!(actions.contains(&"read_skill"));
-        assert!(actions.contains(&"submit_proposal"));
+        assert!(actions.contains(&"wait_for_approval"));
         assert_eq!(
             steps[0]["alternate_path"],
             "$HOME/.claude/skills/policy-advisor/policy_advisor.md"
@@ -2008,9 +2136,7 @@ mod tests {
     #[test]
     fn agent_guidance_points_to_policy_advisor_when_flag_on() {
         let guidance = agent_guidance_for(true).expect("guidance when proposals are enabled");
-        assert!(guidance.contains("do not stop"));
-        assert!(guidance.contains("/etc/openshell/skills/policy_advisor.md"));
-        assert!(guidance.contains("$HOME/.claude/skills/policy-advisor/policy_advisor.md"));
+        assert!(guidance.contains("advisor.proposal_id"));
         assert!(guidance.contains("http://policy.local/v1/proposals"));
         assert!(guidance.contains("policy_reloaded: true"));
     }
