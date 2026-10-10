@@ -46,6 +46,12 @@ the service owner; never submit a private key. Keep normal TLS inspection
 enabled. A supplemental CA always requires developer review, including in
 auto mode. Retry only after approval and `policy_reloaded: true`.
 
+An explicit proxy may return `200 Connection established` before the TLS
+handshake resets. This can mean the supervisor could not verify the upstream
+certificate. Ask the user or service owner for the CA PEM before proposing
+trust. Do not use `--insecure`, `-k`, or an unverified certificate copied from
+the failed connection. After approval and reload, retry without `--cacert`.
+
 ## Workflow
 
 1. Read the denial response body. Use `layer`, `method`, `path`, `host`,

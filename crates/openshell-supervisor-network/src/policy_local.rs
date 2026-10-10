@@ -28,7 +28,7 @@ pub use openshell_core::container_paths::POLICY_ADVISOR_SKILL_PATH as SKILL_PATH
 
 /// Human-readable guidance for agents that are more likely to follow plain
 /// instructions than structured next-step JSON alone.
-pub const AGENT_GUIDANCE: &str = "OpenShell blocked this request with sandbox policy. If the user's task still needs this network action, do not stop here: read /etc/openshell/skills/policy_advisor.md, submit the narrowest policy proposal to http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then retry the original request.";
+pub const AGENT_GUIDANCE: &str = "OpenShell blocked this request with sandbox policy. If the user's task still needs this network action, do not stop here: read /etc/openshell/skills/policy_advisor.md (or $HOME/.claude/skills/policy-advisor/policy_advisor.md in a non-root sandbox), submit the narrowest policy proposal to http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then retry the original request.";
 
 /// Routes served by the in-sandbox policy advisor API.
 ///
@@ -259,6 +259,7 @@ pub fn agent_next_steps(agent_proposals_enabled: bool) -> serde_json::Value {
         {
             "action": "read_skill",
             "path": SKILL_PATH,
+            "alternate_path": "$HOME/.claude/skills/policy-advisor/policy_advisor.md",
         },
         {
             "action": "inspect_policy",
@@ -1993,6 +1994,10 @@ mod tests {
             .collect();
         assert!(actions.contains(&"read_skill"));
         assert!(actions.contains(&"submit_proposal"));
+        assert_eq!(
+            steps[0]["alternate_path"],
+            "$HOME/.claude/skills/policy-advisor/policy_advisor.md"
+        );
     }
 
     #[test]
@@ -2005,6 +2010,7 @@ mod tests {
         let guidance = agent_guidance_for(true).expect("guidance when proposals are enabled");
         assert!(guidance.contains("do not stop"));
         assert!(guidance.contains("/etc/openshell/skills/policy_advisor.md"));
+        assert!(guidance.contains("$HOME/.claude/skills/policy-advisor/policy_advisor.md"));
         assert!(guidance.contains("http://policy.local/v1/proposals"));
         assert!(guidance.contains("policy_reloaded: true"));
     }

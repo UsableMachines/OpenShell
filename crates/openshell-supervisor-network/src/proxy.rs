@@ -2233,21 +2233,11 @@ async fn handle_tcp_connection(
             let tls_result = async {
                 let mut tls_client =
                     crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
-                let endpoint_ca = decision
-                    .endpoint
-                    .policy_configs
-                    .first()
-                    .and_then(|config| match config {
-                        regorus::Value::Object(fields) => {
-                            fields.get(&regorus::Value::String("upstream_ca_pem".into()))
-                        }
-                        _ => None,
-                    })
-                    .and_then(|value| match value {
-                        regorus::Value::String(value) => Some(value.as_ref()),
-                        _ => None,
-                    })
-                    .unwrap_or("");
+                // A broad allow rule may also contribute connection metadata.
+                // The validated exact-host CA augmentation must win regardless
+                // of policy iteration order; ambiguity validation ensures any
+                // other matching nonempty CA has the same value.
+                let endpoint_ca = supplemental_ca_from_configs(&decision.endpoint.policy_configs);
                 let upstream_config = tls.endpoint_upstream_config(endpoint_ca)?;
                 let mut tls_upstream =
                     crate::l7::tls::tls_connect_upstream(upstream, &host_lc, &upstream_config)
@@ -4246,11 +4236,14 @@ fn query_allowed_ips(decision: &EgressDecision) -> Vec<String> {
         return vec![];
     }
 
-    decision
-        .endpoint
-        .policy_configs
-        .first()
+    explicit_allowed_ips_from_configs(&decision.endpoint.policy_configs)
+}
+
+fn explicit_allowed_ips_from_configs(configs: &[regorus::Value]) -> Vec<String> {
+    configs
+        .iter()
         .map(|config| endpoint_config_string_array(config, "allowed_ips"))
+        .find(|allowed_ips| !allowed_ips.is_empty())
         .unwrap_or_default()
 }
 
@@ -6362,6 +6355,22 @@ async fn refuse_connect_when_tls_unavailable(
     Ok(true)
 }
 
+fn supplemental_ca_from_configs(configs: &[regorus::Value]) -> &str {
+    configs
+        .iter()
+        .filter_map(|config| match config {
+            regorus::Value::Object(fields) => {
+                fields.get(&regorus::Value::String("upstream_ca_pem".into()))
+            }
+            _ => None,
+        })
+        .find_map(|value| match value {
+            regorus::Value::String(value) if !value.is_empty() => Some(value.as_ref()),
+            _ => None,
+        })
+        .unwrap_or("")
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -6395,6 +6404,28 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn supplemental_ca_wins_over_broad_config_without_ca() {
+        let broad = regorus::Value::from_json_str(r#"{"allowed_ips":["0.0.0.0/0"]}"#).unwrap();
+        let exact = regorus::Value::from_json_str(r#"{"upstream_ca_pem":"reviewed-ca"}"#).unwrap();
+        assert_eq!(supplemental_ca_from_configs(&[broad, exact]), "reviewed-ca");
+    }
+
+    #[test]
+    fn ca_only_config_preserves_explicit_baseline_ip_restriction() {
+        let ca = regorus::Value::from_json_str(r#"{"upstream_ca_pem":"reviewed-ca"}"#).unwrap();
+        let baseline = regorus::Value::from_json_str(r#"{"allowed_ips":["11.0.0.0/8"]}"#).unwrap();
+        for configs in [
+            vec![ca.clone(), baseline.clone()],
+            vec![baseline.clone(), ca.clone()],
+        ] {
+            assert_eq!(
+                explicit_allowed_ips_from_configs(&configs),
+                vec!["11.0.0.0/8"]
+            );
+        }
+    }
 
     struct DenyWebSocketPreflight;
 

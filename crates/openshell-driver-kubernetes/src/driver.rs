@@ -3267,6 +3267,8 @@ const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
 /// local coordination in sidecar topology.
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
 const SIDECAR_STATE_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const AGENT_SKILLS_VOLUME_NAME: &str = "openshell-agent-skills";
+const AGENT_SKILLS_MOUNT_PATH: &str = "/etc/openshell/skills";
 const SIDECAR_CONTROL_SOCKET: &str = openshell_core::container_paths::SIDECAR_CONTROL_SOCKET;
 // Linux abstract socket names are scoped to the pod's shared network namespace.
 // Unlike a filesystem socket in the shared state volume, the workload cannot
@@ -3861,6 +3863,13 @@ fn apply_supervisor_sidecar_topology(
             "name": SIDECAR_TLS_VOLUME_NAME,
             "emptyDir": {}
         }));
+        // The process supervisor is non-root in sidecar topology. kubelet's
+        // fsGroup makes this directory writable without granting it access
+        // to the rest of the agent container's /etc tree.
+        volumes.push(serde_json::json!({
+            "name": AGENT_SKILLS_VOLUME_NAME,
+            "emptyDir": {}
+        }));
     }
 
     let init_containers = spec
@@ -3930,6 +3939,10 @@ fn apply_supervisor_sidecar_topology(
             volume_mounts.push(supervisor_volume_mount());
             volume_mounts.push(sidecar_state_volume_mount());
             volume_mounts.push(sidecar_tls_volume_mount());
+            volume_mounts.push(serde_json::json!({
+                "name": AGENT_SKILLS_VOLUME_NAME,
+                "mountPath": AGENT_SKILLS_MOUNT_PATH,
+            }));
         }
 
         let env = container
@@ -7601,10 +7614,27 @@ mod tests {
                 .any(|volume| volume["name"] == SIDECAR_TLS_VOLUME_NAME)
         );
         assert!(volumes.iter().any(|volume| {
+            volume["name"] == AGENT_SKILLS_VOLUME_NAME && volume["emptyDir"].is_object()
+        }));
+        assert!(volumes.iter().any(|volume| {
             volume["name"] == SUPERVISOR_VOLUME_NAME && volume["image"].is_object()
         }));
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert!(
+            agent["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == AGENT_SKILLS_VOLUME_NAME
+                        && mount["mountPath"] == AGENT_SKILLS_MOUNT_PATH
+                })
+        );
         let sidecar = containers
             .iter()
             .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
