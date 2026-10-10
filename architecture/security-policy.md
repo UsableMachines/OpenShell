@@ -233,6 +233,17 @@ because it changes the effective access model for every sandbox on the gateway.
 The policy advisor pipeline turns observed denials into draft policy
 recommendations. There are two proposers (sandbox-side mechanistic mapper,
 agent-authored via `policy.local`); the gateway is the single referee.
+
+Supervisor-observed policy denials and upstream TLS certificate-verification
+failures also enter the existing draft pipeline as `gateway_event` proposals.
+The supervisor submits before returning a structured failure body to the
+client. A sandbox-session map keyed by normalized host and port reuses one
+proposal ID for repeated failures. These event drafts always await human
+review, including when auto approval is enabled. Upstream TLS drafts reserve
+an empty `upstream_ca_pem` slot; approval requires an exact host and a
+verified PEM supplied through draft editing. The supervisor never trusts a
+certificate captured from the failed connection. Existing CA conflict and
+IP allowlist validation still run when the edited draft is approved.
 When enabled, L7 `policy_denied` responses include both structured
 `next_steps` and a short `agent_guidance` string so generic agents can continue
 through the proposal loop instead of treating the denial as terminal.

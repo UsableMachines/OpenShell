@@ -265,12 +265,11 @@ mod endpoint_ca_tests {
             .await
             .expect("endpoint CA should verify upstream");
         let stream = TcpStream::connect(address).await.unwrap();
-        assert!(
-            tls_connect_upstream(stream, "private.example.test", client.upstream_config())
-                .await
-                .is_err(),
-            "default upstream config must not trust endpoint CA"
-        );
+        let error = tls_connect_upstream(stream, "private.example.test", client.upstream_config())
+            .await
+            .err()
+            .expect("default upstream config must not trust endpoint CA");
+        assert!(is_certificate_verification_error(&error));
         assert!(Arc::ptr_eq(
             &scoped,
             &client.endpoint_upstream_config(&pem).unwrap()
@@ -454,8 +453,25 @@ pub async fn tls_connect_upstream(
     let tls_stream = connector
         .connect(server_name, upstream)
         .await
-        .into_diagnostic()?;
+        .map_err(|source| miette::Report::new(UpstreamTlsHandshakeError { source }))?;
     Ok(tls_stream)
+}
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("upstream TLS handshake failed: {source}")]
+struct UpstreamTlsHandshakeError {
+    #[source]
+    source: std::io::Error,
+}
+
+/// Identify the verifier's typed certificate error, rather than inferring a
+/// trust failure from curl's reset message or from a stringified IO error.
+pub fn is_certificate_verification_error(error: &miette::Report) -> bool {
+    error
+        .downcast_ref::<UpstreamTlsHandshakeError>()
+        .and_then(|error| error.source.get_ref())
+        .and_then(|source| source.downcast_ref::<rustls::Error>())
+        .is_some_and(|source| matches!(source, rustls::Error::InvalidCertificate(_)))
 }
 
 /// Build a rustls `ClientConfig` using the configured CA root source.

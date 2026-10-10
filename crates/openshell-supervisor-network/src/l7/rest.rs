@@ -132,6 +132,7 @@ pub(crate) struct DenyResponseContext<'a> {
     pub(crate) port: Option<u16>,
     pub(crate) binary: Option<&'a str>,
     pub(crate) agent_proposals_enabled: bool,
+    pub(crate) policy_local: Option<&'a crate::policy_local::PolicyLocalContext>,
 }
 
 impl<'a> DenyResponseContext<'a> {
@@ -142,6 +143,7 @@ impl<'a> DenyResponseContext<'a> {
             port: Some(ctx.port),
             binary: Some(&ctx.binary_path),
             agent_proposals_enabled: ctx.agent_proposals.enabled(),
+            policy_local: ctx.policy_local.as_deref(),
         }
     }
 }
@@ -2582,7 +2584,30 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
     redacted_target: Option<&str>,
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
-    let body = deny_response_body(req, policy_name, reason, redacted_target, context);
+    let mut body = deny_response_body(req, policy_name, reason, redacted_target, context);
+    if let Some(context) = context
+        && let (Some(local), Some(host), Some(port)) =
+            (context.policy_local, context.host, context.port)
+    {
+        let path = redacted_target.unwrap_or(&req.target);
+        let proposal_id = local
+            .propose_for_event(
+                host,
+                port,
+                context.binary.unwrap_or_default(),
+                false,
+                Some((&req.action, path)),
+            )
+            .await;
+        body["advisor"] = serde_json::json!({
+            "event": "policy_denied",
+            "host": host,
+            "port": port,
+            "remedy": "review_destination_exception",
+            "proposal_id": proposal_id,
+            "next_action": if proposal_id.is_some() { "relay_to_user_and_wait_for_approval" } else { "report_failure_without_proposal" }
+        });
+    }
     send_forbidden_json(policy_name, body, client).await
 }
 
@@ -4051,6 +4076,7 @@ mod tests {
                 port: Some(443),
                 binary: Some("/usr/bin/gh"),
                 agent_proposals_enabled: true,
+                policy_local: None,
             }),
         );
 
@@ -4082,12 +4108,11 @@ mod tests {
             body["next_steps"][0]["path"],
             "/etc/openshell/skills/policy_advisor.md"
         );
-        assert_eq!(body["next_steps"][3]["body_type"], "PolicyMergeOperation");
+        assert_eq!(body["next_steps"][3]["action"], "wait_for_approval");
         let guidance = body["agent_guidance"]
             .as_str()
             .expect("agent_guidance is present when proposals are enabled");
-        assert!(guidance.contains("do not stop"));
-        assert!(guidance.contains("/etc/openshell/skills/policy_advisor.md"));
+        assert!(guidance.contains("advisor.proposal_id"));
         assert!(guidance.contains("http://policy.local/v1/proposals"));
         assert!(
             !body.to_string().contains("secret-token"),
@@ -4115,6 +4140,7 @@ mod tests {
                 port: Some(443),
                 binary: Some("/usr/bin/gh"),
                 agent_proposals_enabled: false,
+                policy_local: None,
             }),
         );
 
@@ -4185,7 +4211,7 @@ mod tests {
             Some(DenyResponseContext::from_l7_context(&l7_ctx)),
         );
         assert_eq!(deny_body["next_steps"][0]["action"], "read_skill");
-        assert_eq!(deny_body["next_steps"][3]["action"], "submit_proposal");
+        assert_eq!(deny_body["next_steps"][3]["action"], "wait_for_approval");
         assert!(
             deny_body["agent_guidance"]
                 .as_str()
@@ -4218,6 +4244,7 @@ mod tests {
                 port: Some(443),
                 binary: Some("/usr/bin/curl"),
                 agent_proposals_enabled: true,
+                policy_local: None,
             }),
         );
 
@@ -4256,6 +4283,7 @@ mod tests {
                     port: Some(443),
                     binary: Some("/usr/bin/gh"),
                     agent_proposals_enabled: true,
+                    policy_local: None,
                 }),
             )
             .await
@@ -4278,7 +4306,7 @@ mod tests {
         assert_eq!(body["path"], "/user/repos");
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["next_steps"][2]["action"], "inspect_recent_denials");
-        assert!(body["agent_guidance"].as_str().unwrap().contains("retry"));
+        assert!(body["agent_guidance"].as_str().unwrap().contains("Retry"));
     }
 
     #[test]

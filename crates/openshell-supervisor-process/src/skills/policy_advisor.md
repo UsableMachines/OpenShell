@@ -1,13 +1,17 @@
 # OpenShell Policy Advisor
 
-Use this when OpenShell blocks a network request and the response or logs say
-`policy_denied`.
+Use this when OpenShell returns `policy_denied` or `upstream_tls_failed`.
 
 ## Goal
 
-Draft the smallest policy proposal that allows the user's current task without
-giving the sandbox broad new network access. The developer approves or rejects
-the proposal; do not try to bypass policy.
+Relay the supervisor's mechanical failure and pending proposal to the user.
+The developer reviews the narrow rule; do not try to bypass policy.
+
+The response body includes `advisor.event`, `advisor.host`, `advisor.port`,
+`advisor.remedy`, and `advisor.proposal_id`. The supervisor submits the draft
+before returning the failure. A null proposal ID means submission failed; tell
+the user that no pending card was confirmed. Repeated failures for one endpoint
+reuse the same proposal during the sandbox session.
 
 ## Local API
 
@@ -46,18 +50,23 @@ the service owner; never submit a private key. Keep normal TLS inspection
 enabled. A supplemental CA always requires developer review, including in
 auto mode. Retry only after approval and `policy_reloaded: true`.
 
-An explicit proxy may return `200 Connection established` before the TLS
-handshake resets. This can mean the supervisor could not verify the upstream
-certificate. Ask the user or service owner for the CA PEM before proposing
-trust. Do not use `--insecure`, `-k`, or an unverified certificate copied from
-the failed connection. After approval and reload, retry without `--cacert`.
+For an upstream certificate-verification failure, the supervisor returns a
+structured 502 over the terminated client TLS connection and creates an
+exact-host draft with an empty `upstream_ca_pem` slot. Ask the service owner
+for a verified CA PEM so the reviewer can edit that draft. Approval is blocked
+until a valid CA is supplied. Do not use `--insecure`, `-k`, or an unverified
+certificate copied from the failed connection. After approval and reload,
+retry without `--cacert`.
 
 ## Workflow
 
-1. Read the denial response body. Use `layer`, `method`, `path`, `host`,
-   `port`, `binary`, `rule_missing`, and `detail` as evidence.
-2. Fetch the current policy from `/v1/policy/current`.
-3. Fetch recent denials from `/v1/denials` if the response body is incomplete.
+1. Read the failure response body and its `advisor` object. Tell the user the
+   mechanical reason, the endpoint, and the pending proposal ID.
+2. If a proposal ID exists, wait on `/v1/proposals/{proposal_id}/wait` and
+   retry after approval and `policy_reloaded: true`.
+3. If submission failed, inspect `/v1/policy/current` and recent denials for
+   diagnostics. Report the failure clearly. Manual proposals remain available
+   through `POST /v1/proposals` when the supervisor cannot submit a draft.
 4. Prefer L7 REST rules for REST APIs. **Proposals against hosts where no
    credential is in scope auto-approve** (see Auto-approval below). Any
    credentialed reach or capability change goes to human review — that is

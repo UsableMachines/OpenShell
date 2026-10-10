@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy
 position: 7
 ---
 
-Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`, a developer approves or rejects it from outside the sandbox, and approved network policy hot-reloads into the same sandbox.
+Policy advisor creates a narrow pending network policy proposal when the supervisor denies a request or cannot verify an upstream TLS certificate. The failure response includes an `advisor` object with the mechanical reason, endpoint, remedy, and proposal ID. A developer reviews the draft, and approved policy hot-reloads into the same sandbox.
 
 Policy advisor preserves OpenShell's default-deny posture. The structured rule is the approval contract, and the agent's rationale is supporting context. By default every accepted proposal lands in the draft inbox for human review. Opt-in [auto mode](#approval-modes) approves a proposal without a reviewer only when its [prover delta](#what-auto-approval-checks) is empty and the current draft rule produces no security notes. A prover finding or security note keeps the proposal pending for human review.
 
@@ -45,7 +45,7 @@ openshell settings delete --global \
   --yes
 ```
 
-Set the value before creating a sandbox when you want the first denied request to include policy advisor guidance. Running sandboxes poll settings and can enable the surface after startup, but startup enablement gives the agent the clearest first-denial path.
+Set the value before creating a sandbox when you want the first denied request to create a proposal and include its ID in the failure response. Running sandboxes poll settings and can enable the surface after startup.
 
 ## Approval Modes
 
@@ -96,12 +96,12 @@ When policy advisor is enabled, the sandbox supervisor turns on three agent-faci
 - It serves `http://policy.local` from inside the sandbox.
 - It adds `agent_guidance` and `next_steps` to L7 `policy_denied` response bodies so the agent can find the skill and local API.
 
-The loop has seven steps:
+The supervisor-driven loop is:
 
 1. A sandboxed process attempts a network request that policy denies.
-2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, `agent_guidance`, and `next_steps`.
-3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
-4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
+2. The supervisor submits a pending proposal through the existing gateway pipeline. Concurrent or repeated failures for the same host and port in one sandbox session reuse its proposal ID.
+3. OpenShell returns a structured `403` denial body or a `502` upstream TLS failure body. Its `advisor` object names the endpoint, remedy, and pending `proposal_id`.
+4. The agent relays that information to the user. For a certificate failure, the reviewer obtains a verified service-owner CA PEM and adds it to the draft's `upstream_ca_pem` field before approval.
 5. The gateway turns the proposal into the exact effective-policy candidate it would apply. It preserves any existing L7 or provider-owned endpoint contract, adds the proposed binary as a sandbox overlay, validates the full merge, and runs the [policy prover](#what-auto-approval-checks) against that candidate.
 6. The gateway stores the candidate, its prover result, any application error, and a review token tied to the live policy, provider rules, and credential metadata. Provider rules remain immutable inputs.
 7. Before approval, the gateway cheaply recomputes the candidate token from live inputs. An unchanged token reuses the stored prover result. A changed token leaves the proposal pending with a refreshed candidate and requires a fresh review. Under `auto` mode, an unchanged candidate is approved only when the prover delta and security notes are empty. Under `manual` mode, every valid proposal lands in the draft inbox.
@@ -128,6 +128,7 @@ OpenShell has two proposal paths:
 
 | Path | Source | Typical rule shape |
 |---|---|---|
+| Supervisor event | A denied request or an upstream certificate-verification failure. | Creates one pending draft per host and port per sandbox session. A TLS draft has an exact-host CA slot; a REST denial can carry its method and path. |
 | Mechanistic mapper | Aggregated denial summaries from the sandbox. | Groups by host, port, and binary. If L7 request samples are available, it can draft REST method and path rules. Otherwise it drafts an L4 endpoint. |
 | Agent-authored proposal | The in-sandbox agent, using `policy.local`. | Usually a REST `addRule` with exact host, port, binary, method, and path from the structured denial. It can also omit `protocol` for endpoint-only access through the explicit proxy. |
 
@@ -144,7 +145,7 @@ For example, a GitHub provider can explicitly declare `api.github.com:443` for r
 
 Provenance does not hide a real endpoint conflict. The same two declarations still fail validation if they disagree on connection or request-processing behavior that must have one value, such as TLS mode, `allowed_ips`, an equally specific L7 protocol or parser contract, credential binding, or enforcement mode. Authorization fields such as compatible allow and deny rules can combine.
 
-An exact-host `upstream_ca_pem` rule may augment a broader allow rule that has no supplemental CA, including a public HTTPS allow rule on port 443. If the CA rule omits `allowed_ips`, the existing explicit IP allowlist still applies. The gateway rejects two different CAs or different explicit IP allowlists for one destination, and every supplemental CA requires human review. If a proxy CONNECT succeeds but the TLS handshake resets, ask the service owner for the CA PEM before proposing the exact host and port; do not disable certificate verification.
+An exact-host `upstream_ca_pem` rule may augment a broader allow rule that has no supplemental CA, including a public HTTPS allow rule on port 443. If the CA rule omits `allowed_ips`, the existing explicit IP allowlist still applies. The gateway rejects two different CAs or different explicit IP allowlists for one destination, and every supplemental CA requires human review. When upstream certificate verification fails, the supervisor creates the exact-host draft with an empty CA slot. Obtain the verified CA PEM from the service owner and add it to that draft before approval; do not disable certificate verification.
 
 Exact-host SSRF trust requires an exact endpoint and the matching binary identity to be explicit in the same rule. An advisor-only endpoint or binary does not create that stronger trust. For example:
 

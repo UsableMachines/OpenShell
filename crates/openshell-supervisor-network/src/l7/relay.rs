@@ -79,6 +79,7 @@ pub struct L7EvalContext {
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
     /// Shared feature state for agent-driven policy proposals.
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
+    pub(crate) policy_local: Option<Arc<crate::policy_local::PolicyLocalContext>>,
 }
 
 fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {

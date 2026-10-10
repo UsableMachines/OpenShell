@@ -718,6 +718,7 @@ async fn handle_transparent_tcp_connection(
         // workspace is available here; matches the CONNECT path default when
         // policy-local context is absent.
         String::new(),
+        None,
     );
     let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
@@ -1599,6 +1600,7 @@ async fn deny_connect_destination(
     decision: &EgressDecision,
     denial_tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: &Option<ActivitySender>,
+    policy_local: Option<&PolicyLocalContext>,
 ) -> Result<()> {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_connect_destination_deny_ocsf_event(
@@ -1619,13 +1621,20 @@ async fn deny_connect_destination(
     if denial.kind != DestinationDenialKind::DeclaredEndpoint {
         emit_activity(activity_tx, true, "ssrf");
     }
+    let proposal_id = if let Some(local) = policy_local {
+        local
+            .propose_for_event(host, port, binary, false, None)
+            .await
+    } else {
+        None
+    };
     respond(
         client,
-        &build_json_error_response(
-            403,
-            "Forbidden",
-            "ssrf_denied",
+        &build_destination_deny_response(
+            host,
+            port,
             &format!("CONNECT {host}:{port} blocked: {detail}"),
+            proposal_id.as_deref(),
         ),
     )
     .await
@@ -1648,6 +1657,7 @@ async fn deny_forward_destination(
     decision: &EgressDecision,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    policy_local: Option<&PolicyLocalContext>,
 ) -> Result<()> {
     let detail = destination_denial_detail(denial.kind);
     ocsf_emit!(build_forward_destination_deny_ocsf_event(
@@ -1668,13 +1678,20 @@ async fn deny_forward_destination(
     if denial.kind != DestinationDenialKind::DeclaredEndpoint {
         emit_activity_simple(activity_tx, true, "ssrf");
     }
+    let proposal_id = if let Some(local) = policy_local {
+        local
+            .propose_for_event(host, port, binary, false, Some((method, path)))
+            .await
+    } else {
+        None
+    };
     respond(
         client,
-        &build_json_error_response(
-            403,
-            "Forbidden",
-            "ssrf_denied",
+        &build_destination_deny_response(
+            host,
+            port,
             &format!("{method} {host}:{port} blocked: {detail}"),
+            proposal_id.as_deref(),
         ),
     )
     .await
@@ -1869,6 +1886,13 @@ async fn handle_tcp_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
+        let proposal_id = if let Some(policy_local) = policy_local_ctx.as_ref() {
+            policy_local
+                .propose_for_event(&host_lc, port, &binary_str, false, None)
+                .await
+        } else {
+            None
+        };
         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
@@ -1898,10 +1922,13 @@ async fn handle_tcp_connection(
         emit_activity(&activity_tx, true, "connect_policy");
         respond(
             &mut client,
-            &build_policy_deny_response(
+            &build_event_policy_deny_response(
                 &format!("CONNECT {host_lc}:{port} not permitted by policy"),
                 Some(&deny_reason),
                 agent_proposals.enabled(),
+                &host_lc,
+                port,
+                proposal_id.as_deref(),
             ),
         )
         .await?;
@@ -1953,6 +1980,7 @@ async fn handle_tcp_connection(
                 &decision,
                 &denial_tx,
                 &activity_tx,
+                policy_local_ctx.as_deref(),
             )
             .await?;
             return Ok(());
@@ -1989,6 +2017,7 @@ async fn handle_tcp_connection(
                 &decision,
                 &denial_tx,
                 &activity_tx,
+                policy_local_ctx.as_deref(),
             )
             .await?;
             return Ok(());
@@ -2176,6 +2205,7 @@ async fn handle_tcp_connection(
         dynamic_credentials.clone(),
         agent_proposals,
         workspace,
+        policy_local_ctx.clone(),
     );
 
     if effective_tls_skip {
@@ -2239,9 +2269,52 @@ async fn handle_tcp_connection(
                 // other matching nonempty CA has the same value.
                 let endpoint_ca = supplemental_ca_from_configs(&decision.endpoint.policy_configs);
                 let upstream_config = tls.endpoint_upstream_config(endpoint_ca)?;
-                let mut tls_upstream =
-                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, &upstream_config)
-                        .await?;
+                let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
+                    upstream,
+                    &host_lc,
+                    &upstream_config,
+                )
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let certificate_failure =
+                            crate::l7::tls::is_certificate_verification_error(&error);
+                        let proposal_id = if certificate_failure {
+                            if let Some(policy_local) = policy_local_ctx.as_ref() {
+                                policy_local
+                                    .propose_for_event(&host_lc, port, &binary_str, true, None)
+                                    .await
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let body = serde_json::json!({
+                            "error": "upstream_tls_failed",
+                            "detail": if certificate_failure {
+                                format!("Upstream TLS certificate verification failed for {host_lc}:{port}")
+                            } else {
+                                format!("Upstream TLS handshake failed for {host_lc}:{port}")
+                            },
+                            "advisor": {
+                                "event": if certificate_failure { "certificate_verification_failed" } else { "tls_handshake_failed" },
+                                "host": host_lc,
+                                "port": port,
+                                "remedy": if certificate_failure { "review_exact_host_ca_proposal" } else { "inspect_upstream_tls" },
+                                "proposal_id": proposal_id,
+                                "next_action": if proposal_id.is_some() { "relay_to_user_and_wait_for_approval" } else { "report_failure_without_proposal" }
+                            }
+                        });
+                        tls_client
+                            .write_all(&build_json_body_response(502, "Bad Gateway", body))
+                            .await
+                            .into_diagnostic()?;
+                        tls_client.flush().await.into_diagnostic()?;
+                        return Ok(());
+                    }
+                };
                 let Some(relay_context) =
                     relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
                 else {
@@ -5006,6 +5079,13 @@ async fn handle_forward_proxy(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
+            let proposal_id = if let Some(policy_local) = policy_local_ctx.as_ref() {
+                policy_local
+                    .propose_for_event(&host_lc, port, &binary_str, false, None)
+                    .await
+            } else {
+                None
+            };
             ocsf_emit!(build_forward_policy_deny_ocsf_event(
                 workload_addr,
                 method,
@@ -5030,10 +5110,13 @@ async fn handle_forward_proxy(
             emit_activity_simple(activity_tx, true, "forward_policy");
             respond(
                 client,
-                &build_policy_deny_response(
+                &build_event_policy_deny_response(
                     &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
-                    None,
+                    Some(reason),
                     agent_proposals.enabled(),
+                    &host_lc,
+                    port,
+                    proposal_id.as_deref(),
                 ),
             )
             .await?;
@@ -5161,6 +5244,7 @@ async fn handle_forward_proxy(
         dynamic_credentials.clone(),
         agent_proposals,
         workspace,
+        policy_local_ctx.clone(),
     );
     l7_ctx.request_default_port = match scheme.as_str() {
         "http" => Some(80),
@@ -5625,6 +5709,7 @@ async fn handle_forward_proxy(
                 &decision,
                 denial_tx,
                 activity_tx,
+                policy_local_ctx.as_deref(),
             )
             .await?;
             return Ok(());
@@ -5662,6 +5747,7 @@ async fn handle_forward_proxy(
                 &decision,
                 denial_tx,
                 activity_tx,
+                policy_local_ctx.as_deref(),
             )
             .await?;
             return Ok(());
@@ -6249,6 +6335,57 @@ fn build_policy_deny_response(
         body["agent_guidance"] = serde_json::json!(guidance);
     }
     build_json_body_response(403, "Forbidden", body)
+}
+
+fn build_event_policy_deny_response(
+    detail: &str,
+    reason: Option<&str>,
+    enabled: bool,
+    host: &str,
+    port: u16,
+    proposal_id: Option<&str>,
+) -> Vec<u8> {
+    let mut body = serde_json::json!({
+        "error": "policy_denied",
+        "detail": detail,
+        "reason": reason.unwrap_or_default(),
+        "advisor": {
+            "event": "policy_denied",
+            "host": host,
+            "port": port,
+            "remedy": "review_destination_exception",
+            "proposal_id": proposal_id,
+            "next_action": if proposal_id.is_some() { "relay_to_user_and_wait_for_approval" } else { "report_failure_without_proposal" }
+        }
+    });
+    if let Some(guidance) = crate::policy_local::agent_guidance_for(enabled) {
+        body["agent_guidance"] = serde_json::json!(guidance);
+    }
+    build_json_body_response(403, "Forbidden", body)
+}
+
+fn build_destination_deny_response(
+    host: &str,
+    port: u16,
+    detail: &str,
+    proposal_id: Option<&str>,
+) -> Vec<u8> {
+    build_json_body_response(
+        403,
+        "Forbidden",
+        serde_json::json!({
+            "error": "ssrf_denied",
+            "detail": detail,
+            "advisor": {
+                "event": "destination_restriction",
+                "host": host,
+                "port": port,
+                "remedy": "review_allowed_ips_exception",
+                "proposal_id": proposal_id,
+                "next_action": if proposal_id.is_some() { "relay_to_user_and_wait_for_approval" } else { "report_failure_without_proposal" }
+            }
+        }),
+    )
 }
 
 fn build_middleware_deny_response(
@@ -7022,7 +7159,10 @@ network_policies:
         assert_eq!(body["error"], "policy_denied");
         let guidance = body["agent_guidance"].as_str().expect("guidance present");
         assert!(guidance.contains("policy.local"), "guidance: {guidance}");
-        assert!(guidance.contains("policy_advisor"), "guidance: {guidance}");
+        assert!(
+            guidance.contains("advisor.proposal_id"),
+            "guidance: {guidance}"
+        );
 
         let response = build_policy_deny_response(
             "CONNECT host.example:443 not permitted by policy",

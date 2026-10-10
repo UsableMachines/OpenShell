@@ -48,8 +48,13 @@ fn assert_json_response(
     assert!(headers.contains("Content-Type: application/json\r\n"));
     assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
     assert!(headers.contains("Connection: close\r\n"));
+    let mut actual = serde_json::from_slice::<serde_json::Value>(body).unwrap();
+    if expected_error == "ssrf_denied" {
+        assert_eq!(actual["advisor"]["remedy"], "review_allowed_ips_exception");
+        actual.as_object_mut().unwrap().remove("advisor");
+    }
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+        actual,
         serde_json::json!({
             "error": expected_error,
             "detail": expected_detail,
@@ -100,6 +105,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             &allowed_decision(EgressIntent::connect("target.example".to_string(), 8443)),
             &None,
             &None,
+            None,
         )
         .await
         .unwrap();
@@ -131,6 +137,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
                 "target.example".to_string(),
                 8080,
             )),
+            None,
             None,
             None,
         )
