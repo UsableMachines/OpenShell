@@ -13336,7 +13336,7 @@ mod tests {
                 analysis_mode: "gateway_event".into(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: rule.name.clone(),
-                    proposed_rule: Some(rule),
+                    proposed_rule: Some(rule.clone()),
                     stage: "upstream_tls".into(),
                     ..Default::default()
                 }],
@@ -13353,7 +13353,7 @@ mod tests {
             &state,
             authed_request(ApproveDraftChunkRequest {
                 name: sandbox_name.into(),
-                chunk_id: id,
+                chunk_id: id.clone(),
                 workspace: "default".into(),
                 ..Default::default()
             }),
@@ -13361,6 +13361,47 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.message().contains("upstream_ca_pem"));
+
+        let mut reviewed_rule = rule;
+        reviewed_rule.endpoints[0].upstream_ca_pem =
+            rcgen::generate_simple_self_signed(vec!["internal.example.test".into()])
+                .unwrap()
+                .cert
+                .pem();
+        handle_edit_draft_chunk(
+            &state,
+            authed_request(EditDraftChunkRequest {
+                name: sandbox_name.into(),
+                chunk_id: id.clone(),
+                proposed_rule: Some(reviewed_rule),
+                workspace: "default".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let reviewed = state.store.get_draft_chunk(&id).await.unwrap().unwrap();
+        assert!(!reviewed.review_token.is_empty());
+        handle_approve_draft_chunk(
+            &state,
+            authed_request(ApproveDraftChunkRequest {
+                name: sandbox_name.into(),
+                chunk_id: id.clone(),
+                workspace: "default".into(),
+                review_token: reviewed.review_token,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
     }
 
     #[tokio::test]
