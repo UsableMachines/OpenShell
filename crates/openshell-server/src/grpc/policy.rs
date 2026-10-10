@@ -13182,6 +13182,7 @@ mod tests {
                 endpoints: vec![NetworkEndpoint {
                     host: "*.example.test".into(),
                     port: 443,
+                    allowed_ips: vec!["11.0.0.5/32".into()],
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {

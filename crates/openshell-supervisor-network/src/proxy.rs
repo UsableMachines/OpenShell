@@ -4236,11 +4236,14 @@ fn query_allowed_ips(decision: &EgressDecision) -> Vec<String> {
         return vec![];
     }
 
-    decision
-        .endpoint
-        .policy_configs
-        .first()
+    explicit_allowed_ips_from_configs(&decision.endpoint.policy_configs)
+}
+
+fn explicit_allowed_ips_from_configs(configs: &[regorus::Value]) -> Vec<String> {
+    configs
+        .iter()
         .map(|config| endpoint_config_string_array(config, "allowed_ips"))
+        .find(|allowed_ips| !allowed_ips.is_empty())
         .unwrap_or_default()
 }
 
@@ -6407,6 +6410,21 @@ mod tests {
         let broad = regorus::Value::from_json_str(r#"{"allowed_ips":["0.0.0.0/0"]}"#).unwrap();
         let exact = regorus::Value::from_json_str(r#"{"upstream_ca_pem":"reviewed-ca"}"#).unwrap();
         assert_eq!(supplemental_ca_from_configs(&[broad, exact]), "reviewed-ca");
+    }
+
+    #[test]
+    fn ca_only_config_preserves_explicit_baseline_ip_restriction() {
+        let ca = regorus::Value::from_json_str(r#"{"upstream_ca_pem":"reviewed-ca"}"#).unwrap();
+        let baseline = regorus::Value::from_json_str(r#"{"allowed_ips":["11.0.0.0/8"]}"#).unwrap();
+        for configs in [
+            vec![ca.clone(), baseline.clone()],
+            vec![baseline.clone(), ca.clone()],
+        ] {
+            assert_eq!(
+                explicit_allowed_ips_from_configs(&configs),
+                vec!["11.0.0.0/8"]
+            );
+        }
     }
 
     struct DenyWebSocketPreflight;

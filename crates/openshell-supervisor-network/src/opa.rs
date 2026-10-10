@@ -4993,6 +4993,58 @@ network_policies:
     }
 
     #[test]
+    fn ca_augmentation_keeps_baseline_ip_config_available() {
+        let mut policy = test_proto();
+        let ca_pem = crate::l7::tls::SandboxCa::generate()
+            .unwrap()
+            .cert_pem()
+            .to_string();
+        policy
+            .network_policies
+            .get_mut("claude_code")
+            .unwrap()
+            .endpoints[0]
+            .upstream_ca_pem = ca_pem.clone();
+        policy.network_policies.insert(
+            "public_https".into(),
+            NetworkPolicyRule {
+                name: "public_https".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.*.com".into(),
+                    port: 443,
+                    allowed_ips: vec!["11.0.0.5/32".into()],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/claude".into(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (configs, _) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        assert_eq!(configs.len(), 2);
+        assert!(configs.iter().any(|config| {
+            get_str(config, "upstream_ca_pem").as_deref() == Some(ca_pem.as_str())
+        }));
+        assert!(
+            configs
+                .iter()
+                .any(|config| { get_str_array(config, "allowed_ips") == vec!["11.0.0.5/32"] })
+        );
+    }
+
+    #[test]
     fn explicit_tcp_authorizes_as_l4_without_endpoint_config() {
         let engine = l7_engine();
         let input = NetworkInput {

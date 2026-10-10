@@ -150,7 +150,9 @@ redaction retain their normal boundary. Policy validation rejects this field
 on `tls: skip` and `protocol: tcp` endpoints, which do not use the verifier.
 It also requires an exact host. A CA-bearing rule can augment a broader
 allow rule with no CA on the same port: the supervisor selects the matching
-supplemental CA for the upstream handshake. Two different CAs matching the
+supplemental CA for the upstream handshake. When the CA rule omits
+`allowed_ips`, the supervisor retains the overlapping explicit IP allowlist;
+different explicit lists still conflict. Two different CAs matching the
 same destination remain ambiguous and reject the policy generation.
 Policy advisor may propose the same endpoint field. Its security-notes gate
 requires human review even when the prover reports an empty delta; approval
