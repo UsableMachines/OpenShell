@@ -144,6 +144,8 @@ For example, a GitHub provider can explicitly declare `api.github.com:443` for r
 
 Provenance does not hide a real endpoint conflict. The same two declarations still fail validation if they disagree on connection or request-processing behavior that must have one value, such as TLS mode, `allowed_ips`, an equally specific L7 protocol or parser contract, credential binding, or enforcement mode. Authorization fields such as compatible allow and deny rules can combine.
 
+An exact-host `upstream_ca_pem` rule may augment a broader allow rule that has no supplemental CA, including a public HTTPS allow rule on port 443. The gateway still rejects two different CAs for one destination, and every supplemental CA requires human review. If a proxy CONNECT succeeds but the TLS handshake resets, ask the service owner for the CA PEM before proposing the exact host and port; do not disable certificate verification.
+
 Exact-host SSRF trust requires an exact endpoint and the matching binary identity to be explicit in the same rule. An advisor-only endpoint or binary does not create that stronger trust. For example:
 
 - A provider rule that explicitly declares both `/usr/bin/gh` and `api.github.com:443` already establishes exact-host trust for that pair. A later advisor proposal does not create or broaden that trust.

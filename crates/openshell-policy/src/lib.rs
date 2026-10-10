@@ -1850,6 +1850,9 @@ fn validate_sandbox_policy_with_mcp_presence(
             };
             let mut l7_errors = validate_l7_endpoint_semantics(&fields);
             if !ep.upstream_ca_pem.is_empty() {
+                if ep.host.is_empty() || ep.host.contains('*') {
+                    l7_errors.push("upstream_ca_pem requires an exact endpoint host".to_string());
+                }
                 if ep.tls.eq_ignore_ascii_case("skip") {
                     l7_errors.push("upstream_ca_pem cannot be used with tls: skip".to_string());
                 }
@@ -2041,6 +2044,18 @@ mod upstream_ca_tests {
             v.to_string()
                 .contains("upstream_ca_pem cannot be used with tls: skip")
         }));
+        let mut wildcard = policy.clone();
+        wildcard.network_policies.get_mut("api").unwrap().endpoints[0].host =
+            "*.example.test".into();
+        assert!(
+            validate_sandbox_policy(&wildcard)
+                .unwrap_err()
+                .iter()
+                .any(|v| {
+                    v.to_string()
+                        .contains("upstream_ca_pem requires an exact endpoint host")
+                })
+        );
         let mut tcp = policy;
         tcp.network_policies.get_mut("api").unwrap().endpoints[0].protocol = "tcp".into();
         assert!(

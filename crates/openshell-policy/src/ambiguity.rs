@@ -181,7 +181,13 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
         &normalized_strings(&left.allowed_ips),
         &normalized_strings(&right.allowed_ips),
     );
-    if left.upstream_ca_pem != right.upstream_ca_pem {
+    // An endpoint with no supplemental CA contributes no trust root. A
+    // reviewed exact-host rule may therefore augment a broad allow rule,
+    // while two different roots for the same destination remain ambiguous.
+    if !left.upstream_ca_pem.is_empty()
+        && !right.upstream_ca_pem.is_empty()
+        && left.upstream_ca_pem != right.upstream_ca_pem
+    {
         conflicts.push("upstream_ca_pem differs".to_string());
     }
     conflicts
@@ -1082,5 +1088,27 @@ mod tests {
         assert!(diagnostic.contains("upstream_ca_pem differs"));
         assert!(!diagnostic.contains("private-left-pem"));
         assert!(!diagnostic.contains("private-right-pem"));
+    }
+
+    #[test]
+    fn exact_ca_augments_wildcard_allow_on_443() {
+        let broad = endpoint("*.sandbox.svc", 443);
+        let mut exact = endpoint("selfsigned-443.sandbox.svc", 443);
+        exact.upstream_ca_pem = "reviewed-ca".to_string();
+        assert!(find_endpoint_ambiguities(&policy_with(broad.clone(), exact.clone())).is_empty());
+        assert!(find_endpoint_ambiguities(&policy_with(exact, broad)).is_empty());
+    }
+
+    #[test]
+    fn exact_ca_conflicts_with_different_ca_on_same_destination() {
+        let mut first = endpoint("selfsigned-443.sandbox.svc", 443);
+        first.upstream_ca_pem = "first-ca".to_string();
+        let mut second = first.clone();
+        second.upstream_ca_pem = "second-ca".to_string();
+        assert!(
+            find_endpoint_ambiguities(&policy_with(first, second))[0]
+                .conflicts
+                .contains(&"upstream_ca_pem differs".to_string())
+        );
     }
 }

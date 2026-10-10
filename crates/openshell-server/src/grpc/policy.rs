@@ -13174,14 +13174,25 @@ mod tests {
         let state = test_server_state().await;
         let sandbox_id = "sb-agent-ca";
         let sandbox_name = "agent-ca";
+        let mut baseline = ProtoSandboxPolicy::default();
+        baseline.network_policies.insert(
+            "public_https".into(),
+            NetworkPolicyRule {
+                name: "public_https".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.test".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".into(),
+                    ..Default::default()
+                }],
+            },
+        );
         state
             .store
-            .put_message(&test_sandbox(
-                sandbox_id,
-                sandbox_name,
-                ProtoSandboxPolicy::default(),
-                vec![],
-            ))
+            .put_message(&test_sandbox(sandbox_id, sandbox_name, baseline, vec![]))
             .await
             .unwrap();
         seed_sandbox_approval_mode(&state, sandbox_name, "auto").await;

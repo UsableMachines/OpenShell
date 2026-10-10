@@ -148,6 +148,10 @@ rustls verifier, alongside its normal roots. CONNECT still terminates client
 TLS and uses the parsed HTTP relay, so credential rewrite, middleware, and
 redaction retain their normal boundary. Policy validation rejects this field
 on `tls: skip` and `protocol: tcp` endpoints, which do not use the verifier.
+It also requires an exact host. A CA-bearing rule can augment a broader
+allow rule with no CA on the same port: the supervisor selects the matching
+supplemental CA for the upstream handshake. Two different CAs matching the
+same destination remain ambiguous and reject the policy generation.
 Policy advisor may propose the same endpoint field. Its security-notes gate
 requires human review even when the prover reports an empty delta; approval
 then uses the normal policy merge and hot reload path.
