@@ -15,7 +15,7 @@ const POLICY_ADVISOR_SKILL_CONTENT: &str = include_str!("skills/policy-advisor/S
 const AGENTS_FILE: &str = "AGENTS.md";
 const AGENTS_CONTENT: &str = r"# OpenShell Sandbox Guidance
 
-When you see `policy_denied`, do not treat it as final if the user task still needs that request. Read `/etc/openshell/skills/policy_advisor.md` and use `http://policy.local` to submit the narrowest policy proposal, then wait for approval before retrying.
+When you see `policy_denied`, do not treat it as final if the user task still needs that request. Read `/etc/openshell/skills/policy_advisor.md` or `$HOME/.claude/skills/policy-advisor/policy_advisor.md` and use `http://policy.local` to submit the narrowest policy proposal, then wait for approval before retrying.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +27,33 @@ pub struct InstalledSkills {
 
 pub fn install_static_skills() -> Result<InstalledSkills> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    install_static_skills_at_with_home(Path::new("/"), home.as_deref())
+    match install_static_skills_at_with_home(Path::new("/"), home.as_deref()) {
+        Ok(installed) => Ok(installed),
+        Err(system_error) => {
+            let Some(home) = home.as_deref() else {
+                return Err(system_error);
+            };
+            install_static_skills_in_home(home).map_err(|home_error| {
+                miette::miette!(
+                    "system skill install failed ({system_error}); home skill install failed ({home_error})"
+                )
+            })
+        }
+    }
+}
+
+fn install_static_skills_in_home(home: &Path) -> Result<InstalledSkills> {
+    let skill_dir = home.join(".claude/skills").join(POLICY_ADVISOR_SKILL_DIR);
+    std::fs::create_dir_all(&skill_dir).into_diagnostic()?;
+    let policy_advisor = skill_dir.join(POLICY_ADVISOR_FILE);
+    let policy_advisor_skill = skill_dir.join(POLICY_ADVISOR_SKILL_FILE);
+    write_readonly(&policy_advisor, POLICY_ADVISOR_CONTENT)?;
+    write_readonly(&policy_advisor_skill, POLICY_ADVISOR_SKILL_CONTENT)?;
+    Ok(InstalledSkills {
+        policy_advisor,
+        policy_advisor_skill,
+        agents: install_optional_agents_pointer(home),
+    })
 }
 
 #[cfg(test)]
@@ -46,6 +72,10 @@ fn install_static_skills_at_with_home(root: &Path, home: Option<&Path>) -> Resul
     std::fs::create_dir_all(&policy_advisor_skill_dir).into_diagnostic()?;
     let policy_advisor_skill = policy_advisor_skill_dir.join(POLICY_ADVISOR_SKILL_FILE);
     write_readonly(&policy_advisor_skill, POLICY_ADVISOR_SKILL_CONTENT)?;
+    write_readonly(
+        &policy_advisor_skill_dir.join(POLICY_ADVISOR_FILE),
+        POLICY_ADVISOR_CONTENT,
+    )?;
 
     // Claude discovers skills below HOME. The canonical /etc copy remains
     // available to other agents and to the policy_denied response guidance.
@@ -169,6 +199,25 @@ mod tests {
             std::fs::read_to_string(installed.policy_advisor_skill).unwrap()
         );
         install_static_skills_at_with_home(dir.path(), Some(&home)).unwrap();
+    }
+
+    #[test]
+    fn install_static_skills_in_home_contains_complete_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = install_static_skills_in_home(dir.path()).unwrap();
+        assert!(installed.policy_advisor_skill.starts_with(dir.path()));
+        assert!(
+            std::fs::read_to_string(&installed.policy_advisor_skill)
+                .unwrap()
+                .contains("policy_denied")
+        );
+        assert!(
+            std::fs::read_to_string(&installed.policy_advisor)
+                .unwrap()
+                .contains("/v1/proposals/{chunk_id}/wait")
+        );
+        assert_eq!(installed.agents, Some(dir.path().join("AGENTS.md")));
+        install_static_skills_in_home(dir.path()).unwrap();
     }
 
     #[test]
