@@ -77,6 +77,13 @@ impl TracingLogBus {
         inner.tails.remove(sandbox_id);
     }
 
+    /// Snapshot of all sandbox_ids that currently have a live bus entry.
+    /// Used by the per-replica eviction sweep to find entries to free.
+    pub fn tracked_ids(&self) -> Vec<String> {
+        let inner = self.inner.lock().expect("tracing bus lock poisoned");
+        inner.per_id.keys().cloned().collect()
+    }
+
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
         let inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner

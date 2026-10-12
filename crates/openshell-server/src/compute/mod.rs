@@ -2111,6 +2111,20 @@ impl ComputeRuntime {
 
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
+
+        // Lease-independent per-replica bus eviction sweep. Runs on EVERY replica, so a
+        // non-holder (which never finalizes a store-row removal and therefore never hits
+        // the delete-time cleanup) still frees the per-sandbox bus state it allocated.
+        // The holder-gated reconcile below only cleans the holder; this closes the leak
+        // on followers.
+        {
+            let sweep_runtime = runtime.clone();
+            let sweep_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                sweep_runtime.bus_eviction_sweep_loop(sweep_shutdown).await;
+            });
+        }
+
         if self.store.is_single_replica() {
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
@@ -2124,6 +2138,36 @@ impl ComputeRuntime {
             tokio::spawn(async move {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
+        }
+    }
+
+    /// Periodically drop per-sandbox bus state for sandbox_ids no longer present in the
+    /// shared store. Runs on every replica (not lease-gated), which is what fixes the
+    /// non-holder leak: followers never finalize a row removal, so without this they never
+    /// call the delete-time cleanup. Interval: OPENSHELL_BUS_SWEEP_INTERVAL_SECS (default 30s).
+    async fn bus_eviction_sweep_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
+        let secs = std::env::var("OPENSHELL_BUS_SWEEP_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(30);
+        let interval = std::time::Duration::from_secs(secs);
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => break,
+                _ = tokio::time::sleep(interval) => {
+                    let tracked = self.tracing_log_bus.tracked_ids();
+                    for id in tracked {
+                        // Only evict when the sandbox is truly gone from the store; skip on
+                        // a transient store error (don't evict live state on a blip).
+                        // cleanup_removed_sandbox_state evicts the sandbox index too, not
+                        // just the three buses (completeness).
+                        if let Ok(None) = self.store.get(Sandbox::object_type(), &id).await {
+                            self.cleanup_removed_sandbox_state(&id);
+                        }
+                    }
+                }
+            }
         }
     }
 
