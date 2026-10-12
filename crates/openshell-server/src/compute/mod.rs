@@ -1903,6 +1903,7 @@ impl ComputeRuntime {
             .await
         {
             Ok(true) => {
+                self.announce_sandbox_removal(sandbox_id).await;
                 self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(true)
             }
@@ -3573,11 +3574,14 @@ impl ComputeRuntime {
             self.cleanup_sandbox_owned_records(sandbox).await?;
         }
 
-        let _ = self
+        let removed = self
             .store
             .delete(Sandbox::object_type(), sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
+        if removed {
+            self.announce_sandbox_removal(sandbox_id).await;
+        }
         self.cleanup_removed_sandbox_state(sandbox_id);
         Ok(())
     }
