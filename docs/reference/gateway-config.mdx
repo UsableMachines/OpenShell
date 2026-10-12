@@ -20,6 +20,10 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
+## Runtime Tuning
+
+`OPENSHELL_BUS_SWEEP_INTERVAL_SECS` sets how often, in whole seconds, each multi-replica gateway runs its per-sandbox bus eviction sweep — the periodic pass that frees in-memory per-sandbox state for sandboxes no longer present in the store. It is env-only, defaults to `30`, and is clamped to a minimum of `5`. Values that are absent, non-numeric, zero, or negative fall back to the default; a value below the floor is clamped up. The default suits normal operation; lower it only to reclaim memory faster on a gateway churning through many short-lived sandboxes, at the cost of more frequent store lookups. The sweep runs only on multi-replica (shared-store) installations; a single-replica gateway reclaims state through its delete and reconcile paths.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.

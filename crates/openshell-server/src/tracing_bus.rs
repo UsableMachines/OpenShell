@@ -3,7 +3,7 @@
 
 //! Capture openshell-server tracing logs for streaming over gRPC.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
@@ -77,11 +77,28 @@ impl TracingLogBus {
         inner.tails.remove(sandbox_id);
     }
 
-    /// Snapshot of all sandbox_ids that currently have a live bus entry.
-    /// Used by the per-replica eviction sweep to find entries to free.
+    /// Snapshot of the sandbox_ids with any live tracing-log-bus entry — the union of the
+    /// `per_id` senders and the `tails` buffers.
+    ///
+    /// Both maps are included deliberately: `publish` inserts the sender and the tail under
+    /// separate lock acquisitions, so a concurrent `remove` landing between them can leave a
+    /// `tails` entry with no `per_id` key. Returning only `per_id` keys would make such an
+    /// orphaned tail invisible to the eviction sweep forever; the union lets the next sweep
+    /// reclaim it.
+    ///
+    /// This still covers the tracing-log bus only; it does not reflect the sibling
+    /// platform-event or sandbox-watch buses, so an id watched for status/events without logs
+    /// will not appear here (extending coverage is tracked separately).
     pub fn tracked_ids(&self) -> Vec<String> {
         let inner = self.inner.lock().expect("tracing bus lock poisoned");
-        inner.per_id.keys().cloned().collect()
+        inner
+            .per_id
+            .keys()
+            .chain(inner.tails.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
@@ -232,6 +249,21 @@ mod tests {
 
         // Verify entries are gone
         assert!(bus.tail(sandbox_id, 10).is_empty());
+    }
+
+    #[test]
+    fn tracked_ids_reflects_live_log_bus_entries() {
+        let bus = TracingLogBus::new();
+        assert!(bus.tracked_ids().is_empty());
+
+        let _a = bus.subscribe("sb-a");
+        let _b = bus.subscribe("sb-b");
+        let mut ids = bus.tracked_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["sb-a".to_string(), "sb-b".to_string()]);
+
+        bus.remove("sb-a");
+        assert_eq!(bus.tracked_ids(), vec!["sb-b".to_string()]);
     }
 
     #[test]
