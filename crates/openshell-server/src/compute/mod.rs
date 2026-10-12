@@ -346,7 +346,10 @@ fn resolve_bus_sweep_interval(raw: Result<String, std::env::VarError>) -> Durati
     let configured = match raw {
         Err(std::env::VarError::NotPresent) => return BUS_SWEEP_INTERVAL,
         Err(std::env::VarError::NotUnicode(_)) => {
-            warn!("{BUS_SWEEP_INTERVAL_ENV} is not valid UTF-8; using default");
+            warn!(
+                default_secs = BUS_SWEEP_INTERVAL.as_secs(),
+                "{BUS_SWEEP_INTERVAL_ENV} is not valid UTF-8; using default",
+            );
             return BUS_SWEEP_INTERVAL;
         }
         Ok(raw) => match raw.parse::<u64>() {
@@ -9170,6 +9173,11 @@ mod tests {
         // unset -> default
         assert_eq!(
             resolve_bus_sweep_interval(Err(VarError::NotPresent)),
+            BUS_SWEEP_INTERVAL
+        );
+        // not valid UTF-8 -> default
+        assert_eq!(
+            resolve_bus_sweep_interval(Err(VarError::NotUnicode(std::ffi::OsString::from("x")))),
             BUS_SWEEP_INTERVAL
         );
         // valid override
