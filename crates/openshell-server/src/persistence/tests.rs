@@ -517,7 +517,7 @@ async fn postgres_existing_ids_and_notify_round_trip() {
         .put("sandbox", &id, &id, "default", b"payload", None)
         .await
         .unwrap();
-    let mut ids = vec![id.clone(), "pg-test-missing".to_string()];
+    let mut ids = vec![id.clone()];
     ids.extend((0..super::DELETE_MANY_BATCH_SIZE).map(|idx| format!("pg-test-absent-{idx}")));
     assert_eq!(
         store.existing_ids("sandbox", &ids).await.unwrap(),

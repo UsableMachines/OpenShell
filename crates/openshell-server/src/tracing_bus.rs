@@ -57,12 +57,7 @@ impl TracingLogBus {
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         let now_ms = openshell_core::time::now_ms();
-        match inner.last_active_ms.get_mut(sandbox_id) {
-            Some(last_active_ms) => *last_active_ms = now_ms,
-            None => {
-                inner.last_active_ms.insert(sandbox_id.to_string(), now_ms);
-            }
-        }
+        inner.last_active_ms.insert(sandbox_id.to_string(), now_ms);
         inner
             .per_id
             .entry(sandbox_id.to_string())

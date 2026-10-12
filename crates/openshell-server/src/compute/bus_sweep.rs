@@ -1,17 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Modes for the per-replica bus eviction sweep, selected by `OPENSHELL_BUS_SWEEP_MODE`.
-//!
-//! `full`, the default, checks every tracked id against the store on every pass (see
-//! `ComputeRuntime::run_bus_eviction_sweep`). The other modes narrow what a pass checks:
-//!
-//! - `idle` checks only ids with no log activity for [`IDLE_QUIET_PERIOD`], and backs off ids
-//!   that it keeps finding present.
-//! - `tombstone` records each sandbox-row removal in the store, and each pass reads only the
-//!   removals recorded since the previous pass.
-//! - `notify` announces each removal with Postgres `NOTIFY`, and every replica frees the named
-//!   state as soon as its `LISTEN` connection delivers it.
+//! Modes for the per-replica bus eviction sweep, selected by `OPENSHELL_BUS_SWEEP_MODE`; each
+//! [`BusSweepMode`] variant says how a pass finds the state to free.
 //!
 //! The `tombstone` and `notify` modes also run a full pass every [`BACKSTOP_INTERVAL`] for ids
 //! that no removal signal names, such as a failed create or a watch that subscribed after cleanup.
