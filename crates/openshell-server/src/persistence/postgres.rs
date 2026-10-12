@@ -15,6 +15,7 @@ use openshell_core::proto::Sandbox;
 use prost::Message;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
+use std::collections::HashSet;
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
@@ -478,6 +479,32 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
                 .rows_affected();
         }
         Ok(deleted)
+    }
+
+    pub async fn existing_ids(
+        &self,
+        object_type: &str,
+        ids: &[String],
+    ) -> PersistenceResult<HashSet<String>> {
+        let mut existing = HashSet::new();
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<Postgres>::new("SELECT id FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            let rows = query
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            existing.extend(rows.iter().map(|row| row.get::<String, _>("id")));
+        }
+        Ok(existing)
     }
 
     pub async fn count_in_workspace(

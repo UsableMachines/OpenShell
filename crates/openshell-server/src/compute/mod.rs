@@ -2226,45 +2226,46 @@ impl ComputeRuntime {
     /// rather than tearing down a live stream; a genuinely-gone sandbox is still evicted, one
     /// interval later. The grace assumes a committed row becomes visible within one sweep
     /// interval (true for the strongly-consistent shared store); a very low interval override
-    /// narrows that window. It also assumes sandbox ids are not reused, so an `Ok(None)` for a
+    /// narrows that window. It also assumes sandbox ids are not reused, so an absent row for a
     /// tracked id always refers to the same sandbox whose bus state is being freed.
     ///
-    /// Only `Ok(None)` (a confirmed absence) counts; a store error skips the id (and is logged
-    /// once per pass, with a sample error) so a transient store blip never evicts live state and
-    /// never starts the grace clock. A store error resets the grace for that id, so eviction is
-    /// eventual *absent sustained store errors* — acceptable because a persistently failing
-    /// store is itself an alarmed condition and is logged here. Candidate ids come from the log
-    /// bus only; extending the sweep to the event and watch buses is tracked separately.
+    /// All tracked ids are checked with one batched [`Store::existing_ids`] read, so a pass
+    /// costs `ceil(tracked / DELETE_MANY_BATCH_SIZE)` round trips. Only a successful read
+    /// counts as a confirmed absence; a store error evicts nothing this pass (and is logged) so
+    /// a transient store blip never evicts live state and never starts the grace clock. A
+    /// store error resets the grace, so eviction is eventual *absent sustained store errors* —
+    /// acceptable because a persistently failing store is itself an alarmed condition and is
+    /// logged here. Candidate ids come from the log bus only; extending the sweep to the event
+    /// and watch buses is tracked separately.
     /// `cleanup_removed_sandbox_state` still frees all three buses plus the sandbox index for
     /// each id it does evict.
     async fn run_bus_eviction_sweep(&self, absent_prev: HashSet<String>) -> HashSet<String> {
-        let mut absent_now = HashSet::new();
-        let mut store_errors = 0usize;
-        let mut sample_error: Option<String> = None;
-        for id in self.tracing_log_bus.tracked_ids() {
-            match self.store.get(Sandbox::object_type(), &id).await {
-                Ok(None) => {
-                    if absent_prev.contains(&id) {
-                        self.cleanup_removed_sandbox_state(&id);
-                    } else {
-                        absent_now.insert(id);
-                    }
-                }
-                Ok(Some(_)) => {}
-                Err(err) => {
-                    store_errors += 1;
-                    if sample_error.is_none() {
-                        sample_error = Some(err.to_string());
-                    }
-                }
+        let tracked = self.tracing_log_bus.tracked_ids();
+        let present = match self
+            .store
+            .existing_ids(Sandbox::object_type(), &tracked)
+            .await
+        {
+            Ok(present) => present,
+            Err(err) => {
+                warn!(
+                    tracked = tracked.len(),
+                    error = %err,
+                    "bus eviction sweep: store lookup failed; skipped this pass"
+                );
+                return HashSet::new();
             }
-        }
-        if store_errors > 0 {
-            warn!(
-                store_errors,
-                error = sample_error.as_deref().unwrap_or("unknown"),
-                "bus eviction sweep: store lookups failed; skipped those ids this pass"
-            );
+        };
+        let mut absent_now = HashSet::new();
+        for id in tracked {
+            if present.contains(&id) {
+                continue;
+            }
+            if absent_prev.contains(&id) {
+                self.cleanup_removed_sandbox_state(&id);
+            } else {
+                absent_now.insert(id);
+            }
         }
         absent_now
     }

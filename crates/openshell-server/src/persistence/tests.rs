@@ -462,6 +462,43 @@ async fn delete_many_is_bounded_idempotent_and_type_scoped() {
 }
 
 #[tokio::test]
+async fn existing_ids_spans_batches_and_is_type_scoped() {
+    let store = test_store().await;
+    let mut ids = Vec::new();
+    for idx in 0..(super::DELETE_MANY_BATCH_SIZE + 12) {
+        let id = format!("sandbox-{idx}");
+        store
+            .put(
+                "sandbox",
+                &id,
+                &format!("name-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+    let present: std::collections::HashSet<String> = ids.iter().cloned().collect();
+
+    ids.extend(["missing".to_string(), "other-type".to_string()]);
+    assert_eq!(store.existing_ids("sandbox", &ids).await.unwrap(), present);
+    assert!(store.existing_ids("sandbox", &[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
