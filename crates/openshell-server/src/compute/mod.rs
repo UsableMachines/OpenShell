@@ -7,6 +7,8 @@ pub mod driver_config;
 pub mod lease;
 pub mod rootfs_tar;
 
+mod bus_sweep;
+
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
@@ -670,6 +672,8 @@ pub struct ComputeRuntime {
     /// clones: `ServerState` holds `ComputeRuntime` by value, so a per-clone
     /// table would make a token minted on one clone invisible to another.
     rootfs_tar_staging: Arc<rootfs_tar::RootfsTarStagingRegistry>,
+    /// How the bus eviction sweep finds per-sandbox state to free; see [`bus_sweep`].
+    bus_sweep_mode: bus_sweep::BusSweepMode,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -799,6 +803,7 @@ impl ComputeRuntime {
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
+            bus_sweep_mode: bus_sweep::bus_sweep_mode(),
         })
     }
 
@@ -2166,7 +2171,7 @@ impl ComputeRuntime {
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
 
-        // Lease-independent bus eviction sweep; see `bus_eviction_sweep_loop`. Spawned on
+        // Lease-independent bus eviction sweep; see `bus_sweep_loop`. Spawned on
         // EVERY replica, single-replica included: besides fixing the multi-replica non-holder
         // leak, it is the backstop that reclaims a bus entry created by a watch that passed its
         // row check and then subscribed just after the row was deleted and the delete-time
@@ -2175,7 +2180,7 @@ impl ComputeRuntime {
         let sweep_runtime = runtime.clone();
         let sweep_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            sweep_runtime.bus_eviction_sweep_loop(sweep_shutdown).await;
+            sweep_runtime.bus_sweep_loop(sweep_shutdown).await;
         });
 
         if self.store.is_single_replica() {
@@ -5213,6 +5218,7 @@ pub async fn new_test_runtime_with_driver(
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
+        bus_sweep_mode: bus_sweep::BusSweepMode::default(),
     }
 }
 
@@ -6085,6 +6091,7 @@ mod tests {
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
+            bus_sweep_mode: bus_sweep::BusSweepMode::default(),
         }
     }
 
@@ -6108,7 +6115,7 @@ mod tests {
         );
     }
 
-    fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
+    pub(super) fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),

@@ -24,6 +24,11 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `OPENSHELL_BUS_SWEEP_INTERVAL_SECS` sets how often, in whole seconds, the gateway runs its per-sandbox bus eviction sweep — the periodic pass that frees in-memory per-sandbox state for sandboxes no longer present in the store. It is env-only, defaults to `30`, and is clamped to a minimum of `5`. Values that are absent, non-numeric, zero, or negative fall back to the default; a value below the floor is clamped up. The default suits normal operation; lower it only to reclaim memory faster on a gateway churning through many short-lived sandboxes, at the cost of more frequent store lookups. The sweep applies a one-cycle grace (it frees an id only after two consecutive sweeps find it gone) so a sandbox whose store row is briefly not yet visible at create time is not torn down; a very low interval narrows that grace window, so keep it comfortably above expected create latency.
 
+`OPENSHELL_BUS_SWEEP_MODE` selects how each sweep pass finds the state to free. It is env-only and defaults to `full`; an unknown value falls back to `full` with a warning. Set the same mode on every replica of one installation.
+
+- `full` checks every tracked sandbox against the store on every pass.
+- `idle` checks only sandboxes with no log activity in the last 5 minutes, and waits longer between checks, up to 10 minutes, for a sandbox it keeps finding present. It does fewer store reads than `full`, but can free memory up to about 10 minutes after a sandbox is removed.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.

@@ -24,6 +24,8 @@ pub struct TracingLogBus {
 struct Inner {
     per_id: HashMap<String, broadcast::Sender<SandboxStreamEvent>>,
     tails: HashMap<String, VecDeque<SandboxStreamEvent>>,
+    /// Epoch ms of the latest subscribe or publish per id; read by the idle sweep mode.
+    last_active_ms: HashMap<String, i64>,
 }
 
 impl Default for TracingLogBus {
@@ -39,6 +41,7 @@ impl TracingLogBus {
             inner: Arc::new(Mutex::new(Inner {
                 per_id: HashMap::new(),
                 tails: HashMap::new(),
+                last_active_ms: HashMap::new(),
             })),
             platform_event_bus: PlatformEventBus::new(),
         }
@@ -53,6 +56,13 @@ impl TracingLogBus {
 
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+        let now_ms = openshell_core::time::now_ms();
+        match inner.last_active_ms.get_mut(sandbox_id) {
+            Some(last_active_ms) => *last_active_ms = now_ms,
+            None => {
+                inner.last_active_ms.insert(sandbox_id.to_string(), now_ms);
+            }
+        }
         inner
             .per_id
             .entry(sandbox_id.to_string())
@@ -75,6 +85,7 @@ impl TracingLogBus {
         let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner.per_id.remove(sandbox_id);
         inner.tails.remove(sandbox_id);
+        inner.last_active_ms.remove(sandbox_id);
     }
 
     /// Snapshot of the `sandbox_ids` with any live tracing-log-bus entry — the union of the
@@ -98,6 +109,21 @@ impl TracingLogBus {
             .cloned()
             .collect::<HashSet<_>>()
             .into_iter()
+            .collect()
+    }
+
+    /// [`Self::tracked_ids`], each with its latest subscribe or publish time in epoch ms. An
+    /// orphaned tail has no recorded activity and reports 0, so an idle sweep checks it first.
+    pub fn tracked_activity(&self) -> HashMap<String, i64> {
+        let inner = self.inner.lock().expect("tracing bus lock poisoned");
+        inner
+            .per_id
+            .keys()
+            .chain(inner.tails.keys())
+            .map(|id| {
+                let last_active_ms = inner.last_active_ms.get(id).copied().unwrap_or(0);
+                (id.clone(), last_active_ms)
+            })
             .collect()
     }
 
@@ -293,6 +319,30 @@ mod tests {
         let _rx = bus.subscribe("sb-dup"); // per_id
         bus.publish_external(make_log_event("sb-dup", "y")); // per_id + tails
         assert_eq!(bus.tracked_ids(), vec!["sb-dup".to_string()]);
+    }
+
+    #[test]
+    fn tracked_activity_reports_latest_touch_and_zero_for_orphans() {
+        let bus = TracingLogBus::new();
+        let before_ms = openshell_core::time::now_ms();
+        let _rx = bus.subscribe("sb-live");
+        bus.publish_external(make_log_event("sb-orphan", "x"));
+        {
+            // Simulate the publish/remove race: the tail outlives its sender and activity.
+            let mut inner = bus.inner.lock().expect("lock");
+            inner.per_id.remove("sb-orphan");
+            inner.last_active_ms.remove("sb-orphan");
+        }
+
+        let activity = bus.tracked_activity();
+        assert_eq!(activity.len(), 2);
+        assert!(activity["sb-live"] >= before_ms);
+        assert_eq!(activity["sb-orphan"], 0);
+
+        bus.remove("sb-live");
+        bus.remove("sb-orphan");
+        assert!(bus.tracked_activity().is_empty());
+        assert!(bus.inner.lock().expect("lock").last_active_ms.is_empty());
     }
 
     #[test]
