@@ -10,18 +10,23 @@
 //!   that it keeps finding present.
 //! - `tombstone` records each sandbox-row removal in the store, and each pass reads only the
 //!   removals recorded since the previous pass.
+//! - `notify` announces each removal with Postgres `NOTIFY`, and every replica frees the named
+//!   state as soon as its `LISTEN` connection delivers it.
 //!
-//! The `tombstone` mode also runs a full pass every [`BACKSTOP_INTERVAL`] for ids that no
-//! removal record names, such as a failed create or a watch that subscribed after cleanup.
+//! The `tombstone` and `notify` modes also run a full pass every [`BACKSTOP_INTERVAL`] for ids
+//! that no removal signal names, such as a failed create or a watch that subscribed after cleanup.
 
 use super::{ComputeRuntime, bus_sweep_interval};
-use crate::persistence::{ObjectCursor, ObjectType, WriteCondition};
+use crate::persistence::{
+    ObjectCursor, ObjectType, PersistenceResult, StoreListener, WriteCondition,
+};
 use openshell_core::proto::Sandbox;
 use openshell_core::time::now_ms;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 /// Env override that selects the [`BusSweepMode`]; see `docs/reference/gateway-config.mdx`.
@@ -51,6 +56,9 @@ const TOMBSTONE_PAGE_SIZE: u32 = 500;
 /// How often the signal-driven modes run a full pass for ids that no removal signal names.
 const BACKSTOP_INTERVAL: Duration = Duration::from_mins(10);
 
+/// Postgres channel that carries sandbox-row removals in the `notify` mode.
+const SANDBOX_REMOVED_CHANNEL: &str = "openshell_sandbox_removed";
+
 /// How each sweep pass finds the per-sandbox bus state to free.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum BusSweepMode {
@@ -61,6 +69,8 @@ pub(super) enum BusSweepMode {
     Idle,
     /// Read the removals recorded since the previous pass, with a periodic full pass.
     Tombstone,
+    /// Free state when Postgres delivers a removal notification, with a periodic full pass.
+    Notify,
 }
 
 impl BusSweepMode {
@@ -69,6 +79,7 @@ impl BusSweepMode {
             "full" => Some(Self::Full),
             "idle" => Some(Self::Idle),
             "tombstone" => Some(Self::Tombstone),
+            "notify" => Some(Self::Notify),
             _ => None,
         }
     }
@@ -78,6 +89,7 @@ impl BusSweepMode {
             Self::Full => "full",
             Self::Idle => "idle",
             Self::Tombstone => "tombstone",
+            Self::Notify => "notify",
         }
     }
 }
@@ -163,6 +175,14 @@ fn tombstone_object_id(sandbox_id: &str) -> String {
     format!("{TOMBSTONE_OBJECT_TYPE}:{sandbox_id}")
 }
 
+/// The next removal from `listener`; never completes while there is no listener.
+async fn next_removal(listener: Option<&mut StoreListener>) -> PersistenceResult<Option<String>> {
+    match listener {
+        Some(listener) => listener.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The full pass that signal-driven modes run every [`BACKSTOP_INTERVAL`], with the same
 /// two-pass grace as the `full` mode.
 struct Backstop {
@@ -200,6 +220,7 @@ impl ComputeRuntime {
             BusSweepMode::Full => self.bus_eviction_sweep_loop(cancel).await,
             BusSweepMode::Idle => self.idle_bus_sweep_loop(cancel).await,
             BusSweepMode::Tombstone => self.tombstone_bus_sweep_loop(cancel).await,
+            BusSweepMode::Notify => self.notify_bus_sweep_loop(cancel).await,
         }
     }
 
@@ -229,6 +250,64 @@ impl ComputeRuntime {
                         error = %err,
                         "failed to record sandbox tombstone; a backstop pass will free its state"
                     );
+                }
+            }
+            BusSweepMode::Notify => {
+                if let Err(err) = self.store.notify(SANDBOX_REMOVED_CHANNEL, sandbox_id).await {
+                    warn!(
+                        sandbox_id,
+                        error = %err,
+                        "failed to announce sandbox removal; a backstop pass will free its state"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn notify_bus_sweep_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
+        let interval = bus_sweep_interval();
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut backstop = Backstop::new();
+        let mut listener = None;
+        // `SQLite` has no listener; its only replica already frees state when it removes a row.
+        let mut wants_listener = true;
+        // At most one listen attempt per interval, so a failing database is not hammered.
+        let mut listen_due = true;
+        loop {
+            if wants_listener && listen_due && listener.is_none() {
+                listen_due = false;
+                match self.store.listen(SANDBOX_REMOVED_CHANNEL).await {
+                    Ok(Some(opened)) => {
+                        listener = Some(opened);
+                        // Removals sent while no listener was open are lost; recheck everything.
+                        backstop.run(&self).await;
+                    }
+                    Ok(None) => wants_listener = false,
+                    Err(err) => warn!(
+                        error = %err,
+                        "notify bus sweep: listen failed; retrying next interval"
+                    ),
+                }
+            }
+            tokio::select! {
+                _ = cancel.changed() => break,
+                removal = next_removal(listener.as_mut()) => match removal {
+                    Ok(Some(sandbox_id)) => self.cleanup_removed_sandbox_state(&sandbox_id),
+                    Ok(None) => {
+                        warn!("notify bus sweep: listener reconnected; rechecking every tracked id");
+                        backstop.run(&self).await;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "notify bus sweep: listener failed; reopening it next interval");
+                        listener = None;
+                    }
+                },
+                _ = ticks.tick() => {
+                    listen_due = true;
+                    if backstop.is_due() {
+                        backstop.run(&self).await;
+                    }
                 }
             }
         }
@@ -680,5 +759,103 @@ mod tests {
         );
         backstop.run(&runtime).await;
         assert!(runtime.tracing_log_bus.tracked_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_loop_without_a_listener_stops_on_cancel() {
+        let mut runtime = runtime().await;
+        runtime.bus_sweep_mode = BusSweepMode::Notify;
+        let runtime = Arc::new(runtime);
+        // `SQLite` has no other replica, so the announcement is a no-op rather than an error.
+        runtime.announce_sandbox_removal("sb-1").await;
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sweep = tokio::spawn(runtime.clone().notify_bus_sweep_loop(cancel_rx));
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sweep)
+            .await
+            .expect("the loop stops on cancel")
+            .unwrap();
+    }
+
+    fn postgres_url() -> String {
+        std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("OPENSHELL_TEST_POSTGRES_URL")
+    }
+
+    async fn postgres_runtime(mode: BusSweepMode) -> ComputeRuntime {
+        let store = Store::connect(&postgres_url()).await.unwrap();
+        let mut runtime = new_test_runtime(Arc::new(store)).await;
+        runtime.bus_sweep_mode = mode;
+        runtime
+    }
+
+    /// Two replicas on one Postgres database: a removal that one announces frees the state that
+    /// the other holds. Run like the store's `postgres_` tests.
+    #[tokio::test]
+    #[ignore = "needs OPENSHELL_TEST_POSTGRES_URL"]
+    async fn postgres_tombstone_mode_frees_state_on_another_replica() {
+        let writer = postgres_runtime(BusSweepMode::Tombstone).await;
+        let reader = postgres_runtime(BusSweepMode::Tombstone).await;
+        let id = format!("pg-sb-{}", uuid::Uuid::new_v4());
+        let _rx = reader.tracing_log_bus.subscribe(&id);
+        let read_from_ms = now_ms() - as_ms(TOMBSTONE_READ_OVERLAP);
+
+        writer.announce_sandbox_removal(&id).await;
+        assert!(reader.free_tombstoned_sandboxes(read_from_ms).await);
+        assert!(reader.tracing_log_bus.tracked_ids().is_empty());
+        writer.expire_tombstones(now_ms() + 1_000).await;
+        assert!(!has_tombstone(&writer, &id).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OPENSHELL_TEST_POSTGRES_URL"]
+    async fn postgres_notify_mode_frees_state_on_another_replica() {
+        let writer = postgres_runtime(BusSweepMode::Notify).await;
+        let reader = Arc::new(postgres_runtime(BusSweepMode::Notify).await);
+        let id = format!("pg-sb-{}", uuid::Uuid::new_v4());
+        let _rx = reader.tracing_log_bus.subscribe(&id);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sweep = tokio::spawn(reader.clone().notify_bus_sweep_loop(cancel_rx));
+
+        announce_until_freed(&writer, &reader, &id).await;
+
+        // Drop the listener's connection; the loop must reconnect and keep receiving.
+        let admin = sqlx::PgPool::connect(&postgres_url()).await.unwrap();
+        let terminated: Vec<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND query ILIKE 'LISTEN%' AND query LIKE $1",
+        )
+        .bind(format!("%{SANDBOX_REMOVED_CHANNEL}%"))
+        .fetch_all(&admin)
+        .await
+        .unwrap();
+        assert!(
+            terminated.contains(&true),
+            "a listener connection was dropped"
+        );
+        let next_id = format!("pg-sb-{}", uuid::Uuid::new_v4());
+        let _next_rx = reader.tracing_log_bus.subscribe(&next_id);
+        announce_until_freed(&writer, &reader, &next_id).await;
+
+        cancel_tx.send(true).unwrap();
+        sweep.await.unwrap();
+    }
+
+    /// Repeat an idempotent announcement until `reader` frees `id`, because the reader's
+    /// listener may not be open yet.
+    async fn announce_until_freed(writer: &ComputeRuntime, reader: &ComputeRuntime, id: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reader
+                .tracing_log_bus
+                .tracked_ids()
+                .iter()
+                .any(|tracked| tracked == id)
+            {
+                writer.announce_sandbox_removal(id).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the other replica frees the state");
     }
 }

@@ -499,6 +499,47 @@ async fn existing_ids_spans_batches_and_is_type_scoped() {
 }
 
 #[tokio::test]
+async fn notify_and_listen_are_noops_on_sqlite() {
+    let store = test_store().await;
+    store.notify("openshell_test", "payload").await.unwrap();
+    assert!(store.listen("openshell_test").await.unwrap().is_none());
+}
+
+/// Postgres-only paths. Run against a scratch database with
+/// `OPENSHELL_TEST_POSTGRES_URL=postgres://… cargo test -p openshell-server --lib -- --ignored postgres_`.
+#[tokio::test]
+#[ignore = "needs OPENSHELL_TEST_POSTGRES_URL"]
+async fn postgres_existing_ids_and_notify_round_trip() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("OPENSHELL_TEST_POSTGRES_URL");
+    let store = Store::connect(&url).await.expect("connect to Postgres");
+    let id = format!("pg-test-{}", uuid::Uuid::new_v4());
+    store
+        .put("sandbox", &id, &id, "default", b"payload", None)
+        .await
+        .unwrap();
+    let mut ids = vec![id.clone(), "pg-test-missing".to_string()];
+    ids.extend((0..super::DELETE_MANY_BATCH_SIZE).map(|idx| format!("pg-test-absent-{idx}")));
+    assert_eq!(
+        store.existing_ids("sandbox", &ids).await.unwrap(),
+        std::collections::HashSet::from([id.clone()])
+    );
+
+    let mut listener = store
+        .listen("openshell_test")
+        .await
+        .unwrap()
+        .expect("Postgres provides a listener");
+    store.notify("openshell_test", &id).await.unwrap();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+        .await
+        .expect("notification arrives")
+        .unwrap();
+    assert_eq!(received, Some(id.clone()));
+
+    store.delete("sandbox", &id).await.unwrap();
+}
+
+#[tokio::test]
 async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

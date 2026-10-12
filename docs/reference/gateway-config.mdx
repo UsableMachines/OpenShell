@@ -29,6 +29,7 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 - `full` checks every tracked sandbox against the store on every pass.
 - `idle` checks only sandboxes with no log activity in the last 5 minutes, and waits longer between checks, up to 10 minutes, for a sandbox it keeps finding present. It does fewer store reads than `full`, but can free memory up to about 10 minutes after a sandbox is removed.
 - `tombstone` records each sandbox removal in the store, and each pass reads only the removals recorded since the previous pass. Its reads do not grow with the number of tracked sandboxes, and it frees memory within one interval. Each removal adds one row that expires after 1 hour. A full pass also runs every 10 minutes for state that no removal names, such as a failed create.
+- `notify` announces each sandbox removal with PostgreSQL `LISTEN`/`NOTIFY`, so every replica frees the memory within moments, with no per-pass reads. Each replica holds one extra database connection for the listener. A notification sent while a listener is disconnected is lost, so the gateway runs a full pass after each reconnect and every 10 minutes. On SQLite, `notify` runs only the 10-minute full pass, because the single replica frees memory when it removes a sandbox.
 
 ## Package-Managed Locations
 

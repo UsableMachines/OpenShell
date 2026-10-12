@@ -13,7 +13,7 @@ use crate::policy_store::{
 use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 use std::collections::HashSet;
 
@@ -49,6 +49,36 @@ impl PostgresStore {
     pub async fn ping(&self) -> PersistenceResult<()> {
         let mut conn = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
         conn.ping().await.map_err(|e| map_db_error(&e))
+    }
+
+    pub async fn notify(&self, channel: &str, payload: &str) -> PersistenceResult<()> {
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(channel)
+            .bind(payload)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    /// Listen on `channel` through a dedicated one-connection pool, so the listener never holds
+    /// one of the store pool's connections.
+    pub async fn listen(&self, channel: &str) -> PersistenceResult<PgListener> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect_with((*self.pool.connect_options()).clone())
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let mut listener = PgListener::connect_with(&pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        listener
+            .listen(channel)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(listener)
     }
 
     /// Test support only: close the underlying connection pool.

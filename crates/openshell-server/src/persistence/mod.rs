@@ -151,6 +151,21 @@ pub struct WriteResult {
     pub updated_at_ms: i64,
 }
 
+/// A `LISTEN` subscription on a store notification channel. Only Postgres provides one.
+pub struct StoreListener(sqlx::postgres::PgListener);
+
+impl StoreListener {
+    /// Wait for the next notification payload. `Ok(None)` means the connection dropped and was
+    /// re-established, so notifications sent in between were lost.
+    pub async fn recv(&mut self) -> PersistenceResult<Option<String>> {
+        self.0
+            .try_recv()
+            .await
+            .map(|notification| notification.map(|n| n.payload().to_string()))
+            .map_err(|e| map_db_error(&e))
+    }
+}
+
 /// Persistence store implementations.
 #[derive(Debug, Clone)]
 pub enum Store {
@@ -262,6 +277,23 @@ impl Store {
     /// Verify connectivity to the underlying database.
     pub async fn ping(&self) -> PersistenceResult<()> {
         store_dispatch!(self.ping())
+    }
+
+    /// Send `payload` to every listener on `channel`. A no-op on `SQLite`, where one process
+    /// owns the database and there is no other replica to tell.
+    pub async fn notify(&self, channel: &str, payload: &str) -> PersistenceResult<()> {
+        match self {
+            Self::Postgres(store) => store.notify(channel, payload).await,
+            Self::Sqlite(_) => Ok(()),
+        }
+    }
+
+    /// Listen on `channel`, or `None` on `SQLite` (see [`Store::notify`]).
+    pub async fn listen(&self, channel: &str) -> PersistenceResult<Option<StoreListener>> {
+        match self {
+            Self::Postgres(store) => store.listen(channel).await.map(|l| Some(StoreListener(l))),
+            Self::Sqlite(_) => Ok(None),
+        }
     }
 
     /// Test support only: close the underlying connection pool.
