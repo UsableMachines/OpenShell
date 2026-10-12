@@ -339,8 +339,9 @@ fn bus_sweep_interval() -> Duration {
 }
 
 /// Pure resolver for [`bus_sweep_interval`], split out so it can be unit-tested without
-/// mutating the process environment. A present-but-invalid value (absent, not UTF-8, not
-/// a positive integer) is logged and ignored; a valid value below the floor is clamped up.
+/// mutating the process environment. An absent value falls back to the default silently; a
+/// present-but-invalid value (not UTF-8, or not a positive integer) is logged and ignored; a
+/// valid value below [`BUS_SWEEP_MIN_INTERVAL`] is logged and clamped up.
 fn resolve_bus_sweep_interval(raw: Result<String, std::env::VarError>) -> Duration {
     let configured = match raw {
         Err(std::env::VarError::NotPresent) => return BUS_SWEEP_INTERVAL,
@@ -2162,6 +2163,18 @@ impl ComputeRuntime {
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
 
+        // Lease-independent bus eviction sweep; see `bus_eviction_sweep_loop`. Spawned on
+        // EVERY replica, single-replica included: besides fixing the multi-replica non-holder
+        // leak, it is the backstop that reclaims a bus entry created by a watch that passed its
+        // row check and then subscribed just after the row was deleted and the delete-time
+        // cleanup had already run. It is cheap and idempotent where the delete/reconcile paths
+        // already clean up.
+        let sweep_runtime = runtime.clone();
+        let sweep_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            sweep_runtime.bus_eviction_sweep_loop(sweep_shutdown).await;
+        });
+
         if self.store.is_single_replica() {
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
@@ -2172,23 +2185,15 @@ impl ComputeRuntime {
                 runtime.reconcile_loop(shutdown_rx).await;
             });
         } else {
-            // Lease-independent bus eviction sweep; see `bus_eviction_sweep_loop`. Only
-            // multi-replica runs leak (the sole single-replica node is always the holder and
-            // cleans up via the delete/reconcile paths), so the sweep is spawned here only.
-            let sweep_runtime = runtime.clone();
-            let sweep_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
-                sweep_runtime.bus_eviction_sweep_loop(sweep_shutdown).await;
-            });
             tokio::spawn(async move {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
         }
     }
 
-    /// Periodically drop per-sandbox bus state for sandbox_ids no longer present in the
-    /// shared store. Runs on every multi-replica node (not lease-gated), which is what fixes
-    /// the non-holder leak: a follower only finalizes a store-row removal for deletes it
+    /// Periodically drop per-sandbox bus state for `sandbox_ids` no longer present in the
+    /// shared store. Runs on every replica (not lease-gated), which is what fixes the
+    /// non-holder leak: a follower only finalizes a store-row removal for deletes it
     /// serves itself, so for sandboxes deleted elsewhere (by the holder's reconcile, or a
     /// delete served by another replica) it never reaches the delete-time cleanup and keeps
     /// the per-sandbox state it allocated. The holder-gated reconcile frees only the holder.
@@ -2213,19 +2218,26 @@ impl ComputeRuntime {
     /// pass (feed it back on the next call).
     ///
     /// An id is evicted only when it was *also* absent on the previous pass (`absent_prev`) —
-    /// a one-cycle grace. A live sandbox's row becomes visible within one sweep interval, so
-    /// this spares an entry whose row is momentarily not yet visible (e.g. a create-time race
-    /// where a log line populated the bus just before the row is readable) rather than tearing
-    /// down a live stream; a genuinely-gone sandbox is still evicted, one interval later.
+    /// a one-cycle grace. This spares an entry whose row is momentarily not yet visible (e.g. a
+    /// create-time race where a log line populated the bus just before the row is readable)
+    /// rather than tearing down a live stream; a genuinely-gone sandbox is still evicted, one
+    /// interval later. The grace assumes a committed row becomes visible within one sweep
+    /// interval (true for the strongly-consistent shared store); a very low interval override
+    /// narrows that window. It also assumes sandbox ids are not reused, so an `Ok(None)` for a
+    /// tracked id always refers to the same sandbox whose bus state is being freed.
     ///
     /// Only `Ok(None)` (a confirmed absence) counts; a store error skips the id (and is logged
-    /// once per pass) so a transient store blip never evicts live state and never starts the
-    /// grace clock. Candidate ids come from the log bus only; extending the sweep to the event
-    /// and watch buses is tracked separately. `cleanup_removed_sandbox_state` still frees all
-    /// three buses plus the sandbox index for each id it does evict.
+    /// once per pass, with a sample error) so a transient store blip never evicts live state and
+    /// never starts the grace clock. A store error resets the grace for that id, so eviction is
+    /// eventual *absent sustained store errors* — acceptable because a persistently failing
+    /// store is itself an alarmed condition and is logged here. Candidate ids come from the log
+    /// bus only; extending the sweep to the event and watch buses is tracked separately.
+    /// `cleanup_removed_sandbox_state` still frees all three buses plus the sandbox index for
+    /// each id it does evict.
     async fn run_bus_eviction_sweep(&self, absent_prev: HashSet<String>) -> HashSet<String> {
         let mut absent_now = HashSet::new();
         let mut store_errors = 0usize;
+        let mut sample_error: Option<String> = None;
         for id in self.tracing_log_bus.tracked_ids() {
             match self.store.get(Sandbox::object_type(), &id).await {
                 Ok(None) => {
@@ -2236,12 +2248,18 @@ impl ComputeRuntime {
                     }
                 }
                 Ok(Some(_)) => {}
-                Err(_) => store_errors += 1,
+                Err(err) => {
+                    store_errors += 1;
+                    if sample_error.is_none() {
+                        sample_error = Some(err.to_string());
+                    }
+                }
             }
         }
         if store_errors > 0 {
             warn!(
                 store_errors,
+                error = sample_error.as_deref().unwrap_or("unknown"),
                 "bus eviction sweep: store lookups failed; skipped those ids this pass"
             );
         }
@@ -2908,7 +2926,7 @@ impl ComputeRuntime {
         let backend_ids = backend_sandboxes
             .iter()
             .map(|sandbox| sandbox.id.clone())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         tracing::Span::current().record("backend_count", backend_sandboxes.len());
 
         for sandbox in backend_sandboxes {
