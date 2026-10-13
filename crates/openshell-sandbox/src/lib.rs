@@ -2360,6 +2360,10 @@ async fn fleet_target(endpoint: &str, sandbox_id: &str, attempt: usize) -> Resul
 /// [`gateway_fleet::unary_endpoint`](openshell_supervisor_process::gateway_fleet::unary_endpoint)
 /// costs one. Membership that cannot be resolved yet is a retryable error, so
 /// the backoff covers a sandbox that starts while the fleet is still coming up.
+#[allow(
+    clippy::future_not_send,
+    reason = "the retry helper accepts caller futures without a Send bound"
+)]
 async fn grpc_retry_on_fleet<T, F, Fut>(
     op_name: &str,
     endpoint: &str,
@@ -2652,7 +2656,7 @@ async fn load_policy(
                     // are the ones the policy poll loop later rotates in place.
                     let target = match &fleet_sandbox_id {
                         Some(id) => fleet_target(endpoint, id, 0).await?,
-                        None => endpoint.to_string(),
+                        None => endpoint.clone(),
                     };
                     openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
                         &target,

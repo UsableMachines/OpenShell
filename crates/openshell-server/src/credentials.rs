@@ -2212,7 +2212,7 @@ token_path = {token_path}
             )
             .await
             .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]

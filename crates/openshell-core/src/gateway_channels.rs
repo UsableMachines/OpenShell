@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Gateway connections whose supervisor session is currently established.
 //!
 //! A supervisor multi-connects to a subset of the gateway fleet and holds one
