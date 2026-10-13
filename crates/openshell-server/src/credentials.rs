@@ -184,14 +184,19 @@ impl CredentialRuntime {
         let mut drivers = BTreeMap::new();
         let mut driver_processes = Vec::new();
         let empty_config = toml::Table::new();
-        let default_store_config = config_file
-            .and_then(|file| file.openshell.gateway.credential_storage.as_ref())
-            .unwrap_or(&empty_config);
+        let configured_store =
+            config_file.and_then(|file| file.openshell.gateway.credential_storage.as_ref());
+        let default_store_config = configured_store.unwrap_or(&empty_config);
+        if registry.requires_default_store() && configured_store.is_none() {
+            tracing::warn!(
+                "credential storage is not configured; gateway will run without persistent provider credentials"
+            );
+        }
         connect_default_credential_store(
             &mut drivers,
             store.clone(),
             default_store_config,
-            registry.requires_default_store(),
+            registry.requires_default_store() && configured_store.is_some(),
         )?;
 
         for driver_name in registry.enabled_driver_names() {
@@ -2186,6 +2191,28 @@ token_path = {token_path}
             .unwrap();
 
         assert!(runtime.stores_provider_credentials());
+    }
+
+    #[tokio::test]
+    async fn runtime_without_credential_storage_has_no_store() {
+        let store = Arc::new(crate::persistence::test_store().await);
+        let runtime =
+            CredentialRuntime::from_config_file_with_store(&Config::new(None), None, store)
+                .await
+                .unwrap();
+
+        assert!(!runtime.stores_provider_credentials());
+        let error = runtime
+            .store_provider_credentials(
+                "test",
+                "test-workspace",
+                "test-provider-id",
+                &HashMap::from([("TOKEN".to_string(), "secret".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]

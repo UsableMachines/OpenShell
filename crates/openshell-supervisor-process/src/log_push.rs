@@ -120,7 +120,7 @@ async fn run_push_loop(
 ) {
     let mut batch = Vec::with_capacity(50);
     let mut backoff = INITIAL_BACKOFF;
-    let mut attempt: u64 = 0;
+    let mut attempt: usize = 0;
 
     // Outer reconnect loop — runs for the entire sandbox lifetime.
     loop {
@@ -131,18 +131,14 @@ async fn run_push_loop(
         // configured that is the headless `Service`, which the gateway's
         // serving certificate omits, so the handshake fails. Unresolved
         // membership takes the same backoff as a failed connect.
-        let target =
-            match crate::gateway_fleet::unary_endpoint(&endpoint, &sandbox_id, attempt as usize)
-                .await
-            {
-                Some(target) => target,
-                None => {
-                    eprintln!("openshell: log push has no resolved gateway replica yet");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(tokio::time::Duration::from_secs(30));
-                    continue;
-                }
-            };
+        let Some(target) =
+            crate::gateway_fleet::unary_endpoint(&endpoint, &sandbox_id, attempt).await
+        else {
+            eprintln!("openshell: log push has no resolved gateway replica yet");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(tokio::time::Duration::from_secs(30));
+            continue;
+        };
         let client = match CachedOpenShellClient::connect(&target).await {
             Ok(c) => {
                 if attempt > 1 {

@@ -244,6 +244,10 @@ pub(crate) fn filter_resolved_addresses(
 ///
 /// The explicit proxy adapter controls when `connect` is called so CONNECT and
 /// forward HTTP retain their current upstream-dial timing during the refactor.
+#[allow(
+    dead_code,
+    reason = "the shared dial adapter is not used by production yet"
+)]
 pub(crate) struct UpstreamConnector {
     host: String,
     port: u16,
@@ -258,6 +262,10 @@ impl UpstreamConnector {
     /// Opens the connection with `TCP_NODELAY` set: this is the upstream dial
     /// boundary for latency-sensitive proxied request/response traffic, where
     /// Nagle would stall sub-MSS writes on delayed ACKs.
+    #[allow(
+        dead_code,
+        reason = "the shared dial adapter is not used by production yet"
+    )]
     pub(crate) async fn connect(&self) -> std::io::Result<TcpStream> {
         tracing::debug!(
             host = %self.host,
