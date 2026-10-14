@@ -2380,7 +2380,7 @@ where
         let attempt = &attempt;
         let f = &f;
         async move {
-            let n = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = attempt.fetch_add(1, Ordering::Relaxed);
             let target = fleet_target(endpoint, sandbox_id, n).await?;
 
             f(target).await
