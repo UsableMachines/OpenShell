@@ -4,6 +4,7 @@
 //! Embedded SSH server for sandbox access.
 
 use crate::child_env;
+use crate::exec_group::ExecProcessGroup;
 use crate::main_session::{MainOutput, MainSession};
 #[cfg(target_os = "linux")]
 use crate::managed_children;
@@ -401,6 +402,19 @@ struct ChannelState {
     main_read_only: bool,
     main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
+    /// Process group of the child this channel spawned (exec, shell, or
+    /// sftp), terminated if the channel goes away before the child exits.
+    exec_group: Option<Arc<ExecProcessGroup>>,
+}
+
+impl ChannelState {
+    /// Terminate this channel's own child process group if it is still
+    /// running. Canonical main-session attachments never own one.
+    fn terminate_exec(&mut self, reason: &str) {
+        if let Some(group) = self.exec_group.take() {
+            group.terminate(reason);
+        }
+    }
 }
 
 const MAIN_DETACH_PREFIX: u8 = 0x10; // Ctrl-P
@@ -470,6 +484,7 @@ struct SshHandler {
 impl Drop for SshHandler {
     fn drop(&mut self) {
         for state in self.channels.values_mut() {
+            state.terminate_exec("SSH connection closed");
             if state.main_attached {
                 self.main_session.end_terminal_attachment();
                 state.main_attached = false;
@@ -544,13 +559,16 @@ impl russh::server::Handler for SshHandler {
     ///
     /// This is the final cleanup and subsumes `channel_eof` — if `channel_close`
     /// fires without a preceding `channel_eof`, all resources (`pty_master` File,
-    /// `input_sender`) are dropped here.
+    /// `input_sender`) are dropped here. A child the channel spawned that is
+    /// still running is terminated: the peer closing first means the caller
+    /// gave up on it (exec deadline or cancellation).
     async fn channel_close(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.remove(&channel) {
+        if let Some(mut state) = self.channels.remove(&channel) {
+            state.terminate_exec("SSH channel closed");
             if state.main_attached {
                 self.main_session.end_terminal_attachment();
             }
@@ -846,7 +864,7 @@ impl russh::server::Handler for SshHandler {
             // which is exactly what spawn_pipe_exec wires up.  This enables
             // modern scp (SFTP-based, OpenSSH 9.0+) and SFTP clients to
             // transfer files into and out of the sandbox.
-            let input_sender = spawn_pipe_exec(
+            let (input_sender, exec_group) = spawn_pipe_exec(
                 &self.policy,
                 &self.workspace,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
@@ -865,6 +883,7 @@ impl russh::server::Handler for SshHandler {
                 anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
             })?;
             state.input_sender = Some(InputSender::Process(input_sender));
+            state.exec_group = Some(exec_group);
         } else {
             ocsf_emit!(
                 SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1074,7 +1093,7 @@ impl SshHandler {
         if let Some(pty) = state.pty_request.take() {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
-            let (pty_master, input_sender) = spawn_pty_shell(
+            let (pty_master, input_sender, exec_group) = spawn_pty_shell(
                 &self.policy,
                 &self.workspace,
                 command,
@@ -1092,11 +1111,12 @@ impl SshHandler {
             )?;
             state.pty_master = Some(pty_master);
             state.input_sender = Some(InputSender::Process(input_sender));
+            state.exec_group = Some(exec_group);
         } else {
             // No PTY requested — use plain pipes so stdout/stderr are
             // separate and output has clean LF line endings.  This is the
             // path VSCode Remote-SSH exec commands take.
-            let input_sender = spawn_pipe_exec(
+            let (input_sender, exec_group) = spawn_pipe_exec(
                 &self.policy,
                 &self.workspace,
                 command,
@@ -1112,6 +1132,7 @@ impl SshHandler {
                 self.enforcement_mode,
             )?;
             state.input_sender = Some(InputSender::Process(input_sender));
+            state.exec_group = Some(exec_group);
         }
         Ok(())
     }
@@ -1285,7 +1306,7 @@ fn spawn_pty_shell(
     user_environment: &HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
-) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
+) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>, Arc<ExecProcessGroup>)> {
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
         ws_col: to_u16(pty.col_width.max(1)),
@@ -1369,6 +1390,8 @@ fn spawn_pty_shell(
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
     managed_children::register(child_pid);
+    // The pre_exec hook's setsid made the child a process group leader.
+    let exec_group = ExecProcessGroup::new(&child);
     let master_file = master;
 
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -1411,8 +1434,9 @@ fn spawn_pty_shell(
 
     let handle_exit = handle;
     let runtime_exit = runtime;
+    let exit_group = Arc::clone(&exec_group);
     std::thread::spawn(move || {
-        let status = child.wait().ok();
+        let status = exit_group.wait(&mut child).ok();
         #[cfg(target_os = "linux")]
         managed_children::unregister(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
@@ -1431,7 +1455,7 @@ fn spawn_pty_shell(
         }));
     });
 
-    Ok((master_file, sender))
+    Ok((master_file, sender, exec_group))
 }
 
 /// Spawn a command using plain pipes (no PTY).
@@ -1454,7 +1478,7 @@ fn spawn_pipe_exec(
     user_environment: &HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
-) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
+) -> anyhow::Result<(mpsc::Sender<Vec<u8>>, Arc<ExecProcessGroup>)> {
     // Resolve a shell present in the sandbox image; minimal images (e.g. Alpine)
     // don't ship bash, only `/bin/sh`. Runs in the supervisor, so it inspects
     // the sandbox filesystem. No command → read from stdin with no `-i`:
@@ -1479,6 +1503,15 @@ fn spawn_pipe_exec(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Lead a new process group so closing the channel can signal the whole
+    // command tree (e.g. `bash -c 'pip install ...'`). std calls setpgid in
+    // the child before the pre_exec hook drops privileges, and spawn()
+    // returns only after exec, so the group exists before anything can
+    // signal it.
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     if let Some(dir) = workspace.root() {
         cmd.current_dir(dir);
@@ -1518,6 +1551,7 @@ fn spawn_pipe_exec(
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
     managed_children::register(child_pid);
+    let exec_group = ExecProcessGroup::new(&child);
 
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take().expect("stdout must be piped");
@@ -1586,8 +1620,9 @@ fn spawn_pipe_exec(
     // Exit waiter thread
     let handle_exit = handle;
     let runtime_exit = runtime;
+    let exit_group = Arc::clone(&exec_group);
     std::thread::spawn(move || {
-        let status = child.wait().ok();
+        let status = exit_group.wait(&mut child).ok();
         #[cfg(target_os = "linux")]
         managed_children::unregister(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
@@ -1601,7 +1636,7 @@ fn spawn_pipe_exec(
         }));
     });
 
-    Ok(sender)
+    Ok((sender, exec_group))
 }
 
 mod unsafe_pty {
@@ -1677,7 +1712,8 @@ mod unsafe_pty {
 
     /// Pre-exec hook for pipe-based (non-PTY) exec.
     ///
-    /// Skips `setsid` and `TIOCSCTTY` since there is no controlling terminal.
+    /// Skips `setsid` and `TIOCSCTTY` since there is no controlling terminal;
+    /// the caller places the child in its own process group instead.
     #[allow(unsafe_code)]
     #[cfg_attr(
         not(target_os = "linux"),

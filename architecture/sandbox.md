@@ -458,6 +458,15 @@ sandbox workload directly. The relay supports:
 - Tar-based file sync.
 - Port forwarding where supported by the CLI/TUI surface.
 
+Each exec, shell, or sftp channel runs its command as the leader of its own
+process group. If the channel or SSH connection closes before that leader
+exits, as it does when the gateway's exec deadline expires or the caller
+cancels, the supervisor sends `SIGTERM` to the group and `SIGKILL` five seconds
+later if any member is still running. The leader stays unreaped until then, so
+the group ID cannot be recycled. Processes that start their own session or
+process group are outside this cleanup. Canonical main-process attachments are
+unaffected.
+
 Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal
 diagnostics use ordinary tracing.
