@@ -1,6 +1,7 @@
 name: Branch Checks
 
 on:
+  pull_request:
   merge_group:
     types: [checks_requested]
   push:
@@ -40,18 +41,13 @@ jobs:
     name: mise Lockfile
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Mark workspace as safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install mise
+        uses: ./.github/actions/setup-mise
 
       - name: Verify mise.lock is in sync with mise.toml
         run: |
@@ -65,18 +61,13 @@ jobs:
     name: License Headers
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: mise install --locked
+        uses: ./.github/actions/setup-mise
 
       - name: Check license headers
         run: mise run license:check
@@ -85,7 +76,7 @@ jobs:
     name: Cargo Deny
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
@@ -113,11 +104,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-amd64-cpu8
+          - runner: ubuntu-latest
             system: x86_64-linux
-          - runner: linux-arm64-cpu8
+          - runner: ubuntu-24.04-arm
             system: aarch64-linux
-          - runner: macos-15-xlarge
+          - runner: macos-latest
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -204,19 +195,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-amd64-cpu8, linux-arm64-cpu8]
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: mise install --locked
+        uses: ./.github/actions/setup-mise
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -237,18 +223,13 @@ jobs:
     name: Go SDK
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: mise install --locked
+        uses: ./.github/actions/setup-mise
 
       - name: Lint, build, test, proto-check
         run: mise run go:ci
@@ -257,18 +238,13 @@ jobs:
     name: Markdown
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: mise install --locked
+        uses: ./.github/actions/setup-mise
 
       - name: Lint
         run: mise run markdown:lint
@@ -277,18 +253,13 @@ jobs:
     name: TypeScript SDK
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: mise install --locked
+        uses: ./.github/actions/setup-mise
 
       - name: Check TypeScript SDK
         run: mise run sdk:ts:ci
@@ -302,3 +273,30 @@ jobs:
         run: |
           OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
             mise run sdk:ts:publish
+
+  # Single required status for branch protection and the merge queue. Runs even
+  # when upstream jobs fail so the required check reports a result instead of
+  # staying pending.
+  ci-result:
+    name: CI Result
+    needs:
+      - pr_metadata
+      - mise-lockfile
+      - license-headers
+      - cargo-deny
+      - rust
+      - python
+      - go
+      - markdown
+      - sdk-typescript
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/check-job-results
+        with:
+          results: ${{ toJSON(needs) }}
