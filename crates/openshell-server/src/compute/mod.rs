@@ -42,7 +42,7 @@ use openshell_core::proto::{
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -321,6 +321,60 @@ const RECONCILE_INTERVAL: Duration = Duration::from_mins(1);
 /// How long a sandbox can remain provisioning in the store without a
 /// corresponding backend resource before it is considered orphaned.
 const ORPHAN_GRACE_PERIOD: Duration = Duration::from_mins(5);
+
+/// Default interval between per-replica bus eviction sweeps.
+const BUS_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Floor for the bus-sweep interval. A configured value below this is clamped up, so a
+/// mistaken override can't turn the sweep into a per-id store scan every second.
+const BUS_SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Env override for [`BUS_SWEEP_INTERVAL`] (whole seconds); see `docs/reference/gateway-config.mdx`.
+const BUS_SWEEP_INTERVAL_ENV: &str = "OPENSHELL_BUS_SWEEP_INTERVAL_SECS";
+
+/// Resolve the bus-sweep interval from the environment, falling back to
+/// [`BUS_SWEEP_INTERVAL`] and never going below [`BUS_SWEEP_MIN_INTERVAL`].
+fn bus_sweep_interval() -> Duration {
+    resolve_bus_sweep_interval(std::env::var(BUS_SWEEP_INTERVAL_ENV))
+}
+
+/// Pure resolver for [`bus_sweep_interval`], split out so it can be unit-tested without
+/// mutating the process environment. An absent value falls back to the default silently; a
+/// present-but-invalid value (not UTF-8, or not a positive integer) is logged and ignored; a
+/// valid value below [`BUS_SWEEP_MIN_INTERVAL`] is logged and clamped up.
+fn resolve_bus_sweep_interval(raw: Result<String, std::env::VarError>) -> Duration {
+    let configured = match raw {
+        Err(std::env::VarError::NotPresent) => return BUS_SWEEP_INTERVAL,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn!(
+                default_secs = BUS_SWEEP_INTERVAL.as_secs(),
+                "{BUS_SWEEP_INTERVAL_ENV} is not valid UTF-8; using default",
+            );
+            return BUS_SWEEP_INTERVAL;
+        }
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                warn!(
+                    value = %raw,
+                    default_secs = BUS_SWEEP_INTERVAL.as_secs(),
+                    "invalid {BUS_SWEEP_INTERVAL_ENV}; using default",
+                );
+                return BUS_SWEEP_INTERVAL;
+            }
+        },
+    };
+    if configured < BUS_SWEEP_MIN_INTERVAL {
+        warn!(
+            requested_secs = configured.as_secs(),
+            floor_secs = BUS_SWEEP_MIN_INTERVAL.as_secs(),
+            "{BUS_SWEEP_INTERVAL_ENV} below floor; clamping up",
+        );
+        BUS_SWEEP_MIN_INTERVAL
+    } else {
+        configured
+    }
+}
 
 // Re-export the shared error type under the name used by this module.
 pub use openshell_core::ComputeDriverError as ComputeError;
@@ -2111,6 +2165,19 @@ impl ComputeRuntime {
 
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
+
+        // Lease-independent bus eviction sweep; see `bus_eviction_sweep_loop`. Spawned on
+        // EVERY replica, single-replica included: besides fixing the multi-replica non-holder
+        // leak, it is the backstop that reclaims a bus entry created by a watch that passed its
+        // row check and then subscribed just after the row was deleted and the delete-time
+        // cleanup had already run. It is cheap and idempotent where the delete/reconcile paths
+        // already clean up.
+        let sweep_runtime = runtime.clone();
+        let sweep_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            sweep_runtime.bus_eviction_sweep_loop(sweep_shutdown).await;
+        });
+
         if self.store.is_single_replica() {
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
@@ -2125,6 +2192,81 @@ impl ComputeRuntime {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
         }
+    }
+
+    /// Periodically drop per-sandbox bus state for `sandbox_ids` no longer present in the
+    /// shared store. Runs on every replica (not lease-gated), which is what fixes the
+    /// non-holder leak: a follower only finalizes a store-row removal for deletes it
+    /// serves itself, so for sandboxes deleted elsewhere (by the holder's reconcile, or a
+    /// delete served by another replica) it never reaches the delete-time cleanup and keeps
+    /// the per-sandbox state it allocated. The holder-gated reconcile frees only the holder.
+    /// Interval: [`BUS_SWEEP_INTERVAL`], overridable via `OPENSHELL_BUS_SWEEP_INTERVAL_SECS`.
+    async fn bus_eviction_sweep_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
+        let interval = bus_sweep_interval();
+        // Ids confirmed absent on the previous pass; an id is evicted only after it is absent
+        // on two consecutive passes (see `run_bus_eviction_sweep`).
+        let mut absent_prev: HashSet<String> = HashSet::new();
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => break,
+                () = tokio::time::sleep(interval) => {
+                    absent_prev = self.run_bus_eviction_sweep(absent_prev).await;
+                }
+            }
+        }
+    }
+
+    /// One pass of the eviction sweep. Frees per-sandbox bus state for tracked ids whose
+    /// sandbox row is gone from the store, and returns the set of ids confirmed absent this
+    /// pass (feed it back on the next call).
+    ///
+    /// An id is evicted only when it was *also* absent on the previous pass (`absent_prev`) —
+    /// a one-cycle grace. This spares an entry whose row is momentarily not yet visible (e.g. a
+    /// create-time race where a log line populated the bus just before the row is readable)
+    /// rather than tearing down a live stream; a genuinely-gone sandbox is still evicted, one
+    /// interval later. The grace assumes a committed row becomes visible within one sweep
+    /// interval (true for the strongly-consistent shared store); a very low interval override
+    /// narrows that window. It also assumes sandbox ids are not reused, so an `Ok(None)` for a
+    /// tracked id always refers to the same sandbox whose bus state is being freed.
+    ///
+    /// Only `Ok(None)` (a confirmed absence) counts; a store error skips the id (and is logged
+    /// once per pass, with a sample error) so a transient store blip never evicts live state and
+    /// never starts the grace clock. A store error resets the grace for that id, so eviction is
+    /// eventual *absent sustained store errors* — acceptable because a persistently failing
+    /// store is itself an alarmed condition and is logged here. Candidate ids come from the log
+    /// bus only; extending the sweep to the event and watch buses is tracked separately.
+    /// `cleanup_removed_sandbox_state` still frees all three buses plus the sandbox index for
+    /// each id it does evict.
+    async fn run_bus_eviction_sweep(&self, absent_prev: HashSet<String>) -> HashSet<String> {
+        let mut absent_now = HashSet::new();
+        let mut store_errors = 0usize;
+        let mut sample_error: Option<String> = None;
+        for id in self.tracing_log_bus.tracked_ids() {
+            match self.store.get(Sandbox::object_type(), &id).await {
+                Ok(None) => {
+                    if absent_prev.contains(&id) {
+                        self.cleanup_removed_sandbox_state(&id);
+                    } else {
+                        absent_now.insert(id);
+                    }
+                }
+                Ok(Some(_)) => {}
+                Err(err) => {
+                    store_errors += 1;
+                    if sample_error.is_none() {
+                        sample_error = Some(err.to_string());
+                    }
+                }
+            }
+        }
+        if store_errors > 0 {
+            warn!(
+                store_errors,
+                error = sample_error.as_deref().unwrap_or("unknown"),
+                "bus eviction sweep: store lookups failed; skipped those ids this pass"
+            );
+        }
+        absent_now
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -2787,7 +2929,7 @@ impl ComputeRuntime {
         let backend_ids = backend_sandboxes
             .iter()
             .map(|sandbox| sandbox.id.clone())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         tracing::Span::current().record("backend_count", backend_sandboxes.len());
 
         for sandbox in backend_sandboxes {
@@ -5082,7 +5224,7 @@ mod tests {
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
         ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as TestMutex};
     use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
@@ -9023,6 +9165,143 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn resolve_bus_sweep_interval_handles_env_values() {
+        use std::env::VarError;
+        // unset -> default
+        assert_eq!(
+            resolve_bus_sweep_interval(Err(VarError::NotPresent)),
+            BUS_SWEEP_INTERVAL
+        );
+        // not valid UTF-8 -> default
+        assert_eq!(
+            resolve_bus_sweep_interval(Err(VarError::NotUnicode(std::ffi::OsString::from("x")))),
+            BUS_SWEEP_INTERVAL
+        );
+        // valid override
+        assert_eq!(
+            resolve_bus_sweep_interval(Ok("45".to_string())),
+            Duration::from_secs(45)
+        );
+        // zero / non-numeric -> default
+        assert_eq!(
+            resolve_bus_sweep_interval(Ok("0".to_string())),
+            BUS_SWEEP_INTERVAL
+        );
+        assert_eq!(
+            resolve_bus_sweep_interval(Ok("garbage".to_string())),
+            BUS_SWEEP_INTERVAL
+        );
+        // below the floor -> clamped up
+        assert_eq!(
+            resolve_bus_sweep_interval(Ok("1".to_string())),
+            BUS_SWEEP_MIN_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_sweep_evicts_state_after_two_absent_passes() {
+        // A follower allocated log-bus state for a sandbox it logged about, but the
+        // sandbox is not in the store (its row was removed elsewhere). The one-cycle grace
+        // means the FIRST pass does not evict; the SECOND consecutive absence does.
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let _rx = runtime.tracing_log_bus.subscribe("sb-gone");
+        assert_eq!(
+            runtime.tracing_log_bus.tracked_ids(),
+            vec!["sb-gone".to_string()]
+        );
+
+        // Pass 1: absent but spared by the grace.
+        let absent = runtime.run_bus_eviction_sweep(HashSet::new()).await;
+        assert_eq!(
+            runtime.tracing_log_bus.tracked_ids(),
+            vec!["sb-gone".to_string()],
+            "first absent pass must NOT evict (one-cycle grace)"
+        );
+        assert!(absent.contains("sb-gone"));
+
+        // Pass 2: still absent -> evicted now.
+        runtime.run_bus_eviction_sweep(absent).await;
+        assert!(
+            runtime.tracing_log_bus.tracked_ids().is_empty(),
+            "second consecutive absence must evict the bus state"
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_sweep_keeps_state_when_store_row_present() {
+        // A live sandbox (row present in the store) must keep its bus state across passes.
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let sandbox = sandbox_record("sb-live", "sandbox-live", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let _rx = runtime.tracing_log_bus.subscribe("sb-live");
+
+        let absent = runtime.run_bus_eviction_sweep(HashSet::new()).await;
+        assert!(
+            absent.is_empty(),
+            "a present sandbox must not be marked absent"
+        );
+        assert_eq!(
+            runtime.tracing_log_bus.tracked_ids(),
+            vec!["sb-live".to_string()],
+            "sweep must not evict bus state for a sandbox still present in the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_sweep_grace_spares_id_whose_row_reappears() {
+        // Create-race analogue: a bus entry is absent on pass 1 (row not yet visible) but the
+        // row appears before pass 2. The grace must spare it — a live stream is never torn down.
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let _rx = runtime.tracing_log_bus.subscribe("sb-racing");
+
+        // Pass 1: row not present yet -> marked absent, not evicted.
+        let absent = runtime.run_bus_eviction_sweep(HashSet::new()).await;
+        assert!(absent.contains("sb-racing"));
+        assert_eq!(
+            runtime.tracing_log_bus.tracked_ids(),
+            vec!["sb-racing".to_string()]
+        );
+
+        // Row becomes visible before pass 2.
+        let sandbox = sandbox_record("sb-racing", "sandbox-racing", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        // Pass 2: now present -> must NOT evict, and must drop from the absent set.
+        let absent2 = runtime.run_bus_eviction_sweep(absent).await;
+        assert!(!absent2.contains("sb-racing"));
+        assert_eq!(
+            runtime.tracing_log_bus.tracked_ids(),
+            vec!["sb-racing".to_string()],
+            "an id whose row reappeared within the grace window must not be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_sweep_keeps_state_on_store_error() {
+        // A store lookup error must never evict (or even start the grace clock for) an id —
+        // a transient store blip must not tear down live state.
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        let _rx = runtime.tracing_log_bus.subscribe("sb-blip");
+        // Closing the test store makes every subsequent get() return Err.
+        runtime.store.close_for_test().await;
+
+        // Even with the id already "absent once", an error must keep it and not evict.
+        let mut absent_prev = HashSet::new();
+        absent_prev.insert("sb-blip".to_string());
+        let absent = runtime.run_bus_eviction_sweep(absent_prev).await;
+
+        assert_eq!(
+            runtime.tracing_log_bus.tracked_ids(),
+            vec!["sb-blip".to_string()],
+            "a store error must not evict bus state"
+        );
+        assert!(
+            !absent.contains("sb-blip"),
+            "a store error must not mark the id absent for the grace clock"
+        );
     }
 
     #[tokio::test]
