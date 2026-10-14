@@ -2577,6 +2577,77 @@ const EXEC_KEEPALIVE_MAX: usize = 4;
 /// Max wait for a trailing `Close` after `ExitStatus`.
 const EXEC_POST_EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Max wait for the relay proxy to drain after its caller abandoned an exec,
+/// before the proxy is aborted and the relay dropped outright.
+const EXEC_ABANDONED_PROXY_TEARDOWN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// How an exec over a relay ended, from the gateway's side.
+enum RelayExecOutcome {
+    /// The command reported an exit status, or the exec failed.
+    Finished(Result<i32, Status>),
+    /// `timeout_seconds` elapsed first.
+    TimedOut,
+    /// Every receiver of the response stream was dropped first: the caller
+    /// cancelled or disconnected.
+    CallerGone,
+}
+
+/// Drive `exec` until it finishes, its deadline passes, or its caller goes
+/// away, whichever comes first. A `timeout_seconds` of zero means no deadline.
+///
+/// When this returns anything but [`RelayExecOutcome::Finished`], `exec` has
+/// been dropped. That drops the russh client, which closes the SSH channel
+/// and connection to the supervisor, and the supervisor then terminates the
+/// command's process group.
+async fn race_relay_exec<F>(
+    exec: F,
+    timeout_seconds: u32,
+    tx: &mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> RelayExecOutcome
+where
+    F: Future<Output = Result<i32, Status>>,
+{
+    let deadline = async {
+        if timeout_seconds == 0 {
+            future::pending::<()>().await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(timeout_seconds))).await;
+        }
+    };
+    tokio::select! {
+        // A command that has finished wins over a deadline or departure
+        // observed in the same poll.
+        biased;
+        result = exec => RelayExecOutcome::Finished(result),
+        () = deadline => RelayExecOutcome::TimedOut,
+        () = tx.closed() => RelayExecOutcome::CallerGone,
+    }
+}
+
+/// Aborts a spawned task when dropped, so a task that borrows a share of an
+/// exec's SSH session cannot outlive the exec future that owns it.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Tear down the relay proxy of an exec whose caller has gone. The proxy
+/// normally ends as soon as the dropped russh client's socket closes; abort it
+/// if it does not, so the task can never hang on a silent relay.
+async fn tear_down_abandoned_exec_proxy(proxy_task: tokio::task::JoinHandle<()>) {
+    let abort = proxy_task.abort_handle();
+    if tokio::time::timeout(EXEC_ABANDONED_PROXY_TEARDOWN_TIMEOUT, proxy_task)
+        .await
+        .is_err()
+    {
+        abort.abort();
+    }
+}
+
 /// Supervisor SSH banner software token that signals no-login-shell support.
 const OPENSHELL_SSHID_PREFIX: &[u8] = b"SSH-2.0-OpenShell_";
 
@@ -2679,32 +2750,32 @@ async fn stream_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if timeout_seconds == 0 {
-        exec.await
-    } else if let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        r
-    } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
-    };
-
-    let exit_code = match exec_result {
-        Ok(code) => code,
-        Err(status) => {
+    let exit_code = match race_relay_exec(exec, timeout_seconds, &tx).await {
+        RelayExecOutcome::Finished(Ok(code)) => code,
+        RelayExecOutcome::Finished(Err(status)) => {
             let _ = proxy_task.await;
             return Err(status);
+        }
+        RelayExecOutcome::TimedOut => {
+            let _ = tx
+                .send(Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                        ExecSandboxExit { exit_code: 124 },
+                    )),
+                }))
+                .await;
+            let _ = proxy_task.await;
+            return Ok(());
+        }
+        RelayExecOutcome::CallerGone => {
+            // Nobody is left to receive an exit event.
+            info!(
+                sandbox_id = %sandbox_id,
+                channel_id = %channel_id,
+                "ExecSandbox (relay): caller went away, abandoning command"
+            );
+            tear_down_abandoned_exec_proxy(proxy_task).await;
+            return Ok(());
         }
     };
 
@@ -2768,32 +2839,32 @@ async fn stream_interactive_exec_over_relay(
         tx.clone(),
     );
 
-    let exec_result = if timeout_seconds == 0 {
-        exec.await
-    } else if let Ok(r) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        r
-    } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
-    };
-
-    let exit_code = match exec_result {
-        Ok(code) => code,
-        Err(status) => {
+    let exit_code = match race_relay_exec(exec, timeout_seconds, &tx).await {
+        RelayExecOutcome::Finished(Ok(code)) => code,
+        RelayExecOutcome::Finished(Err(status)) => {
             let _ = proxy_task.await;
             return Err(status);
+        }
+        RelayExecOutcome::TimedOut => {
+            let _ = tx
+                .send(Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                        ExecSandboxExit { exit_code: 124 },
+                    )),
+                }))
+                .await;
+            let _ = proxy_task.await;
+            return Ok(());
+        }
+        RelayExecOutcome::CallerGone => {
+            // Nobody is left to receive an exit event.
+            info!(
+                sandbox_id = %sandbox_id,
+                channel_id = %channel_id,
+                "ExecSandboxInteractive (relay): caller went away, abandoning command"
+            );
+            tear_down_abandoned_exec_proxy(proxy_task).await;
+            return Ok(());
         }
     };
 
@@ -2902,26 +2973,42 @@ async fn run_interactive_exec_with_russh(
     let (mut read_half, write_half) = channel.split();
 
     let stdin_task = tokio::spawn(async move {
-        while let Ok(Some(msg)) = input_stream.message().await {
-            match msg.payload {
-                Some(Payload::Stdin(data)) => {
-                    if write_half.data(std::io::Cursor::new(data)).await.is_err() {
-                        break;
+        let input_failed = loop {
+            match input_stream.message().await {
+                Ok(Some(msg)) => match msg.payload {
+                    Some(Payload::Stdin(data)) => {
+                        if write_half.data(std::io::Cursor::new(data)).await.is_err() {
+                            break false;
+                        }
                     }
-                }
-                Some(Payload::Resize(resize)) => {
-                    if request_tty {
-                        let _ = write_half
-                            .window_change(resize.cols, resize.rows, 0, 0)
-                            .await;
+                    Some(Payload::Resize(resize)) => {
+                        if request_tty {
+                            let _ = write_half
+                                .window_change(resize.cols, resize.rows, 0, 0)
+                                .await;
+                        }
                     }
-                }
-                Some(Payload::Start(_)) | None => {}
+                    Some(Payload::Start(_)) | None => {}
+                },
+                Ok(None) => break false,
+                Err(_) => break true,
             }
-        }
+        };
+        // Half-close stdin, as any SSH client does when its input ends, and
+        // leave closing the channel to the exit path below: the supervisor
+        // terminates a command whose channel closes while it is still running,
+        // so closing here would kill e.g. `echo data | exec -i -- slow-cmd`.
+        // A failed input stream means the caller is gone, so that case does
+        // close the channel and lets the supervisor stop the command.
         let _ = write_half.eof().await;
-        let _ = write_half.close().await;
+        if input_failed {
+            let _ = write_half.close().await;
+        }
     });
+    // The stdin task holds a write half of the channel, which keeps the SSH
+    // connection open. If this future is dropped (deadline or departed
+    // caller), the connection must close with it.
+    let _stdin_guard = AbortOnDrop(stdin_task.abort_handle());
 
     let mut exit_code: Option<i32> = None;
     loop {
@@ -3346,6 +3433,432 @@ mod relay_failure_tests {
             !source.contains(banned.as_str()),
             "constructing a fresh Status here discards the x-openshell-serving-replica trailer"
         );
+    }
+}
+
+#[cfg(test)]
+mod relay_exec_cancel_tests {
+    use super::*;
+    use russh::server::{Auth, ChannelOpenHandle, Session};
+    use std::time::Duration;
+
+    /// Long enough for a broken cancellation to show, short enough that a
+    /// passing run is quick. Below `EXEC_ABANDONED_PROXY_TEARDOWN_TIMEOUT`, so
+    /// a pass proves the SSH connection closed on its own rather than through
+    /// the proxy-abort fallback.
+    const PROMPT: Duration = Duration::from_secs(3);
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum SshdEvent {
+        Exec(String),
+        Stdin(Vec<u8>),
+        Eof,
+        ExitSent(u32),
+        ChannelClosed,
+        Disconnected,
+    }
+
+    /// A supervisor stand-in that accepts any exec and records what the
+    /// gateway does to it. Without `exit_after_eof` the command never exits,
+    /// like a long-running one. With it, the command reports that exit code a
+    /// little after stdin is half-closed, like a command finishing its input.
+    struct FakeSupervisorSshd {
+        events: mpsc::UnboundedSender<SshdEvent>,
+        exit_after_eof: Option<u32>,
+    }
+
+    /// How long a fake command keeps running after its stdin is half-closed.
+    const FAKE_EXIT_DELAY: Duration = Duration::from_millis(300);
+
+    impl Drop for FakeSupervisorSshd {
+        fn drop(&mut self) {
+            let _ = self.events.send(SshdEvent::Disconnected);
+        }
+    }
+
+    impl russh::server::Handler for FakeSupervisorSshd {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            data: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            let _ = self
+                .events
+                .send(SshdEvent::Exec(String::from_utf8_lossy(data).into_owned()));
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _channel: russh::ChannelId,
+            data: &[u8],
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let _ = self.events.send(SshdEvent::Stdin(data.to_vec()));
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let _ = self.events.send(SshdEvent::Eof);
+            if let Some(code) = self.exit_after_eof {
+                let handle = session.handle();
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(FAKE_EXIT_DELAY).await;
+                    let _ = handle.exit_status_request(channel, code).await;
+                    let _ = events.send(SshdEvent::ExitSent(code));
+                    let _ = handle.eof(channel).await;
+                    let _ = handle.close(channel).await;
+                });
+            }
+            Ok(())
+        }
+
+        async fn channel_close(
+            &mut self,
+            _channel: russh::ChannelId,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let _ = self.events.send(SshdEvent::ChannelClosed);
+            Ok(())
+        }
+    }
+
+    /// Serve SSH on the supervisor end of an in-memory relay and return the
+    /// gateway end plus the server's event log.
+    fn never_exiting_relay() -> (tokio::io::DuplexStream, mpsc::UnboundedReceiver<SshdEvent>) {
+        fake_supervisor_relay(None)
+    }
+
+    fn fake_supervisor_relay(
+        exit_after_eof: Option<u32>,
+    ) -> (tokio::io::DuplexStream, mpsc::UnboundedReceiver<SshdEvent>) {
+        let (gateway_end, supervisor_end) = tokio::io::duplex(64 * 1024);
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let key = russh::keys::PrivateKey::from(
+            russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]),
+        );
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            ..Default::default()
+        });
+        tokio::spawn(async move {
+            let handler = FakeSupervisorSshd {
+                events: events_tx,
+                exit_after_eof,
+            };
+            if let Ok(session) = russh::server::run_stream(config, supervisor_end, handler).await {
+                let _ = session.await;
+            }
+        });
+        (gateway_end, events)
+    }
+
+    async fn next_event(events: &mut mpsc::UnboundedReceiver<SshdEvent>) -> SshdEvent {
+        tokio::time::timeout(PROMPT, events.recv())
+            .await
+            .expect("fake supervisor saw nothing in time")
+            .expect("fake supervisor event log closed")
+    }
+
+    /// The caller of a streamed exec disconnects while the command is still
+    /// running. The gateway must stop driving the exec and close the SSH
+    /// connection, which is what makes the supervisor kill the command.
+    #[tokio::test]
+    async fn dropping_the_exec_stream_closes_the_ssh_connection() {
+        let (relay, mut events) = never_exiting_relay();
+        let (tx, rx) = mpsc::channel(256);
+        let exec = tokio::spawn(async move {
+            stream_exec_over_relay(
+                tx,
+                "sb-1",
+                "ch-1",
+                relay,
+                "sleep 911",
+                Vec::new(),
+                0,
+                false,
+                false,
+                80,
+                24,
+            )
+            .await
+        });
+
+        assert_eq!(
+            next_event(&mut events).await,
+            SshdEvent::Exec("sleep 911".into())
+        );
+        drop(rx);
+
+        let result = tokio::time::timeout(PROMPT, exec)
+            .await
+            .expect("exec kept running after its caller went away")
+            .expect("exec task panicked");
+        assert!(
+            result.is_ok(),
+            "an abandoned exec is not a failure: {result:?}"
+        );
+        loop {
+            if next_event(&mut events).await == SshdEvent::Disconnected {
+                break;
+            }
+        }
+    }
+
+    /// A request body that never yields a frame: an interactive caller that
+    /// keeps its input open and sends nothing.
+    fn silent_input_stream() -> tonic::Streaming<ExecSandboxInput> {
+        struct NoMessages;
+        impl tonic::codec::Decoder for NoMessages {
+            type Item = ExecSandboxInput;
+            type Error = Status;
+            fn decode(
+                &mut self,
+                _src: &mut tonic::codec::DecodeBuf<'_>,
+            ) -> Result<Option<Self::Item>, Self::Error> {
+                Ok(None)
+            }
+        }
+        let body = http_body_util::StreamBody::new(futures::stream::pending::<
+            Result<http_body::Frame<bytes::Bytes>, std::convert::Infallible>,
+        >());
+        tonic::Streaming::new_request(NoMessages, body, None, None)
+    }
+
+    /// Decodes `ExecSandboxInput` messages from gRPC request frames.
+    struct InputDecoder;
+
+    impl tonic::codec::Decoder for InputDecoder {
+        type Item = ExecSandboxInput;
+        type Error = Status;
+        fn decode(
+            &mut self,
+            src: &mut tonic::codec::DecodeBuf<'_>,
+        ) -> Result<Option<Self::Item>, Self::Error> {
+            ExecSandboxInput::decode(src)
+                .map(Some)
+                .map_err(|e| Status::internal(e.to_string()))
+        }
+    }
+
+    /// A request body carrying `messages` that then ends normally: a caller
+    /// that sent its stdin and finished, e.g. `echo data | exec -i`.
+    fn finished_input_stream(messages: &[ExecSandboxInput]) -> tonic::Streaming<ExecSandboxInput> {
+        let frames: Vec<Result<http_body::Frame<bytes::Bytes>, std::convert::Infallible>> =
+            messages
+                .iter()
+                .map(|message| {
+                    let encoded = message.encode_to_vec();
+                    let mut frame = Vec::with_capacity(5 + encoded.len());
+                    frame.push(0); // uncompressed
+                    frame.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
+                    frame.extend_from_slice(&encoded);
+                    Ok(http_body::Frame::data(bytes::Bytes::from(frame)))
+                })
+                .collect();
+        let body = http_body_util::StreamBody::new(futures::stream::iter(frames));
+        tonic::Streaming::new_request(InputDecoder, body, None, None)
+    }
+
+    /// Finishing stdin must not end the command. The gateway half-closes
+    /// the channel and waits for the exit status; it closes the channel only
+    /// after that, since the supervisor kills a command whose channel closes
+    /// while it is still running.
+    #[tokio::test]
+    async fn finishing_interactive_stdin_waits_for_the_exit_status() {
+        use openshell_core::proto::exec_sandbox_input::Payload;
+
+        let (relay, mut events) = fake_supervisor_relay(Some(7));
+        let input = finished_input_stream(&[ExecSandboxInput {
+            payload: Some(Payload::Stdin(b"data\n".to_vec())),
+        }]);
+        let (tx, mut rx) = mpsc::channel(256);
+        let exec = tokio::spawn(async move {
+            stream_interactive_exec_over_relay(
+                tx, "sb-1", "ch-1", relay, "slow-cmd", input, false, false, 0, 80, 24,
+            )
+            .await
+        });
+
+        assert_eq!(
+            next_event(&mut events).await,
+            SshdEvent::Exec("slow-cmd".into())
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            SshdEvent::Stdin(b"data\n".to_vec())
+        );
+        assert_eq!(next_event(&mut events).await, SshdEvent::Eof);
+        assert_eq!(
+            next_event(&mut events).await,
+            SshdEvent::ExitSent(7),
+            "the channel closed before the command reported its exit"
+        );
+
+        let mut exit_code = None;
+        while let Some(event) = tokio::time::timeout(PROMPT, rx.recv())
+            .await
+            .expect("exec stream stalled")
+        {
+            if let Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(exit)) =
+                event.expect("exec stream item is not an error").payload
+            {
+                exit_code = Some(exit.exit_code);
+            }
+        }
+        assert_eq!(exit_code, Some(7));
+        assert!(
+            tokio::time::timeout(PROMPT, exec)
+                .await
+                .expect("exec task did not finish after the exit")
+                .expect("exec task panicked")
+                .is_ok()
+        );
+        loop {
+            if next_event(&mut events).await == SshdEvent::Disconnected {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_interactive_exec_stream_closes_the_ssh_connection() {
+        let (relay, mut events) = never_exiting_relay();
+        let (tx, rx) = mpsc::channel(256);
+        let exec = tokio::spawn(async move {
+            stream_interactive_exec_over_relay(
+                tx,
+                "sb-1",
+                "ch-1",
+                relay,
+                "sleep 911",
+                silent_input_stream(),
+                false,
+                false,
+                0,
+                80,
+                24,
+            )
+            .await
+        });
+
+        assert_eq!(
+            next_event(&mut events).await,
+            SshdEvent::Exec("sleep 911".into())
+        );
+        drop(rx);
+
+        let result = tokio::time::timeout(PROMPT, exec)
+            .await
+            .expect("interactive exec kept running after its caller went away")
+            .expect("exec task panicked");
+        assert!(
+            result.is_ok(),
+            "an abandoned exec is not a failure: {result:?}"
+        );
+        loop {
+            if next_event(&mut events).await == SshdEvent::Disconnected {
+                break;
+            }
+        }
+    }
+
+    /// The deadline still reports exit 124 to a caller who is listening.
+    #[tokio::test]
+    async fn a_deadline_still_reports_exit_124() {
+        let (relay, mut events) = never_exiting_relay();
+        let (tx, mut rx) = mpsc::channel(256);
+        let exec = tokio::spawn(async move {
+            stream_exec_over_relay(
+                tx,
+                "sb-1",
+                "ch-1",
+                relay,
+                "sleep 911",
+                Vec::new(),
+                1,
+                false,
+                false,
+                80,
+                24,
+            )
+            .await
+        });
+
+        let exit = tokio::time::timeout(PROMPT, rx.recv())
+            .await
+            .expect("no exit event before the deadline test timed out")
+            .expect("stream ended without an exit event")
+            .expect("exit event is not an error");
+        assert_eq!(
+            exit.payload,
+            Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                ExecSandboxExit { exit_code: 124 }
+            ))
+        );
+        assert!(
+            tokio::time::timeout(PROMPT, exec)
+                .await
+                .expect("exec task did not finish after its deadline")
+                .expect("exec task panicked")
+                .is_ok()
+        );
+        loop {
+            if next_event(&mut events).await == SshdEvent::Disconnected {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn race_prefers_a_finished_exec_over_a_departed_caller() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let outcome = race_relay_exec(async { Ok(0) }, 0, &tx).await;
+        assert!(matches!(outcome, RelayExecOutcome::Finished(Ok(0))));
+    }
+
+    #[tokio::test]
+    async fn race_reports_a_departed_caller_without_a_deadline() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let outcome = tokio::time::timeout(
+            PROMPT,
+            race_relay_exec(future::pending::<Result<i32, Status>>(), 0, &tx),
+        )
+        .await
+        .expect("a departed caller must end the race");
+        assert!(matches!(outcome, RelayExecOutcome::CallerGone));
+    }
+
+    #[tokio::test]
+    async fn race_reports_the_deadline_while_the_caller_listens() {
+        let (tx, _rx) = mpsc::channel(1);
+        let outcome = race_relay_exec(future::pending::<Result<i32, Status>>(), 1, &tx).await;
+        assert!(matches!(outcome, RelayExecOutcome::TimedOut));
     }
 }
 
