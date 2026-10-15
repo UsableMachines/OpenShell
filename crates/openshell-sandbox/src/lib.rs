@@ -2380,6 +2380,9 @@ where
         let attempt = &attempt;
         let f = &f;
         async move {
+            // The top-level `Ordering` import is Linux-only, so the path stays qualified
+            // for other targets; Linux clippy would otherwise flag it.
+            #[allow(unused_qualifications)]
             let n = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let target = fleet_target(endpoint, sandbox_id, n).await?;
 

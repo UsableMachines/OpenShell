@@ -6416,10 +6416,7 @@ mod tests {
     fn ca_only_config_preserves_explicit_baseline_ip_restriction() {
         let ca = regorus::Value::from_json_str(r#"{"upstream_ca_pem":"reviewed-ca"}"#).unwrap();
         let baseline = regorus::Value::from_json_str(r#"{"allowed_ips":["11.0.0.0/8"]}"#).unwrap();
-        for configs in [
-            vec![ca.clone(), baseline.clone()],
-            vec![baseline.clone(), ca.clone()],
-        ] {
+        for configs in [vec![ca.clone(), baseline.clone()], vec![baseline, ca]] {
             assert_eq!(
                 explicit_allowed_ips_from_configs(&configs),
                 vec!["11.0.0.0/8"]
