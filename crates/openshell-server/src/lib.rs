@@ -20,6 +20,7 @@ mod compute;
 pub mod config_file;
 mod credentials;
 mod defaults;
+mod exec_drain;
 mod gateway_listener;
 mod grpc;
 mod http;
@@ -302,6 +303,9 @@ pub struct ServerState {
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
 
+    /// Exec streams in flight, which graceful shutdown waits for.
+    pub(crate) exec_drain: Arc<exec_drain::ExecDrain>,
+
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
@@ -418,6 +422,7 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            exec_drain: Arc::default(),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -817,6 +822,9 @@ pub(crate) async fn run_server(
     shutdown_signal().await;
     info!("Shutdown signal received; stopping gateway");
     state.gateway_shutting_down.store(true, Ordering::Release);
+    // Before anything else, so no exec is admitted that the drain below does
+    // not wait for. See `exec_drain`.
+    state.supervisor_sessions.begin_drain();
     let _ = shutdown_tx.send(true);
 
     for task in listener_tasks {
@@ -854,6 +862,16 @@ pub(crate) async fn run_server(
         );
     }
 
+    // Wait for the execs this replica is relaying. They ride connections the
+    // listeners already accepted, which keep serving until the process exits,
+    // and they cannot move to another replica. Waiting only after the records
+    // are withdrawn means callers are already being steered elsewhere.
+    drain_exec_streams(
+        &state.exec_drain,
+        Duration::from_secs(config.shutdown_drain_secs),
+    )
+    .await;
+
     state
         .compute
         .cleanup_on_shutdown()
@@ -861,6 +879,34 @@ pub(crate) async fn run_server(
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
 
     Ok(())
+}
+
+async fn drain_exec_streams(drain: &exec_drain::ExecDrain, deadline: Duration) {
+    let in_flight = drain.in_flight();
+    if in_flight == 0 {
+        return;
+    }
+    if deadline.is_zero() {
+        warn!(
+            in_flight,
+            "exiting with exec streams in flight; no shutdown drain is configured"
+        );
+        return;
+    }
+    info!(
+        in_flight,
+        deadline_secs = deadline.as_secs(),
+        "waiting for in-flight exec streams before exiting"
+    );
+    if drain.wait_idle(deadline).await {
+        info!("in-flight exec streams finished; continuing shutdown");
+    } else {
+        warn!(
+            in_flight = drain.in_flight(),
+            deadline_secs = deadline.as_secs(),
+            "shutdown drain deadline passed; exiting with exec streams in flight"
+        );
+    }
 }
 
 async fn serve_gateway_listener(

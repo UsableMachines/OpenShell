@@ -199,6 +199,11 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS")]
     grpc_rate_limit_window_seconds: Option<u64>,
 
+    /// Seconds graceful shutdown waits for in-flight exec streams before
+    /// exiting. 0 exits without waiting.
+    #[arg(long, env = "OPENSHELL_SHUTDOWN_DRAIN_SECONDS", default_value_t = 0)]
+    shutdown_drain_seconds: u64,
+
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[arg(
@@ -412,6 +417,7 @@ fn prepare_server_config_with_drivers(
             args.grpc_rate_limit_requests,
             args.grpc_rate_limit_window_seconds,
         )
+        .with_shutdown_drain_secs(args.shutdown_drain_seconds)
         .with_gateway_interceptors(
             file.as_ref()
                 .map(|f| f.openshell.gateway.interceptors.clone())

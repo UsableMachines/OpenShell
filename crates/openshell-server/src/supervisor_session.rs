@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,11 @@ pub struct SupervisorSessionRegistry {
     /// unit and integration tests that drive the registry without a store —
     /// the registry then behaves exactly as a single-replica gateway.
     liveness: Option<Arc<SessionLiveness>>,
+    /// Set when graceful shutdown starts. A draining replica opens no new
+    /// relays and stops renewing its liveness records, so callers route new
+    /// work to the other replicas holding a session while the relays already
+    /// open here run to completion.
+    draining: Arc<AtomicBool>,
 }
 
 struct PendingRelay {
@@ -124,6 +129,17 @@ impl SupervisorSessionRegistry {
         }
     }
 
+    /// Stop opening relays and renewing liveness records on this replica.
+    ///
+    /// One-way: a replica that starts draining is on its way out.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
     /// Claim cross-replica liveness of a session and keep the claim fresh
     /// for as long as the returned handle is alive.
     ///
@@ -149,6 +165,7 @@ impl SupervisorSessionRegistry {
         Fut: Future<Output = ()> + Send,
     {
         let liveness = Arc::clone(self.liveness.as_ref()?);
+        let draining = Arc::clone(&self.draining);
         let handle = tokio::spawn(async move {
             // Held only while this replica has a usable claim. A store error
             // drops it and the next pass re-announces: giving up instead would
@@ -159,6 +176,12 @@ impl SupervisorSessionRegistry {
             let mut claim: Option<LivenessHandle> = None;
 
             loop {
+                // A draining replica's records are withdrawn in one pass at
+                // shutdown; renewing or re-announcing after that would point
+                // callers back at a replica that refuses them.
+                if draining.load(Ordering::SeqCst) {
+                    return;
+                }
                 let wait = match claim.as_mut() {
                     None => match liveness.announce(&sandbox_id, &session_id).await {
                         Ok(fresh) => {
@@ -367,7 +390,13 @@ impl SupervisorSessionRegistry {
         &self,
         sandbox_id: &str,
     ) -> Result<mpsc::Sender<GatewayMessage>, Status> {
-        if let Some(tx) = self.lookup_session(sandbox_id) {
+        // A draining replica answers as if it held no session, which is true
+        // of it for any new work: the refusal is reached before anything is
+        // dispatched, and its serving list points the caller at the replicas
+        // that will still be here.
+        if !self.is_draining()
+            && let Some(tx) = self.lookup_session(sandbox_id)
+        {
             return Ok(tx);
         }
 
@@ -2242,6 +2271,73 @@ mod tests {
             "message should name the replica for logs: {}",
             err.message()
         );
+    }
+
+    /// A draining replica still holds the session, and the relays already
+    /// open on it keep running, but it opens no new one: it answers the way a
+    /// replica without the session does, naming the peers that will outlast it.
+    #[tokio::test]
+    async fn a_draining_replica_refuses_new_relays_and_names_its_peers() {
+        let store = store_with_sandboxes(&["sbx-drain"]).await;
+        let remote = liveness(&store, "replica-remote", "10-0-0-9.gw.ns.svc:8080");
+        remote
+            .announce("sbx-drain", "session-remote")
+            .await
+            .unwrap();
+
+        let registry =
+            SupervisorSessionRegistry::with_liveness(liveness(&store, "replica-local", "local:1"));
+        let (tx, mut rx) = mpsc::channel(4);
+        registry.register(
+            "sbx-drain".to_string(),
+            "s1".to_string(),
+            tx,
+            make_shutdown(),
+        );
+        registry
+            .open_relay("sbx-drain")
+            .await
+            .expect("a live replica opens the relay");
+        assert!(rx.try_recv().is_ok(), "the first RelayOpen was sent");
+
+        registry.begin_drain();
+
+        let err = registry
+            .open_relay("sbx-drain")
+            .await
+            .expect_err("a draining replica opens no new relay");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            redirect_hint(&err).as_deref(),
+            Some("10-0-0-9.gw.ns.svc:8080")
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be dispatched once draining: the refusal must prove nothing ran"
+        );
+        assert!(
+            registry.has_session("sbx-drain"),
+            "draining keeps the session for the relays already open on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draining_replica_does_not_announce_liveness() {
+        let store = store_with_sandboxes(&["sbx-quiet"]).await;
+        let local = liveness(&store, "replica-local", "local:1");
+        let registry = SupervisorSessionRegistry::with_liveness(Arc::clone(&local));
+
+        registry.begin_drain();
+        let renewal = registry
+            .spawn_liveness_record("sbx-quiet".to_string(), "s1".to_string(), |_| async {})
+            .expect("liveness is configured");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            local.lookup("sbx-quiet").await.unwrap().is_none(),
+            "a draining replica must not point callers back at itself"
+        );
+        drop(renewal);
     }
 
     /// The contract this registry now keeps: a replica holding no session
