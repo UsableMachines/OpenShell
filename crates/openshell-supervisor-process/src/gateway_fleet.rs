@@ -34,6 +34,12 @@
 //!   The window bounds skew between two *live* views; it cannot cover a caller
 //!   that has stopped re-resolving, so sandbox-api stops trusting an
 //!   unboundedly old view to *narrow* the candidates (`gateway-fleet.ts`).
+//!
+//!   A departure is held only while its session lives. Once that session
+//!   fails it is dropped, not redialed: a caller picking that replica would
+//!   reach one with no session either way, and the window is sized to a
+//!   gateway's whole shutdown drain, so redialing a replica that has exited
+//!   would spin on a dead address for hours.
 //! * **Never act on ignorance.** A failed or empty DNS answer leaves existing
 //!   connections alone. Losing a working session because a resolver blipped
 //!   would be strictly worse than routing on a slightly stale view, which
@@ -55,6 +61,7 @@
 //! one source of targets either way.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -147,6 +154,16 @@ struct Connection {
     /// Set when the member has left the subset; the session is dropped once
     /// this passes. `None` means the member is still in the subset.
     drop_at: Option<Instant>,
+    /// Shared with the session loop, which stops redialing once it is set.
+    departed: Arc<AtomicBool>,
+}
+
+impl Connection {
+    /// A departed member whose session loop has stopped: nothing is left to
+    /// hold, so it can go before its drain window passes.
+    fn ended(&self) -> bool {
+        self.drop_at.is_some() && self.abort.is_finished()
+    }
 }
 
 /// Run the supervisor's gateway sessions for the lifetime of the sandbox.
@@ -244,11 +261,14 @@ fn reconcile(
     connections: &mut HashMap<String, Connection>,
 ) {
     for member in subset {
-        if let Some(connection) = connections.get_mut(member) {
+        if let Some(connection) = connections.get_mut(member)
+            && !connection.ended()
+        {
             // Already held. Clear any pending drop: a member that left the
             // subset and came back within the drain window keeps its session
             // rather than being dropped and immediately reconnected.
             connection.drop_at = None;
+            connection.departed.store(false, Ordering::SeqCst);
         } else {
             let endpoint = member_endpoint(scheme, member);
             info!(
@@ -256,14 +276,17 @@ fn reconcile(
                 %endpoint,
                 "supervisor session: connecting to a new subset member"
             );
+            let departed = Arc::new(AtomicBool::new(false));
             let mut member_config = config.clone();
             member_config.endpoint = endpoint;
+            member_config.departed = Arc::clone(&departed);
             let abort = sessions.spawn(run_session_loop(member_config));
             connections.insert(
                 member.clone(),
                 Connection {
                     abort,
                     drop_at: None,
+                    departed,
                 },
             );
         }
@@ -295,20 +318,23 @@ fn reconcile(
                 "supervisor session: subset member departed; holding its session to drain"
             );
             connection.drop_at = Some(deadline);
+            connection.departed.store(true, Ordering::SeqCst);
         }
     }
 }
 
-/// Drop sessions whose drain window has passed.
+/// Drop departed members whose drain window has passed or whose session has
+/// already ended.
 fn reap_drained(connections: &mut HashMap<String, Connection>) {
     let now = Instant::now();
     connections.retain(|member, connection| {
         let expired = connection.drop_at.is_some_and(|drop_at| now >= drop_at);
-        if expired {
+        if expired || connection.ended() {
             debug!(%member, "supervisor session: dropping a drained subset member");
             connection.abort.abort();
+            return false;
         }
-        !expired
+        true
     });
 }
 
@@ -391,8 +417,9 @@ mod tests {
             ssh_socket_path: std::path::PathBuf::from("/nonexistent.sock"),
             netns_fd: None,
             expected_ssh_peer_pid: None,
-            terminating: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            terminating: Arc::new(AtomicBool::new(true)),
             instance_id: "instance-1".to_string(),
+            departed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -530,5 +557,93 @@ mod tests {
         );
         assert!(connections["a:8080"].drop_at.is_none());
         assert_eq!(connections.len(), 2);
+    }
+
+    async fn wait_until_ended(connection: &Connection) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !connection.abort.is_finished() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a departed member's session loop must stop once its session fails");
+    }
+
+    /// The drain window can be hours long, to cover a gateway's own shutdown
+    /// drain. A departed member's session is held only for the execs riding
+    /// it, so once that session fails (the replica exited) redialing it for
+    /// the rest of the window would only spin on a dead address.
+    #[tokio::test]
+    async fn a_departed_member_is_dropped_once_its_session_ends() {
+        let mut sessions = JoinSet::new();
+        let mut connections = HashMap::new();
+        let fleet = fleet(Duration::from_hours(3));
+        let config = test_config("https://base:8080");
+
+        reconcile(
+            &["a:8080".to_string(), "b:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        reconcile(
+            &["b:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        wait_until_ended(&connections["a:8080"]).await;
+        assert!(
+            !connections["b:8080"].abort.is_finished(),
+            "a member still in the subset keeps redialing"
+        );
+
+        reap_drained(&mut connections);
+        assert_eq!(connections.keys().collect::<Vec<_>>(), vec!["b:8080"]);
+    }
+
+    /// A member that returns after its departed session already ended gets a
+    /// new session; keeping the dead entry would leave it with none.
+    #[tokio::test]
+    async fn a_returning_member_whose_session_ended_is_redialed() {
+        let mut sessions = JoinSet::new();
+        let mut connections = HashMap::new();
+        let fleet = fleet(Duration::from_hours(3));
+        let config = test_config("https://base:8080");
+
+        reconcile(
+            &["a:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        reconcile(
+            &["b:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        wait_until_ended(&connections["a:8080"]).await;
+
+        reconcile(
+            &["a:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        let a = &connections["a:8080"];
+        assert!(!a.abort.is_finished(), "the returning member is redialed");
+        assert!(a.drop_at.is_none());
+        assert!(!a.departed.load(Ordering::SeqCst));
     }
 }
