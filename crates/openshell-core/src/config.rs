@@ -232,6 +232,17 @@ pub struct Config {
     /// the limit.
     pub grpc_rate_limit_window_secs: Option<u64>,
 
+    /// How long graceful shutdown waits for in-flight exec streams, in seconds.
+    ///
+    /// An exec rides the supervisor session this replica holds, so it cannot
+    /// move to another replica: once the process exits, the exec fails. While
+    /// draining, the gateway refuses new execs the way a replica without the
+    /// session does, so callers route them elsewhere, and exits as soon as the
+    /// last in-flight exec finishes or this deadline passes. `0` exits without
+    /// waiting. Keep it below the pod's termination grace period, or the
+    /// kubelet kills the process before it releases its liveness records.
+    pub shutdown_drain_secs: u64,
+
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
 }
@@ -576,6 +587,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
+            shutdown_drain_secs: 0,
             service_routing: ServiceRoutingConfig::default(),
         }
     }
@@ -680,6 +692,13 @@ impl Config {
     ) -> Self {
         self.grpc_rate_limit_requests = requests;
         self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Set how long graceful shutdown waits for in-flight exec streams.
+    #[must_use]
+    pub const fn with_shutdown_drain_secs(mut self, secs: u64) -> Self {
+        self.shutdown_drain_secs = secs;
         self
     }
 

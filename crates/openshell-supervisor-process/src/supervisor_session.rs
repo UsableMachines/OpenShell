@@ -291,6 +291,7 @@ pub fn spawn(
         expected_ssh_peer_pid,
         terminating,
         instance_id,
+        departed: Arc::new(AtomicBool::new(false)),
     };
     // One task, however many sessions it holds: callers abort this handle at
     // shutdown, and `gateway_fleet::run` owns its sessions in a `JoinSet` so
@@ -309,10 +310,17 @@ pub(crate) struct SessionConfig {
     pub(crate) expected_ssh_peer_pid: Option<u32>,
     pub(crate) terminating: Arc<AtomicBool>,
     pub(crate) instance_id: String,
+    /// Set by the fleet loop once this session's member has left the subset.
+    /// A departed member is held only so the execs riding its session can
+    /// finish, and they die with the session, so once it ends there is
+    /// nothing left to hold: the loop stops rather than redialing a replica
+    /// that has most likely exited.
+    pub(crate) departed: Arc<AtomicBool>,
 }
 
 /// Keep one session to one gateway replica alive, reconnecting with
-/// exponential backoff until the gateway closes the stream cleanly.
+/// exponential backoff until the gateway closes the stream cleanly or the
+/// member has departed the subset (see [`SessionConfig::departed`]).
 pub(crate) async fn run_session_loop(config: SessionConfig) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -338,8 +346,15 @@ pub(crate) async fn run_session_loop(config: SessionConfig) {
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
+                if config.departed.load(Ordering::SeqCst) {
+                    break;
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
+                // It may have departed during the backoff.
+                if config.departed.load(Ordering::SeqCst) {
+                    break;
+                }
             }
         }
     }

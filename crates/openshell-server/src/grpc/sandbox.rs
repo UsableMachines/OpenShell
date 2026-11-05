@@ -1786,6 +1786,10 @@ pub(super) async fn handle_exec_sandbox(
         return Err(refusal);
     }
 
+    // Taken before the relay is opened, so graceful shutdown either refuses
+    // this exec or waits for it. See `crate::exec_drain`.
+    let in_flight = state.exec_drain.track();
+
     // Answers immediately when this replica holds no session: it cannot say
     // anything about the other replicas, so the caller decides whether to ask
     // one of them, and how long to keep asking.
@@ -1813,6 +1817,7 @@ pub(super) async fn handle_exec_sandbox(
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
+        let _in_flight = in_flight;
         if let Err(err) = stream_exec_over_relay(
             tx.clone(),
             &sandbox_id,
@@ -2318,6 +2323,10 @@ pub(super) async fn handle_exec_sandbox_interactive(
         return Err(refusal);
     }
 
+    // Taken before the relay is opened, so graceful shutdown either refuses
+    // this exec or waits for it. See `crate::exec_drain`.
+    let in_flight = state.exec_drain.track();
+
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay(sandbox.object_id())
@@ -2341,6 +2350,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
+        let _in_flight = in_flight;
         if let Err(err) = stream_interactive_exec_over_relay(
             tx.clone(),
             &sandbox_id,
