@@ -61,8 +61,9 @@ pub const FLEET_SUBSET_SIZE_ENV: &str = "OPENSHELL_FLEET_SUBSET_SIZE";
 /// How often membership is re-resolved from DNS.
 pub const FLEET_REFRESH_SECS_ENV: &str = "OPENSHELL_FLEET_REFRESH_SECS";
 
-/// How long a supervisor keeps a session to a replica that has left the
-/// subset. See [`FleetConfig::drain`].
+/// The ceiling on how long a supervisor keeps a session to a replica that has
+/// left the subset while relays are still riding it. See
+/// [`FleetConfig::drain`].
 pub const FLEET_DRAIN_SECS_ENV: &str = "OPENSHELL_FLEET_DRAIN_SECS";
 
 /// Two replicas per sandbox: one may be lost without the sandbox becoming
@@ -77,7 +78,8 @@ pub const DEFAULT_SUBSET_SIZE: usize = 2;
 /// sandbox per interval, answered by the node-local cache.
 pub const DEFAULT_REFRESH: Duration = Duration::from_secs(20);
 
-/// Default grace period before a departed subset member is dropped.
+/// Default drain ceiling, and the fixed window every departed subset member is
+/// held for regardless of relays.
 ///
 /// Long enough to cover the skew between two components' views of membership,
 /// which is bounded by the record TTL plus a re-resolve interval on each side.
@@ -96,7 +98,18 @@ pub struct FleetConfig {
     pub subset_size: usize,
     /// DNS re-resolve interval.
     pub refresh: Duration,
-    /// Grace period before a session to a departed subset member is dropped.
+    /// Ceiling on how long a session to a departed subset member is held
+    /// while relays are still in flight on it, measured from when the member
+    /// first left the subset.
+    ///
+    /// A departed member is always held for the skew window (two minutes, see
+    /// [`DEFAULT_DRAIN`]) and is dropped after that as soon as its session
+    /// carries no relay, so this only extends the hold of a member still
+    /// relaying: set it to a gateway's shutdown drain so a terminating
+    /// gateway's execs survive it. A value below the skew window shortens both
+    /// windows to it, and zero drops departed members at once.
+    ///
+    /// Why a departed member is held at all:
     ///
     /// A membership change moves a sandbox's subset, and the two sides notice
     /// at different times. Connecting to the new members *before* dropping
