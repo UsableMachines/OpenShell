@@ -28,6 +28,12 @@ The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
 
+## UsableMachines fork
+
+The `UsableMachines/OpenShell` fork has no NVIDIA self-hosted runners and no copy-pr-bot, so it does not use the mirror flow above. `Branch Checks` and `Helm Lint` run on GitHub-hosted runners and trigger on `pull_request` and `merge_group`, so no `/ok to test` comment is needed. `Branch Checks` ends with a `CI Result` job that fails when any other job in the workflow did not succeed.
+
+Branch protection or the merge-queue ruleset on `main` requires `CI Result` and `Helm Lint`. `Required CI Gates` and `Branch E2E Checks` still exist from upstream, but their `OpenShell / ...` statuses and the NVIDIA-runner E2E lanes are not required in the fork. Keep the `branch-checks.yml` and `helm-lint.yml` runner and trigger changes in mind when merging from upstream.
+
 ## Informational security reports
 
 Security workflow compute runs directly on GitHub-hosted runners instead of

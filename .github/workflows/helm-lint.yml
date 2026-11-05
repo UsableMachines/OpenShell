@@ -4,6 +4,7 @@
 name: Helm Lint
 
 on:
+  pull_request:
   merge_group:
     types: [checks_requested]
   push:
@@ -79,17 +80,12 @@ jobs:
     name: Helm Lint
     needs: [pr_metadata, helm_changes]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.helm_changes.outputs.should_run == 'true'
-    runs-on: linux-amd64-cpu8
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: mise install --locked
+        uses: ./.github/actions/setup-mise
 
       - name: Lint Helm chart
         run: mise run helm:lint
