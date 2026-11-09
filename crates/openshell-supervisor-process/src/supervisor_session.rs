@@ -14,7 +14,7 @@ use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -292,6 +292,7 @@ pub fn spawn(
         terminating,
         instance_id,
         departed: Arc::new(AtomicBool::new(false)),
+        relays: Arc::new(AtomicUsize::new(0)),
     };
     // One task, however many sessions it holds: callers abort this handle at
     // shutdown, and `gateway_fleet::run` owns its sessions in a `JoinSet` so
@@ -316,6 +317,31 @@ pub(crate) struct SessionConfig {
     /// nothing left to hold: the loop stops rather than redialing a replica
     /// that has most likely exited.
     pub(crate) departed: Arc<AtomicBool>,
+    /// Relays currently being served on this session, of any target kind.
+    /// The fleet loop reads it to decide whether a departed member still has
+    /// work riding its session; see [`RelayGuard`].
+    pub(crate) relays: Arc<AtomicUsize>,
+}
+
+/// Counts one relay in [`SessionConfig::relays`] for as long as it lives.
+///
+/// An RAII guard rather than a paired increment and decrement, because a relay
+/// task ends in more ways than returning: an error, a panic, or an abort all
+/// drop the future and with it this guard, so the count cannot leak and hold a
+/// departed gateway session past its need.
+pub(crate) struct RelayGuard(Arc<AtomicUsize>);
+
+impl RelayGuard {
+    pub(crate) fn new(relays: &Arc<AtomicUsize>) -> Self {
+        relays.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(relays))
+    }
+}
+
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Keep one session to one gateway replica alive, reconnecting with
@@ -474,6 +500,7 @@ async fn run_single_session(
                     channel: &channel,
                     tx: &tx,
                     terminating: &config.terminating,
+                    relays: &config.relays,
                 };
                 handle_gateway_message(
                     &msg,
@@ -542,6 +569,7 @@ struct GatewayMessageContext<'a> {
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
     terminating: &'a Arc<AtomicBool>,
+    relays: &'a Arc<AtomicUsize>,
 }
 
 fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
@@ -559,11 +587,18 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let netns_fd = context.netns_fd;
             let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
             let terminating = Arc::clone(context.terminating);
+            // Taken here, before the spawn, so the count covers the whole
+            // relay with no gap between the gateway's message and the task
+            // starting. Every target kind counts: SSH relays carry exec and
+            // shell, TCP relays carry port forwards, and both die with the
+            // session.
+            let relay_guard = RelayGuard::new(context.relays);
 
             let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
+                let _relay_guard = relay_guard;
                 let event_open = relay_open.clone();
                 match handle_relay_open(
                     relay_open,

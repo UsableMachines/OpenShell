@@ -21,14 +21,27 @@
 //!
 //! * **Add before drop.** When the subset changes, connect to the arrivals
 //!   first and keep each departure until it has been absent from the subset
-//!   for a whole drain window. The held connections are then a superset of
-//!   *every* subset this supervisor computed within that window — not merely
-//!   of the last two — so a caller whose view is anything this supervisor has
-//!   seen recently picks a replica it is connected to. That distinction is the
-//!   whole guarantee under a rolling restart, which is a run of membership
-//!   changes spaced more closely than the window. Overlap between subsets
-//!   would not be enough: the requirement is on the caller's pick, not on the
-//!   sets intersecting.
+//!   for a whole skew window ([`SKEW_WINDOW`]). The held connections are then
+//!   a superset of *every* subset this supervisor computed within that
+//!   window — not merely of the last two — so a caller whose view is anything
+//!   this supervisor has seen recently picks a replica it is connected to.
+//!   That distinction is the whole guarantee under a rolling restart, which
+//!   is a run of membership changes spaced more closely than the window.
+//!   Overlap between subsets would not be enough: the requirement is on the
+//!   caller's pick, not on the sets intersecting.
+//!
+//!   Two windows apply to a departure, and they answer different questions.
+//!   The *skew window* is how long callers' views may lag, so every departure
+//!   is held that long whatever it is doing. The *drain ceiling*
+//!   (`OPENSHELL_FLEET_DRAIN_SECS`) is how long a departure may be kept past
+//!   that because relays are still riding its session: those cannot move to
+//!   another replica, and a terminating gateway finishes them during its own
+//!   shutdown drain. Past the skew window a departure with no in-flight relay
+//!   is dropped, so a healthy replica that a scale-out merely displaced does
+//!   not keep a session for hours. Both windows are measured from when the
+//!   member first went absent. When the ceiling is shorter than the skew
+//!   window the ceiling wins, so a configured drain (including zero) still
+//!   means "drop by then" for a member with nothing in flight.
 //!
 //!   The other side of the bargain is that the caller's view has to be recent.
 //!   The window bounds skew between two *live* views; it cannot cover a caller
@@ -37,7 +50,7 @@
 //!
 //!   A departure is held only while its session lives. Once that session
 //!   fails it is dropped, not redialed: a caller picking that replica would
-//!   reach one with no session either way, and the window is sized to a
+//!   reach one with no session either way, and the ceiling is sized to a
 //!   gateway's whole shutdown drain, so redialing a replica that has exited
 //!   would spin on a dead address for hours.
 //! * **Never act on ignorance.** A failed or empty DNS answer leaves existing
@@ -61,14 +74,15 @@
 //! one source of targets either way.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use openshell_core::gateway_fleet::{
     FleetConfig, endpoint_shape, member_endpoint, resolve_members, subset_for,
 };
 use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::supervisor_session::{SessionConfig, run_session_loop};
@@ -76,6 +90,19 @@ use crate::supervisor_session::{SessionConfig, run_session_loop};
 /// Backoff after a DNS failure. Short, because the previous view is still in
 /// use and the only cost of being stale is a rejected request that retries.
 const RESOLVE_RETRY: Duration = Duration::from_secs(5);
+
+/// How long every departed member is held regardless of what it is doing: the
+/// bound on how far a caller's view of membership may lag this supervisor's.
+///
+/// A constant rather than a setting. It is the value
+/// [`openshell_core::gateway_fleet::DEFAULT_DRAIN`] always had, derived from
+/// DNS record TTL plus a re-resolve interval on each side, none of which an
+/// operator tunes per deployment; the knob operators do have,
+/// `OPENSHELL_FLEET_DRAIN_SECS`, is the ceiling for a member that is still
+/// relaying. A second variable would need to stay in step with the callers'
+/// own refresh settings and would be one more way to shorten the window
+/// below what they need.
+const SKEW_WINDOW: Duration = openshell_core::gateway_fleet::DEFAULT_DRAIN;
 
 /// The subset this supervisor currently holds sessions to, in preference
 /// order, published for the unary RPCs in `run`.
@@ -151,9 +178,16 @@ pub async fn unary_endpoint(
 /// One held session, and when it should be given up.
 struct Connection {
     abort: AbortHandle,
-    /// Set when the member has left the subset; the session is dropped once
-    /// this passes. `None` means the member is still in the subset.
+    /// Set when the member has left the subset: the ceiling, after which the
+    /// session is dropped whatever it is carrying. `None` means the member is
+    /// still in the subset.
     drop_at: Option<Instant>,
+    /// Set with `drop_at`: until this passes the session is held regardless of
+    /// relays, to cover callers' lagging views. After it, the session is held
+    /// only while `relays` is non-zero.
+    skew_until: Option<Instant>,
+    /// Relays in flight on this member's session, shared with the session.
+    relays: Arc<AtomicUsize>,
     /// Shared with the session loop, which stops redialing once it is set.
     departed: Arc<AtomicBool>,
 }
@@ -163,6 +197,18 @@ impl Connection {
     /// hold, so it can go before its drain window passes.
     fn ended(&self) -> bool {
         self.drop_at.is_some() && self.abort.is_finished()
+    }
+
+    /// Whether a departed member has outlived its reason to be held at `now`.
+    fn drained(&self, now: Instant) -> bool {
+        let Some(drop_at) = self.drop_at else {
+            return false;
+        };
+        if now >= drop_at {
+            return true;
+        }
+        let skew_passed = self.skew_until.is_some_and(|until| now >= until);
+        skew_passed && self.relays.load(Ordering::SeqCst) == 0
     }
 }
 
@@ -268,6 +314,7 @@ fn reconcile(
             // subset and came back within the drain window keeps its session
             // rather than being dropped and immediately reconnected.
             connection.drop_at = None;
+            connection.skew_until = None;
             connection.departed.store(false, Ordering::SeqCst);
         } else {
             let endpoint = member_endpoint(scheme, member);
@@ -280,19 +327,27 @@ fn reconcile(
             let mut member_config = config.clone();
             member_config.endpoint = endpoint;
             member_config.departed = Arc::clone(&departed);
+            let relays = Arc::new(AtomicUsize::new(0));
+            member_config.relays = Arc::clone(&relays);
             let abort = sessions.spawn(run_session_loop(member_config));
             connections.insert(
                 member.clone(),
                 Connection {
                     abort,
                     drop_at: None,
+                    skew_until: None,
+                    relays,
                     departed,
                 },
             );
         }
     }
 
-    let deadline = Instant::now() + fleet.drain;
+    let now = Instant::now();
+    let deadline = now + fleet.drain;
+    // Never longer than the ceiling, so a short configured drain still drops
+    // an idle member when it always did.
+    let skew_until = now + SKEW_WINDOW.min(fleet.drain);
     for (member, connection) in connections.iter_mut() {
         // `drop_at.is_none()` is load-bearing, and both halves of it are.
         //
@@ -309,27 +364,31 @@ fn reconcile(
         // Refreshing the deadline on every pass instead would push it forward
         // for as long as the member stayed absent, so the session would never
         // be dropped and the subset would grow without bound. Clearing it on
-        // return to the subset (above) is what restarts the measurement.
+        // return to the subset (above) is what restarts the measurement. The
+        // same holds for `skew_until`, which is what the superset guarantee
+        // rests on: it is set once, on first absence, and relays can only
+        // extend a hold past it, never shorten it.
         if !subset.contains(member) && connection.drop_at.is_none() {
             info!(
                 sandbox_id = %config.sandbox_id,
                 %member,
+                skew_secs = SKEW_WINDOW.min(fleet.drain).as_secs(),
                 drain_secs = fleet.drain.as_secs(),
-                "supervisor session: subset member departed; holding its session to drain"
+                "supervisor session: subset member departed; holding its session while it relays"
             );
             connection.drop_at = Some(deadline);
+            connection.skew_until = Some(skew_until);
             connection.departed.store(true, Ordering::SeqCst);
         }
     }
 }
 
-/// Drop departed members whose drain window has passed or whose session has
-/// already ended.
+/// Drop departed members that are past the skew window with no relay in
+/// flight, past the drain ceiling, or whose session has already ended.
 fn reap_drained(connections: &mut HashMap<String, Connection>) {
     let now = Instant::now();
     connections.retain(|member, connection| {
-        let expired = connection.drop_at.is_some_and(|drop_at| now >= drop_at);
-        if expired || connection.ended() {
+        if connection.drained(now) || connection.ended() {
             debug!(%member, "supervisor session: dropping a drained subset member");
             connection.abort.abort();
             return false;
@@ -353,6 +412,7 @@ fn drain_finished_sessions(sessions: &mut JoinSet<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervisor_session::RelayGuard;
 
     #[test]
     fn endpoint_shape_reuses_the_configured_scheme_and_port() {
@@ -420,6 +480,7 @@ mod tests {
             terminating: Arc::new(AtomicBool::new(true)),
             instance_id: "instance-1".to_string(),
             departed: Arc::new(AtomicBool::new(false)),
+            relays: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -645,5 +706,214 @@ mod tests {
         assert!(!a.abort.is_finished(), "the returning member is redialed");
         assert!(a.drop_at.is_none());
         assert!(!a.departed.load(Ordering::SeqCst));
+    }
+
+    /// Swap a member's session for one that stays up, so a test can tell a
+    /// member held for its relays from one dropped because its session died
+    /// (the real session loop stops on its own once it is marked departed and
+    /// cannot connect).
+    fn keep_session_alive(
+        sessions: &mut JoinSet<()>,
+        connections: &mut HashMap<String, Connection>,
+        member: &str,
+    ) {
+        let abort = sessions.spawn(std::future::pending());
+        connections.get_mut(member).expect("member held").abort = abort;
+    }
+
+    /// `a` departs the subset; returns the connections with `a` departed and
+    /// its session kept alive.
+    fn displace_a(fleet: &FleetConfig, sessions: &mut JoinSet<()>) -> HashMap<String, Connection> {
+        let mut connections = HashMap::new();
+        let config = test_config("https://base:8080");
+        for subset in [["a:8080", "b:8080"], ["b:8080", "c:8080"]] {
+            let subset = subset.map(str::to_string);
+            reconcile(&subset, fleet, "https", &config, sessions, &mut connections);
+            if connections.contains_key("a:8080") {
+                keep_session_alive(sessions, &mut connections, "a:8080");
+            }
+        }
+        connections
+    }
+
+    /// The scale-out case: a healthy replica pushed out of the subset with
+    /// nothing relaying is held for the skew window and no longer, however
+    /// long the ceiling is.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_departed_member_is_dropped_after_the_skew_window() {
+        let mut sessions = JoinSet::new();
+        let fleet = fleet(Duration::from_hours(3));
+        let mut connections = displace_a(&fleet, &mut sessions);
+
+        tokio::time::advance(SKEW_WINDOW.saturating_sub(Duration::from_secs(1))).await;
+        reap_drained(&mut connections);
+        assert!(
+            connections.contains_key("a:8080"),
+            "held for the whole skew window"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reap_drained(&mut connections);
+        assert!(!connections.contains_key("a:8080"));
+        assert_eq!(connections.len(), 2, "members still in the subset stay");
+    }
+
+    /// A relay in flight keeps a departed member past the skew window, and the
+    /// hold ends when the relay does.
+    #[tokio::test(start_paused = true)]
+    async fn a_relaying_departed_member_is_held_until_its_relay_ends() {
+        let mut sessions = JoinSet::new();
+        let fleet = fleet(Duration::from_hours(3));
+        let mut connections = displace_a(&fleet, &mut sessions);
+        let relay = RelayGuard::new(&connections["a:8080"].relays);
+
+        tokio::time::advance(SKEW_WINDOW + Duration::from_hours(1)).await;
+        reap_drained(&mut connections);
+        assert!(
+            connections.contains_key("a:8080"),
+            "held while a relay is in flight"
+        );
+
+        drop(relay);
+        reap_drained(&mut connections);
+        assert!(!connections.contains_key("a:8080"));
+    }
+
+    /// A relay that never ends cannot hold a departed member past the ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn a_relaying_departed_member_is_dropped_at_the_ceiling() {
+        let mut sessions = JoinSet::new();
+        let ceiling = Duration::from_hours(3);
+        let fleet = fleet(ceiling);
+        let mut connections = displace_a(&fleet, &mut sessions);
+        let _relay = RelayGuard::new(&connections["a:8080"].relays);
+
+        tokio::time::advance(ceiling.saturating_sub(Duration::from_secs(1))).await;
+        reap_drained(&mut connections);
+        assert!(connections.contains_key("a:8080"));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reap_drained(&mut connections);
+        assert!(!connections.contains_key("a:8080"));
+    }
+
+    /// A relay inside the skew window changes nothing: the member is held for
+    /// the window either way, and the hold is measured from first absence, not
+    /// from when the relay ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_ending_early_does_not_shorten_or_restart_the_skew_window() {
+        let mut sessions = JoinSet::new();
+        let fleet = fleet(Duration::from_hours(3));
+        let mut connections = displace_a(&fleet, &mut sessions);
+        let relay = RelayGuard::new(&connections["a:8080"].relays);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        drop(relay);
+        reap_drained(&mut connections);
+        assert!(
+            connections.contains_key("a:8080"),
+            "still inside the skew window"
+        );
+
+        tokio::time::advance(SKEW_WINDOW.saturating_sub(Duration::from_secs(30))).await;
+        reap_drained(&mut connections);
+        assert!(!connections.contains_key("a:8080"));
+    }
+
+    /// A ceiling shorter than the skew window wins, so a configured short
+    /// drain still means "dropped by then" for an idle member.
+    #[tokio::test(start_paused = true)]
+    async fn a_ceiling_shorter_than_the_skew_window_wins() {
+        let mut sessions = JoinSet::new();
+        let fleet = fleet(Duration::from_secs(30));
+        let mut connections = displace_a(&fleet, &mut sessions);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        reap_drained(&mut connections);
+        assert!(!connections.contains_key("a:8080"));
+    }
+
+    /// A member that returns has its skew hold cleared along with the ceiling,
+    /// and measures a fresh absence if it leaves again.
+    #[tokio::test(start_paused = true)]
+    async fn a_returning_member_restarts_both_windows() {
+        let mut sessions = JoinSet::new();
+        let fleet = fleet(Duration::from_hours(3));
+        let mut connections = displace_a(&fleet, &mut sessions);
+        let config = test_config("https://base:8080");
+
+        tokio::time::advance(Duration::from_secs(100)).await;
+        reconcile(
+            &["a:8080".to_string(), "b:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        assert!(connections["a:8080"].drop_at.is_none());
+        assert!(connections["a:8080"].skew_until.is_none());
+
+        reconcile(
+            &["b:8080".to_string(), "c:8080".to_string()],
+            &fleet,
+            "https",
+            &config,
+            &mut sessions,
+            &mut connections,
+        );
+        tokio::time::advance(SKEW_WINDOW.saturating_sub(Duration::from_secs(1))).await;
+        reap_drained(&mut connections);
+        assert!(
+            connections.contains_key("a:8080"),
+            "the second absence is measured from its own start"
+        );
+    }
+
+    /// The count must fall on every way a relay task can end, or a departed
+    /// member would be held to the ceiling for a relay that is long gone.
+    #[tokio::test]
+    async fn the_relay_count_falls_when_a_relay_task_is_aborted_or_finishes() {
+        let relays = Arc::new(AtomicUsize::new(0));
+
+        let guard = RelayGuard::new(&relays);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(relays.load(Ordering::SeqCst), 1);
+        tokio::task::yield_now().await;
+
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        assert_eq!(relays.load(Ordering::SeqCst), 0, "abort releases the guard");
+
+        // Aborted before it was ever polled: the guard moved into the future
+        // is dropped with it.
+        let guard = RelayGuard::new(&relays);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+        assert_eq!(relays.load(Ordering::SeqCst), 0);
+
+        // A panicking relay releases it too.
+        let guard = RelayGuard::new(&relays);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("relay bug");
+        });
+        assert!(task.await.expect_err("panicked").is_panic());
+        assert_eq!(relays.load(Ordering::SeqCst), 0);
+
+        // Normal completion, and several at once.
+        let a = RelayGuard::new(&relays);
+        let b = RelayGuard::new(&relays);
+        assert_eq!(relays.load(Ordering::SeqCst), 2);
+        drop(a);
+        drop(b);
+        assert_eq!(relays.load(Ordering::SeqCst), 0);
     }
 }
